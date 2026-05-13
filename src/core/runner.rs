@@ -95,6 +95,9 @@ pub fn run(
                 raw
             };
             let filtered = filter_fn(text_to_filter);
+            // ===== contextzip-downstream: error compression post-processor begin =====
+            let filtered = crate::core::error_cmd::compress_errors(&filtered);
+            // ===== contextzip-downstream: error compression post-processor end =====
 
             if let Some(label) = opts.tee_label {
                 print_with_hint(&filtered, raw, label, exit_code);
