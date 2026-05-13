@@ -17,7 +17,7 @@ mod tirith_gate {
 
     pub enum Verdict {
         Allow,
-        Block,
+        Block { tirith_json: String },
         // Tirith missing, errored, or returned an unrecognized verdict.
         // Caller decides fail-open (proceed) vs fail-closed (downgrade).
         Unavailable,
@@ -61,11 +61,11 @@ mod tirith_gate {
             Ok(o) => o,
             Err(_) => return Verdict::Unavailable,
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
         // Cheap parse: avoid pulling serde_json into the hot rewrite path.
         if stdout.contains("\"action\":\"block\"") {
-            Verdict::Block
+            Verdict::Block { tirith_json: stdout }
         } else if stdout.contains("\"action\":\"allow\"") {
             Verdict::Allow
         } else {
@@ -75,6 +75,70 @@ mod tirith_gate {
 
     pub fn require_tirith() -> bool {
         std::env::var("CONTEXTZIP_TIRITH_REQUIRED").as_deref() == Ok("1")
+    }
+
+    /// Append a downgrade event to the ContextCrawler local log.
+    /// Path: $XDG_DATA_HOME/contextcrawler/downgrades.jsonl
+    /// (or platform equivalent via dirs::data_local_dir).
+    /// Best-effort: any I/O error is silently dropped so logging never
+    /// blocks the user's actual command.
+    pub fn log_downgrade(cmd: &str, reason: &'static str, tirith_json: Option<&str>) {
+        let dir = match dirs::data_local_dir() {
+            Some(d) => d.join("contextcrawler"),
+            None => return,
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("downgrades.jsonl");
+
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        // Embed Tirith's full JSON when present (action + findings + timings)
+        // so future analysis has the full evidence chain. Otherwise emit a
+        // minimal record.
+        let record = match tirith_json {
+            Some(json) => format!(
+                r#"{{"ts":"{}","reason":"{}","cmd":{},"tirith":{}}}"#,
+                timestamp,
+                reason,
+                json_escape(cmd),
+                json.trim(),
+            ),
+            None => format!(
+                r#"{{"ts":"{}","reason":"{}","cmd":{}}}"#,
+                timestamp,
+                reason,
+                json_escape(cmd),
+            ),
+        };
+
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{}", record);
+        }
+    }
+
+    /// Minimal JSON string escape — enough for our log lines.
+    fn json_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
     }
 }
 // ===== contextzip-downstream: Tirith pre-execution gate end =====
@@ -110,19 +174,28 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
                 // flags the command. Closes the prompt-injection-driven
                 // auto-allow bypass when defense-in-depth is installed.
                 let tirith_verdict = tirith_gate::check(cmd);
-                let downgrade = matches!(tirith_verdict, tirith_gate::Verdict::Block)
-                    || (matches!(tirith_verdict, tirith_gate::Verdict::Unavailable)
-                        && tirith_gate::require_tirith());
+                let (downgrade, reason, tirith_json) = match &tirith_verdict {
+                    tirith_gate::Verdict::Block { tirith_json } => {
+                        (true, "tirith_block", Some(tirith_json.as_str()))
+                    }
+                    tirith_gate::Verdict::Unavailable
+                        if tirith_gate::require_tirith() =>
+                    {
+                        (true, "tirith_required_unavailable", None)
+                    }
+                    _ => (false, "", None),
+                };
                 if downgrade {
-                    if matches!(tirith_verdict, tirith_gate::Verdict::Block) {
+                    if reason == "tirith_block" {
                         eprintln!(
-                            "[contextzip] Tirith flagged the command; downgrading auto-allow to Ask."
+                            "[contextcrawler] Tirith flagged the command; downgrading auto-allow to Ask."
                         );
                     } else {
                         eprintln!(
-                            "[contextzip] Tirith required but unavailable; downgrading auto-allow to Ask."
+                            "[contextcrawler] Tirith required but unavailable; downgrading auto-allow to Ask."
                         );
                     }
+                    tirith_gate::log_downgrade(cmd, reason, tirith_json);
                     print!("{}", rewritten);
                     let _ = std::io::stdout().flush();
                     std::process::exit(3);

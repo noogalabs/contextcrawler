@@ -34,7 +34,11 @@ struct AuditActions {
     allow: u64,
 }
 
-pub fn run(format: &str, _verbose: u8) -> Result<()> {
+pub fn run(format: &str, log: bool, log_limit: usize, _verbose: u8) -> Result<()> {
+    if log {
+        return print_downgrade_log(format, log_limit);
+    }
+
     let tirith_bin = resolve_tirith_bin();
 
     match (tirith_bin.as_deref(), format) {
@@ -58,6 +62,66 @@ pub fn run(format: &str, _verbose: u8) -> Result<()> {
         _ => print_human(&bin, &stats, &doctor),
     }
 
+    Ok(())
+}
+
+fn print_downgrade_log(format: &str, limit: usize) -> Result<()> {
+    let path = dirs::data_local_dir()
+        .map(|d| d.join("contextcrawler").join("downgrades.jsonl"));
+
+    let Some(path) = path else {
+        if format == "json" {
+            println!(r#"{{"log": [], "reason": "no_data_local_dir"}}"#);
+        } else {
+            println!("No data directory available — cannot locate downgrade log.");
+        }
+        return Ok(());
+    };
+
+    if !path.exists() {
+        if format == "json" {
+            println!(r#"{{"log": [], "path": "{}"}}"#, path.display());
+        } else {
+            println!("ContextCrawler Gate Downgrade Log");
+            println!("{}", "═".repeat(60));
+            println!();
+            println!("  No downgrades logged yet at:");
+            println!("    {}", path.display());
+            println!();
+            println!("  The Tirith gate has not downgraded any auto-allow rewrite");
+            println!("  since this binary was installed.");
+        }
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = total.saturating_sub(limit);
+    let tail = &lines[start..];
+
+    match format {
+        "json" => {
+            print!("{{\"path\":\"{}\",\"total\":{},\"showing\":{},\"log\":[",
+                path.display(), total, tail.len());
+            for (i, line) in tail.iter().enumerate() {
+                if i > 0 { print!(","); }
+                print!("{}", line);
+            }
+            println!("]}}");
+        }
+        _ => {
+            println!("ContextCrawler Gate Downgrade Log");
+            println!("{}", "═".repeat(60));
+            println!("  Location:  {}", path.display());
+            println!("  Total:     {} downgrade events", total);
+            println!("  Showing:   last {} (use --log-limit to change)", tail.len());
+            println!();
+            for line in tail {
+                println!("  {}", line);
+            }
+        }
+    }
     Ok(())
 }
 

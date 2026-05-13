@@ -782,6 +782,13 @@ enum Commands {
         /// Output format: text (default) or json
         #[arg(short, long, default_value = "text")]
         format: String,
+        /// Show recent ContextCrawler gate-downgrade events from the local log
+        /// (commands where the Tirith gate downgraded an auto-allow rewrite).
+        #[arg(long)]
+        log: bool,
+        /// Number of recent log entries to show with --log (default: 20)
+        #[arg(long, default_value_t = 20)]
+        log_limit: usize,
     },
     // ===== contextzip-downstream variants end =====
 }
@@ -2440,8 +2447,12 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Security { format } => {
-            analytics::security_cmd::run(&format, cli.verbose)?;
+        Commands::Security {
+            format,
+            log,
+            log_limit,
+        } => {
+            analytics::security_cmd::run(&format, log, log_limit, cli.verbose)?;
             0
         }
         // ===== contextzip-downstream match arms end =====
