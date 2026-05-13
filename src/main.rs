@@ -764,6 +764,14 @@ enum Commands {
         /// URL to fetch and extract content from
         url: String,
     },
+
+    /// Security report — Tirith audit stats, gate status, and detection rule
+    /// breakdown. Surfaces what Tirith caught while protecting your shell.
+    Security {
+        /// Output format: text (default) or json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
     // ===== contextzip-downstream variants end =====
 }
 
@@ -2418,6 +2426,11 @@ fn run_cli() -> Result<i32> {
                 &raw,
                 &filtered,
             );
+            0
+        }
+
+        Commands::Security { format } => {
+            analytics::security_cmd::run(&format, cli.verbose)?;
             0
         }
         // ===== contextzip-downstream match arms end =====
