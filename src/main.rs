@@ -27,6 +27,7 @@ use cmds::system::{
 // Downstream-only `use` imports land between these markers.
 // Confining additions here minimizes rebase conflicts when upstream RTK
 // touches the import section.
+use cmds::cloud::web_cmd;
 // ===== contextzip-downstream imports end =====
 
 use anyhow::{Context, Result};
@@ -756,6 +757,13 @@ enum Commands {
 
     // ===== contextzip-downstream variants begin =====
     // Downstream-only Commands::* enum variants land between these markers.
+    /// Fetch a URL with curl and extract main content from the HTML response
+    /// (strip nav, ads, scripts). Falls back to raw output when the response
+    /// is not HTML.
+    Web {
+        /// URL to fetch and extract content from
+        url: String,
+    },
     // ===== contextzip-downstream variants end =====
 }
 
@@ -2387,6 +2395,31 @@ fn run_cli() -> Result<i32> {
         // Downstream-only match arms land between these markers.
         // Each arm should be small (delegate to the module's run function);
         // keep all dispatch logic in the module, not inline here.
+        Commands::Web { url } => {
+            let timer = core::tracking::TimedExecution::start();
+            let mut cmd = core::utils::resolved_command("curl");
+            cmd.args(["-s", "-L", &url]);
+            let output = cmd.output().context("Failed to fetch URL with curl")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("FAILED: curl {}", stderr.trim());
+                std::process::exit(output.status.code().unwrap_or(1));
+            }
+            let raw = String::from_utf8_lossy(&output.stdout).to_string();
+            let filtered = if web_cmd::is_html(&raw) {
+                web_cmd::extract_content(&raw)
+            } else {
+                raw.clone()
+            };
+            println!("{}", filtered);
+            timer.track(
+                &format!("web {}", url),
+                &format!("rtk web {}", url),
+                &raw,
+                &filtered,
+            );
+            0
+        }
         // ===== contextzip-downstream match arms end =====
     };
 
