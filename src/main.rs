@@ -23,6 +23,12 @@ use cmds::system::{
     read, summary, tree, wc_cmd,
 };
 
+// ===== contextzip-downstream imports begin =====
+// Downstream-only `use` imports land between these markers.
+// Confining additions here minimizes rebase conflicts when upstream RTK
+// touches the import section.
+// ===== contextzip-downstream imports end =====
+
 use anyhow::{Context, Result};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -747,6 +753,10 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
+
+    // ===== contextzip-downstream variants begin =====
+    // Downstream-only Commands::* enum variants land between these markers.
+    // ===== contextzip-downstream variants end =====
 }
 
 #[derive(Debug, Subcommand)]
@@ -2372,6 +2382,12 @@ fn run_cli() -> Result<i32> {
             }
             0
         }
+
+        // ===== contextzip-downstream match arms begin =====
+        // Downstream-only match arms land between these markers.
+        // Each arm should be small (delegate to the module's run function);
+        // keep all dispatch logic in the module, not inline here.
+        // ===== contextzip-downstream match arms end =====
     };
 
     Ok(code)
