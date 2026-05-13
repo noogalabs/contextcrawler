@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Adapted from jee599/contextzip (MIT). Original work by jee599 — not derived
+// from upstream rtk-ai/rtk. Brought into ContextCrawler as a port against
+// rtk 0.39's tree layout.
+//
 //! Error stacktrace compression module.
 //!
 //! Detects stacktraces from 5 languages (Node.js, Python, Rust, Go, Java)

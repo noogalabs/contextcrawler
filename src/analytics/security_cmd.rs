@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Part of the ContextCrawler downstream of rtk-ai/rtk.
+// Copyright (c) 2026 ContextCrawler contributors.
+//
 //! `rtk security` — surfaces Tirith audit data and gate status.
 //!
 //! Subprocess-calls `tirith` for the underlying data. AGPL boundary is clean:
@@ -110,7 +114,7 @@ fn fetch_doctor_status(bin: &str) -> DoctorStatus {
 }
 
 fn print_tirith_missing() {
-    println!("RTK Security (Tirith Integration)");
+    println!("ContextCrawler Security (Tirith Integration)");
     println!("{}", "═".repeat(60));
     println!();
     println!("  Tirith is not installed.");
@@ -126,7 +130,7 @@ fn print_tirith_missing() {
 }
 
 fn print_human(bin: &str, stats: &Option<AuditStats>, doctor: &DoctorStatus) {
-    println!("RTK Security (Tirith Integration)");
+    println!("ContextCrawler Security (Tirith Integration)");
     println!("{}", "═".repeat(60));
     println!();
     println!(

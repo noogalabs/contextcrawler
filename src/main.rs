@@ -28,6 +28,16 @@ use cmds::system::{
 // Confining additions here minimizes rebase conflicts when upstream RTK
 // touches the import section.
 use cmds::cloud::web_cmd;
+
+// Banner-only rebrand: this is a ContextCrawler distribution of upstream rtk.
+// Surfaces only in --version / --about output; binary name, package name,
+// and source identifiers are unchanged for clean rebases against upstream.
+const CONTEXTCRAWLER_VERSION: &str = concat!(
+    "ContextCrawler 0.1.0 (downstream of rtk ",
+    env!("CARGO_PKG_VERSION"),
+    ")"
+);
+const CONTEXTCRAWLER_LONG_ABOUT: &str = "ContextCrawler — a downstream distribution of rtk-ai/rtk (https://github.com/rtk-ai/rtk) with added Claude Code session compaction, multi-language stacktrace compression, HTML content extraction, and a Tirith pre-execution security gate. Invoke as `rtk` (binary name is preserved for hook-script compatibility).";
 // ===== contextzip-downstream imports end =====
 
 use anyhow::{Context, Result};
@@ -56,9 +66,10 @@ pub enum AgentTarget {
 #[derive(Parser)]
 #[command(
     name = "rtk",
-    version,
+    // contextzip-downstream: override version + long_about for branding
+    version = CONTEXTCRAWLER_VERSION,
     about = "Rust Token Killer - Minimize LLM token consumption",
-    long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
+    long_about = CONTEXTCRAWLER_LONG_ABOUT,
 )]
 struct Cli {
     #[command(subcommand)]

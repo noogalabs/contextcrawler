@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Adapted from jee599/contextzip (MIT). Original work by jee599 — not derived
+// from upstream rtk-ai/rtk. Brought into ContextCrawler as a port against
+// rtk 0.39's tree layout.
+
 use scraper::{Html, Selector};
 
 /// Check if input looks like HTML (contains DOCTYPE or <html tag)
