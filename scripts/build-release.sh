@@ -36,6 +36,17 @@ done
 CARGO_HOME_REAL="${CARGO_HOME:-$HOME/.cargo}"
 WORKSPACE_REAL="$REPO_ROOT"
 
+# Reject path values that would break RUSTFLAGS tokenisation (rustflags is a
+# whitespace-delimited string; a path with spaces or shell-sensitive chars
+# could inject extra rustc args). This is paranoid but cheap.
+for v in "$HOME" "$CARGO_HOME_REAL" "$WORKSPACE_REAL"; do
+    if [[ "$v" =~ [[:space:]\"\$\`\\] ]]; then
+        echo "error: path '$v' contains whitespace or shell-special characters;" >&2
+        echo "       refusing to build (would break RUSTFLAGS tokenisation)." >&2
+        exit 1
+    fi
+done
+
 # Stable rustc flag. Format: --remap-path-prefix=FROM=TO.
 # - $CARGO_HOME → /cargo so dependency source paths become /cargo/registry/...
 # - $WORKSPACE  → /src so panic file:line refs in our own code become /src/...
@@ -54,22 +65,63 @@ BIN="target/release/contextcrawler"
 
 if [[ $VERIFY -eq 1 ]]; then
     echo "[build-release] verifying no builder paths leaked..."
-    # Allow strings under /Users/dev/... which are test fixture data baked into
-    # the binary (CompileSwift / etc test fixture strings) — those are not from
-    # the build environment.
-    # grep returns 1 when no matches, which combined with set -e/pipefail would
-    # abort the success path. Run inside a subshell that swallows the exit code.
-    LEAK_COUNT=$( (strings "$BIN" \
-        | grep -E "${HOME}|${CARGO_HOME_REAL}|${WORKSPACE_REAL}" \
-        | grep -vE '/Users/dev/' \
+    if [[ ! -f "$BIN" ]]; then
+        echo "error: $BIN does not exist (cargo build above must have failed?)" >&2
+        exit 1
+    fi
+    if ! command -v strings >/dev/null 2>&1; then
+        echo "error: 'strings' binary not found; cannot run leak verification" >&2
+        exit 1
+    fi
+
+    # Build fixed-string match files. grep -F treats every line as a literal,
+    # so path metacharacters (., -, +, brackets) don't matter.
+    PREFIXES_FILE=$(mktemp)
+    FIXTURE_TOKENS_FILE=$(mktemp)
+    trap 'rm -f "$PREFIXES_FILE" "$FIXTURE_TOKENS_FILE"' EXIT
+    printf '%s\n' "$HOME" "$CARGO_HOME_REAL" "$WORKSPACE_REAL" > "$PREFIXES_FILE"
+    # Test-fixture strings that contain /Users/dev/ as part of literal data
+    # embedded by src/filters/xcodebuild.toml (CompileSwift / CodeSign /
+    # ViewController.swift / App.swift / etc.) and src/cmds/dotnet/binlog.rs
+    # (.binlog Microsoft.Build paths). These tokens are highly specific —
+    # they won't appear in actual build-host metadata, so a real leak from a
+    # builder whose $HOME happens to be /Users/dev/ would still be flagged.
+    cat > "$FIXTURE_TOKENS_FILE" <<'EOF'
+CompileSwift
+CodeSign
+ViewController.swift
+AppDelegate.swift
+Model.swift
+Main.swift
+Tests.swift
+Microsoft.Build
+.binlog
+EOF
+
+    # Count leaks: strings | (matches a real builder prefix) | (NOT matching a
+    # known fixture token). pipefail off locally so grep's exit-1 (no matches)
+    # doesn't kill the script — exit-2+ (real error) still surfaces because
+    # we re-check via `set -e` outside the block.
+    set +o pipefail
+    LEAK_COUNT=$(strings "$BIN" \
+        | grep -F -f "$PREFIXES_FILE" \
+        | grep -vF -f "$FIXTURE_TOKENS_FILE" \
         | wc -l \
-        | tr -d ' ') || true )
+        | tr -d ' ')
+    PIPELINE_STATUS=${PIPESTATUS[0]:-0}
+    set -o pipefail
+
+    if [[ "$PIPELINE_STATUS" -ne 0 ]]; then
+        echo "error: 'strings $BIN' failed with exit $PIPELINE_STATUS" >&2
+        exit 1
+    fi
     LEAK_COUNT="${LEAK_COUNT:-0}"
+
     if [[ "$LEAK_COUNT" -ne 0 ]]; then
         echo "[build-release] FAIL: ${LEAK_COUNT} builder paths still embedded:" >&2
         strings "$BIN" \
-            | grep -E "${HOME}|${CARGO_HOME_REAL}|${WORKSPACE_REAL}" \
-            | grep -vE '/Users/dev/' \
+            | grep -F -f "$PREFIXES_FILE" \
+            | grep -vF -f "$FIXTURE_TOKENS_FILE" \
             | head -10 >&2
         exit 1
     fi
