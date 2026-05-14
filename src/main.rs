@@ -2543,6 +2543,12 @@ fn run_cli() -> Result<i32> {
                 "30",
                 "--max-filesize",
                 "67108864",
+                // Bound redirect-chain abuse independently from the time
+                // budget. curl's default is 50; cap at 10 so an attacker
+                // can't waste the entire --max-time on a long redirect
+                // chain. Codex review of the original commit flagged this.
+                "--max-redirs",
+                "10",
                 "--",
                 &url,
             ]);
