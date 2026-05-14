@@ -18,27 +18,61 @@ that brings the [jee599/contextzip](https://github.com/jee599/contextzip)
 feature set forward to current rtk and stitches in
 [Tirith](https://tirith.sh) for defense-in-depth on the auto-allow path.
 
-One binary, one name: **`contextcrawler`**. If you've been using `contextzip`
-and want to stay on a current rtk base without losing the contextzip extras,
-this is for you.
+One binary, one name: **`contextcrawler`**.
 
-## How it's put together
+## Goal
+
+Make AI coding agents both **cheaper** and **safer** without changing how
+you work:
+
+- **Cheaper** — compress noisy command output before it eats your LLM
+  context window. Inherits rtk's 60+ command filters, adds session-log
+  compaction, HTML extraction, multi-language stacktrace compression.
+- **Safer** — when an agent proposes a shell command, run it past two
+  optional gates before auto-approving: shell-syntax inspection (Tirith)
+  and pre-install supply-chain checks (package age + OSV CVE lookup).
+  Neither is mandatory; both are opt-in.
+
+If you were using `jee599/contextzip` and want the same features but on
+**current rtk**, this is the migration path.
+[`MIGRATING_FROM_CONTEXTZIP.md`](MIGRATING_FROM_CONTEXTZIP.md) walks
+you through it.
+
+## Features at a glance
+
+| Command | Purpose |
+|---|---|
+| `contextcrawler <git / cargo / npm / ...>` | Drop-in for everyday rtk-style filtering — 60+ command filters inherited from upstream. |
+| `contextcrawler web <url>` | Fetch a URL and strip HTML chrome (nav, ads, scripts). ~86% byte savings on typical landing pages. |
+| `contextcrawler sessions compact <id>` / `apply` / `expand` | Compact / promote / rollback Claude Code session-JSONL logs. Sidecar-based; never touches the original. |
+| `contextcrawler security` | Tirith integration dashboard — audit stats, gate mode, shell-hook status, top detection rules. |
+| `contextcrawler security log` | Merged gate-activity log (Tirith downgrades + supply-chain events), human-readable. `--json` for tooling. |
+| `contextcrawler supply-chain check '<cmd>'` | Inspect an install command for recent uploads + known CVEs. Opt-in via config. |
+| `contextcrawler hook claude` / `cursor` / `copilot` / `gemini` | Built-in agent-hook entrypoints. Configured by `contextcrawler init -g`. |
+| `contextcrawler gain` | Token-savings stats. Preserves your existing `contextzip` SQLite DB. |
+| `contextcrawler init -g` | Register with Claude Code (and other agents via `--agent`). |
+| Multi-language stacktrace compression | Wired into the runner pipeline. Detects framework frames in Node / Python / Rust / Go / Java tracebacks and drops them. Automatic. |
+| Tirith pre-execution gate | Optional. When Tirith is installed, auto-allow rewrites are routed through `tirith check` first. Block-level findings downgrade to *Ask*. Fail-open by default. |
+| Supply-chain pre-install gate | Optional. Refuses to auto-allow `npm install foo` or `pip install foo` when the resolved version is younger than a configurable cooldown (default 3d) or carries OSV-known CVEs. Honors pinned versions. |
+
+## Diagrams
+
+Click each section to expand. All diagrams are top-to-bottom Mermaid;
+GitHub renders them inline.
+
+<details>
+<summary><strong>1. Project lineage — where each piece comes from</strong></summary>
 
 ```mermaid
 flowchart TB
-    subgraph Upstreams["Upstreams (we vendor / call)"]
-        RTK["rtk-ai/rtk<br/>(Apache-2.0 / MIT)<br/>v0.39.0 core"]
-        CZIP["jee599/contextzip<br/>(MIT)<br/>session compactor, error_cmd, web_cmd"]
-        TIRITH["sheeki03/tirith<br/>(AGPL-3.0)<br/>shell-command security gate"]
-    end
+    RTK["rtk-ai/rtk<br/>(Apache-2.0 / MIT)<br/>v0.39.0 core<br/>+ 60+ command filters"]
+    CZIP["jee599/contextzip<br/>(MIT)<br/>session compactor<br/>error_cmd, web_cmd"]
+    TIRITH["sheeki03/tirith<br/>(AGPL-3.0)<br/>shell-command<br/>security gate"]
 
-    subgraph CC["ContextCrawler — this repo"]
-        FORK["rtk fork @ v0.39.0<br/>+ contextzip-downstream branch<br/>sentinel-blocked patches"]
-        PATCHES["Downstream modules:<br/>• supply_chain_gate<br/>• tirith_gate<br/>• security_cmd<br/>• session_compact_cmd<br/>• web_cmd<br/>• error_cmd"]
-        BIN["<code>contextcrawler</code><br/>single Rust binary"]
-    end
-
-    USERS["You / Claude / Cursor /<br/>Copilot / Gemini"]
+    FORK["rtk fork branch:<br/>contextzip-downstream<br/>sentinel-blocked patches"]
+    PATCHES["Downstream modules:<br/>supply_chain_gate<br/>tirith_gate<br/>security_cmd<br/>session_compact_cmd<br/>web_cmd · error_cmd"]
+    BIN["<code>contextcrawler</code><br/>single Rust binary"]
+    USERS["You / Claude / Cursor /<br/>Copilot / Gemini / OpenCode"]
 
     RTK -- "git rebase" --> FORK
     CZIP -- "ported MIT source<br/>(SPDX headers)" --> PATCHES
@@ -53,29 +87,32 @@ flowchart TB
     class FORK,PATCHES,BIN ours
 ```
 
-## What happens when an agent proposes a command
+</details>
+
+<details>
+<summary><strong>2. Runtime flow — what happens when an agent proposes a command</strong></summary>
 
 ```mermaid
-flowchart LR
+flowchart TB
     AGENT["Claude / Cursor /<br/>Copilot / Gemini"]
     AGENT -- "Bash tool call" --> HOOK["contextcrawler hook &lt;agent&gt;"]
 
-    HOOK --> RW{"Has rtk<br/>rewrite?"}
+    HOOK --> RW{"rtk-style<br/>rewrite available?"}
     RW -- "no" --> PASS["pass through<br/>(agent's normal prompt)"]
-    RW -- "yes" --> VERDICT{"Verdict from<br/>user's allow/ask/deny<br/>rules"}
+    RW -- "yes" --> VERDICT{"user's<br/>allow / ask / deny<br/>rules"}
 
-    VERDICT -- "deny" --> DENY["Claude Code's<br/>native deny prompt"]
-    VERDICT -- "ask/default" --> ASK["rewrite + ask<br/>(user reviews)"]
-    VERDICT -- "allow" --> TIRITH_GATE["Tirith gate<br/>(if installed)"]
+    VERDICT -- "deny" --> DENY["Claude Code<br/>native deny prompt"]
+    VERDICT -- "ask / default" --> ASK["rewrite + ask<br/>(user reviews)"]
+    VERDICT -- "allow" --> TIRITH_GATE{"Tirith gate<br/>(if installed)"}
 
     TIRITH_GATE -- "block" --> ASK
-    TIRITH_GATE -- "allow / unavailable" --> SC_GATE["Supply-chain gate<br/>(if config enabled<br/>+ install pattern detected)"]
+    TIRITH_GATE -- "allow / unavailable" --> SC_GATE{"Supply-chain gate<br/>(if enabled +<br/>install detected)"}
 
     SC_GATE -- "block<br/>(age / CVE)" --> ASK
-    SC_GATE -- "allow / skip" --> AUTO["auto-allow<br/>(permissionDecision: allow)"]
+    SC_GATE -- "allow / skip" --> AUTO["auto-allow<br/>permissionDecision: allow"]
 
-    AUTO --> RUN["Command runs<br/>through rtk's filters"]
-    RUN --> OUTPUT["Compressed output<br/>back to agent"]
+    AUTO --> RUN["command runs<br/>through rtk's filters"]
+    RUN --> OUTPUT["compressed output<br/>back to agent"]
 
     classDef gate fill:#2a0a2e,stroke:#e83e8c,color:#fff
     classDef terminal fill:#1a1a2e,stroke:#888,color:#ddd
@@ -83,18 +120,21 @@ flowchart LR
     class DENY,ASK,AUTO terminal
 ```
 
-## Feature surface
+</details>
+
+<details>
+<summary><strong>3. Feature surface — what the binary exposes</strong></summary>
 
 ```mermaid
 flowchart TB
     BIN["<code>contextcrawler</code>"]
 
-    BIN --> FILTERS["Command filters<br/>(60+ from rtk):<br/>git / cargo / npm / pnpm /<br/>vitest / playwright / docker /<br/>kubectl / pytest / ..."]
+    BIN --> FILTERS["Command filters<br/>(60+ from rtk):<br/>git · cargo · npm · pnpm ·<br/>vitest · playwright · docker ·<br/>kubectl · pytest · ..."]
     BIN --> WEB["<code>web &lt;url&gt;</code><br/>HTML content extractor"]
     BIN --> SESSIONS["<code>sessions</code><br/>compact / apply / expand<br/>Claude JSONL logs"]
-    BIN --> SECURITY["<code>security</code><br/>+ --log<br/>Tirith audit dashboard"]
+    BIN --> SECURITY["<code>security</code><br/>+ <code>security log</code><br/>Tirith dashboard + activity log"]
     BIN --> SUPPLY["<code>supply-chain check</code><br/>opt-in pre-install gate"]
-    BIN --> HOOK_SUB["<code>hook &lt;agent&gt;</code><br/>built-in entrypoint<br/>for agent integrations"]
+    BIN --> HOOK_SUB["<code>hook &lt;agent&gt;</code><br/>built-in agent hook"]
     BIN --> INIT["<code>init -g</code><br/>register with agents"]
     BIN --> GAIN["<code>gain</code><br/>token-savings stats<br/>(your contextzip DB)"]
 
@@ -104,23 +144,9 @@ flowchart TB
     class FILTERS,HOOK_SUB,INIT,GAIN inherited
 ```
 
-Pink-bordered boxes are ContextCrawler-specific additions; grey-bordered ones inherit from upstream rtk.
+Pink boxes are ContextCrawler additions; grey are inherited from upstream rtk.
 
-## What you get
-
-A single `contextcrawler` binary with these capabilities:
-
-| Surface | Purpose |
-|---|---|
-| `contextcrawler` (root) | Drop-in for everyday rtk-style filtering: `contextcrawler git status`, `contextcrawler cargo test`, etc. Same 60+ command filters rtk ships. |
-| `contextcrawler web <url>` | Fetch a URL with curl, strip nav/ads/scripts via `scraper`. ~86% byte savings on typical pages. |
-| `contextcrawler sessions compact <id>` | Compact Claude Code session JSONL — dedupes repeated file-reads, recompresses past Bash outputs. Sidecar-based; never touches the original. |
-| `contextcrawler sessions apply <id>` / `expand <id>` | Promote a sidecar to live / roll back. |
-| `contextcrawler security` | Tirith integration dashboard — audit stats, gate mode, detection-rule breakdown. |
-| `contextcrawler security --log` | Tail the local gate-downgrade log. |
-| `contextcrawler hook claude/cursor/copilot/gemini` | Built-in agent hook entrypoints (set in agent settings via `contextcrawler init`). |
-| Stacktrace compressor | Wired into the runner pipeline. Detects framework frames in Node / Python / Rust / Go / Java tracebacks and drops them. |
-| Tirith pre-execution gate | Optional. When `tirith` is installed, every auto-allow rewrite is first run past `tirith check`. Block-level findings downgrade to *Ask* so you review the command. Fail-open by default. |
+</details>
 
 ## Install
 
