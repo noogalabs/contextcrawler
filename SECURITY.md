@@ -18,7 +18,7 @@ collaboration thread.
 
 If you can't use GitHub's advisory flow, email:
 
-**daniel@hoff.id.au**
+**contextcrawler@thehoff.id.au**
 
 Please include:
 
