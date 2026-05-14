@@ -4,6 +4,14 @@ End-to-end runbook for cutting a release of ContextCrawler. Follow this
 in order. Steps that have automation are marked **[script]**; steps
 that still require human judgement are marked **[review]**.
 
+> **Prerequisite:** this runbook assumes `scripts/bump-version.sh` and
+> `scripts/build-release.sh` are on the branch you're releasing from.
+> The former ships on the `chore/release-runbook` branch in the v0.1.6
+> cycle; the latter ships on `feat/sec-strip-build-paths`. Both land on
+> `develop` when those branches merge — if you're cutting a release
+> from before that merge, fall back to plain `cargo build --release`
+> and skip the leak-verify steps below.
+
 ## Versioning
 
 ContextCrawler ships under the `v0.1.x` line. The internal Rust crate

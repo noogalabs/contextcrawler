@@ -148,7 +148,7 @@ patched file (their fix vs ours). Decide:
 | Clippy | `cargo clippy --all-targets -- -D unsafe_code` |
 | Audit | `cargo audit` |
 | Deny | `cargo deny check` |
-| Build leak | `scripts/build-release.sh --verify` |
+| Build leak | `scripts/build-release.sh --verify` (ships on `feat/sec-strip-build-paths` in the v0.1.6 cycle; fall back to a manual `cargo build --release && strings target/release/contextcrawler \| grep $HOME` if the script isn't on the branch yet) |
 | Smoke (argv guard) | `contextcrawler err 'sh -c "x"'` should refuse |
 | Smoke (OSC strip) | TBD: add a hyperlink emit fixture test |
 | Smoke (scrub) | `contextcrawler proxy curl -H 'Authorization: Bearer x' …` then check `gain --history` for `<REDACTED>` |
