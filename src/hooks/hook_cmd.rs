@@ -340,27 +340,31 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     });
 
     if verdict == PermissionVerdict::Allow {
-        // ===== contextzip-downstream: Tirith gate fires here =====
-        // When defense-in-depth is installed, consult Tirith before
-        // auto-allowing. Block-level verdicts (or fail-closed +
-        // unavailable) cause us to omit permissionDecision so Claude
-        // Code's normal review prompt fires for the original command.
+        // ===== contextzip-downstream: defense-in-depth gates fire here =====
+        // Two gates run before we emit `permissionDecision: "allow"`:
+        //   1. Tirith — shell-syntax inspection (homograph URLs, pipe-to-shell, etc.)
+        //   2. Supply-chain — npm/PyPI package age + OSV.dev CVE check
+        // Either gate blocking causes us to omit permissionDecision so
+        // Claude Code's normal review prompt fires for the original command.
         let tirith_verdict = super::tirith_gate::check(cmd);
-        match super::tirith_gate::should_downgrade(&tirith_verdict) {
-            Some((reason, tirith_json)) => {
-                super::tirith_gate::log_downgrade(cmd, reason, tirith_json);
-                // Intentionally do NOT insert "permissionDecision" — the
-                // rewrite still flows to Claude Code via updatedInput,
-                // but without the auto-allow flag the user gets prompted.
-            }
-            None => {
-                hook_output
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("permissionDecision".into(), json!("allow"));
-            }
+        let tirith_block = super::tirith_gate::should_downgrade(&tirith_verdict);
+
+        let sc_verdict = super::supply_chain_gate::check(cmd);
+        super::supply_chain_gate::log_event(cmd, &sc_verdict);
+        let sc_block = matches!(sc_verdict, super::supply_chain_gate::Verdict::Block(_));
+
+        if let Some((reason, tirith_json)) = tirith_block {
+            super::tirith_gate::log_downgrade(cmd, reason, tirith_json);
+            // Don't insert permissionDecision — let Claude Code prompt.
+        } else if sc_block {
+            // Don't insert permissionDecision — let Claude Code prompt.
+        } else {
+            hook_output
+                .as_object_mut()
+                .unwrap()
+                .insert("permissionDecision".into(), json!("allow"));
         }
-        // ===== contextzip-downstream: end Tirith gate =====
+        // ===== contextzip-downstream: end defense-in-depth gates =====
     }
 
     PayloadAction::Rewrite {

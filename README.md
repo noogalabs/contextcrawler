@@ -22,6 +22,90 @@ One binary, one name: **`contextcrawler`**. If you've been using `contextzip`
 and want to stay on a current rtk base without losing the contextzip extras,
 this is for you.
 
+## How it's put together
+
+```mermaid
+flowchart TB
+    subgraph Upstreams["Upstreams (we vendor / call)"]
+        RTK["rtk-ai/rtk<br/>(Apache-2.0 / MIT)<br/>v0.39.0 core"]
+        CZIP["jee599/contextzip<br/>(MIT)<br/>session compactor, error_cmd, web_cmd"]
+        TIRITH["sheeki03/tirith<br/>(AGPL-3.0)<br/>shell-command security gate"]
+    end
+
+    subgraph CC["ContextCrawler — this repo"]
+        FORK["rtk fork @ v0.39.0<br/>+ contextzip-downstream branch<br/>sentinel-blocked patches"]
+        PATCHES["Downstream modules:<br/>• supply_chain_gate<br/>• tirith_gate<br/>• security_cmd<br/>• session_compact_cmd<br/>• web_cmd<br/>• error_cmd"]
+        BIN["<code>contextcrawler</code><br/>single Rust binary"]
+    end
+
+    USERS["You / Claude / Cursor /<br/>Copilot / Gemini"]
+
+    RTK -- "git rebase" --> FORK
+    CZIP -- "ported MIT source<br/>(SPDX headers)" --> PATCHES
+    FORK --> BIN
+    PATCHES --> BIN
+    TIRITH -. "subprocess only<br/>(no AGPL link)" .-> BIN
+    BIN --> USERS
+
+    classDef upstream fill:#1a1a2e,stroke:#888,color:#ddd
+    classDef ours fill:#2a0a2e,stroke:#e83e8c,color:#fff
+    class RTK,CZIP,TIRITH upstream
+    class FORK,PATCHES,BIN ours
+```
+
+## What happens when an agent proposes a command
+
+```mermaid
+flowchart LR
+    AGENT["Claude / Cursor /<br/>Copilot / Gemini"]
+    AGENT -- "Bash tool call" --> HOOK["contextcrawler hook &lt;agent&gt;"]
+
+    HOOK --> RW{"Has rtk<br/>rewrite?"}
+    RW -- "no" --> PASS["pass through<br/>(agent's normal prompt)"]
+    RW -- "yes" --> VERDICT{"Verdict from<br/>user's allow/ask/deny<br/>rules"}
+
+    VERDICT -- "deny" --> DENY["Claude Code's<br/>native deny prompt"]
+    VERDICT -- "ask/default" --> ASK["rewrite + ask<br/>(user reviews)"]
+    VERDICT -- "allow" --> TIRITH_GATE["Tirith gate<br/>(if installed)"]
+
+    TIRITH_GATE -- "block" --> ASK
+    TIRITH_GATE -- "allow / unavailable" --> SC_GATE["Supply-chain gate<br/>(if config enabled<br/>+ install pattern detected)"]
+
+    SC_GATE -- "block<br/>(age / CVE)" --> ASK
+    SC_GATE -- "allow / skip" --> AUTO["auto-allow<br/>(permissionDecision: allow)"]
+
+    AUTO --> RUN["Command runs<br/>through rtk's filters"]
+    RUN --> OUTPUT["Compressed output<br/>back to agent"]
+
+    classDef gate fill:#2a0a2e,stroke:#e83e8c,color:#fff
+    classDef terminal fill:#1a1a2e,stroke:#888,color:#ddd
+    class TIRITH_GATE,SC_GATE gate
+    class DENY,ASK,AUTO terminal
+```
+
+## Feature surface
+
+```mermaid
+flowchart TB
+    BIN["<code>contextcrawler</code>"]
+
+    BIN --> FILTERS["Command filters<br/>(60+ from rtk):<br/>git / cargo / npm / pnpm /<br/>vitest / playwright / docker /<br/>kubectl / pytest / ..."]
+    BIN --> WEB["<code>web &lt;url&gt;</code><br/>HTML content extractor"]
+    BIN --> SESSIONS["<code>sessions</code><br/>compact / apply / expand<br/>Claude JSONL logs"]
+    BIN --> SECURITY["<code>security</code><br/>+ --log<br/>Tirith audit dashboard"]
+    BIN --> SUPPLY["<code>supply-chain check</code><br/>opt-in pre-install gate"]
+    BIN --> HOOK_SUB["<code>hook &lt;agent&gt;</code><br/>built-in entrypoint<br/>for agent integrations"]
+    BIN --> INIT["<code>init -g</code><br/>register with agents"]
+    BIN --> GAIN["<code>gain</code><br/>token-savings stats<br/>(your contextzip DB)"]
+
+    classDef new fill:#2a0a2e,stroke:#e83e8c,color:#fff
+    classDef inherited fill:#1a1a2e,stroke:#888,color:#ddd
+    class WEB,SESSIONS,SECURITY,SUPPLY new
+    class FILTERS,HOOK_SUB,INIT,GAIN inherited
+```
+
+Pink-bordered boxes are ContextCrawler-specific additions; grey-bordered ones inherit from upstream rtk.
+
 ## What you get
 
 A single `contextcrawler` binary with these capabilities:

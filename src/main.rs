@@ -797,8 +797,30 @@ enum Commands {
         #[command(subcommand)]
         command: SessionsCommands,
     },
+
+    /// Supply-chain gate — inspect npm / pip-style install commands for
+    /// recent uploads and known CVEs before they run. Opt-in via config.
+    SupplyChain {
+        #[command(subcommand)]
+        command: SupplyChainCommands,
+    },
     // ===== contextzip-downstream variants end =====
 }
+
+// ===== contextzip-downstream: SupplyChain subcommand group =====
+#[derive(Debug, Subcommand)]
+enum SupplyChainCommands {
+    /// Inspect a shell command for installs and report a verdict.
+    Check {
+        /// Output format: text (default) or json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Command to inspect
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+}
+// ===== end contextzip-downstream SupplyChain =====
 
 // ===== contextzip-downstream: Sessions subcommand group =====
 #[derive(Debug, Subcommand)]
@@ -2509,6 +2531,45 @@ fn run_cli() -> Result<i32> {
                 }
                 SessionsCommands::Expand { target } => {
                     analytics::session_compact_cmd::run_expand(&target, cli.verbose)?
+                }
+            }
+            0
+        }
+
+        Commands::SupplyChain { command } => {
+            match command {
+                SupplyChainCommands::Check { format, cmd } => {
+                    let joined = cmd.join(" ");
+                    let verdict = hooks::supply_chain_gate::check(&joined);
+                    hooks::supply_chain_gate::log_event(&joined, &verdict);
+                    match format.as_str() {
+                        "json" => {
+                            let payload = serde_json::json!({
+                                "verdict": match &verdict {
+                                    hooks::supply_chain_gate::Verdict::Skip => "skip",
+                                    hooks::supply_chain_gate::Verdict::Allow => "allow",
+                                    hooks::supply_chain_gate::Verdict::Block(_) => "block",
+                                    hooks::supply_chain_gate::Verdict::Unavailable(_) => "unavailable",
+                                },
+                                "findings": match &verdict {
+                                    hooks::supply_chain_gate::Verdict::Block(f) => serde_json::to_value(f).unwrap_or(serde_json::Value::Null),
+                                    _ => serde_json::Value::Array(vec![]),
+                                },
+                            });
+                            println!("{}", payload);
+                        }
+                        _ => {
+                            println!("{}", hooks::supply_chain_gate::render(&verdict));
+                        }
+                    }
+                    // Exit-code protocol: 0=skip/allow, 2=block, 3=unavailable
+                    match verdict {
+                        hooks::supply_chain_gate::Verdict::Block(_) => std::process::exit(2),
+                        hooks::supply_chain_gate::Verdict::Unavailable(_) => {
+                            std::process::exit(3)
+                        }
+                        _ => {}
+                    }
                 }
             }
             0
