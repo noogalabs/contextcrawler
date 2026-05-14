@@ -4,6 +4,10 @@ use super::permissions::{check_command, PermissionVerdict};
 use crate::discover::registry;
 use std::io::Write;
 
+// ===== contextzip-downstream: supply-chain gate import begin =====
+use super::supply_chain_gate;
+// ===== contextzip-downstream: supply-chain gate import end =====
+
 // ===== contextzip-downstream: Tirith pre-execution gate begin =====
 // Gate logic lives in `super::tirith_gate` so both this path and the
 // modern `rtk hook claude` path (hook_cmd.rs) share one implementation.
@@ -55,6 +59,18 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
                     std::process::exit(3);
                 }
                 // ===== contextzip-downstream: end Tirith gate =====
+
+                // ===== contextzip-downstream: supply-chain gate fires here =====
+                let sc_verdict = supply_chain_gate::check(cmd);
+                supply_chain_gate::log_event(cmd, &sc_verdict);
+                if let supply_chain_gate::Verdict::Block(_) = &sc_verdict {
+                    eprintln!("{}", supply_chain_gate::render(&sc_verdict));
+                    print!("{}", rewritten);
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(3);
+                }
+                // ===== contextzip-downstream: end supply-chain gate =====
+
                 print!("{}", rewritten);
                 let _ = std::io::stdout().flush();
                 Ok(())

@@ -61,13 +61,16 @@ pub fn check(cmd: &str) -> Verdict {
     };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    // Cheap parse: avoid pulling serde_json into the hot path.
-    if stdout.contains("\"action\":\"block\"") {
-        Verdict::Block { tirith_json: stdout }
-    } else if stdout.contains("\"action\":\"allow\"") {
-        Verdict::Allow
-    } else {
-        Verdict::Unavailable
+    // Parse structurally — substring matching on JSON is fragile (pretty-
+    // printed output, descriptions containing the word "block", etc.).
+    let parsed: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+        Ok(v) => v,
+        Err(_) => return Verdict::Unavailable,
+    };
+    match parsed.get("action").and_then(|x| x.as_str()) {
+        Some("block") => Verdict::Block { tirith_json: stdout },
+        Some("allow") => Verdict::Allow,
+        _ => Verdict::Unavailable,
     }
 }
 

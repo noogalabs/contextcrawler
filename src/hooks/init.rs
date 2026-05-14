@@ -2977,7 +2977,10 @@ mod tests {
         let rules_path = temp.path().join(".kilocode/rules/rtk-rules.md");
         assert!(rules_path.exists(), "Rules file should be created");
         let content = fs::read_to_string(&rules_path).unwrap();
-        assert!(content.contains("RTK"), "Rules file should contain RTK");
+        assert!(
+            content.contains("contextcrawler") || content.contains("ContextCrawler"),
+            "Rules file should contain ContextCrawler branding"
+        );
     }
 
     #[test]
@@ -3002,7 +3005,10 @@ mod tests {
         let rules_path = temp.path().join(".agents/rules/antigravity-rtk-rules.md");
         assert!(rules_path.exists(), "Rules file should be created");
         let content = fs::read_to_string(&rules_path).unwrap();
-        assert!(content.contains("RTK"), "Rules file should contain RTK");
+        assert!(
+            content.contains("contextcrawler") || content.contains("ContextCrawler"),
+            "Rules file should contain ContextCrawler branding"
+        );
     }
 
     #[test]

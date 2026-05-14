@@ -33,16 +33,16 @@ pub fn extract_content(input: &str) -> String {
 
     if has_main {
         for main_el in document.select(&main_sel) {
-            extract_element_text(&main_el, &mut output);
+            extract_element_text(&main_el, &mut output, 0);
         }
     } else {
         // Fall back to <body>, filtering out noise
         let body_sel = Selector::parse("body").expect("valid selector");
         if let Some(body) = document.select(&body_sel).next() {
-            extract_element_text(&body, &mut output);
+            extract_element_text(&body, &mut output, 0);
         } else {
             // No body tag — extract from root
-            extract_element_text(&document.root_element(), &mut output);
+            extract_element_text(&document.root_element(), &mut output, 0);
         }
     }
 
@@ -111,8 +111,22 @@ fn has_noise_class_or_id(element: &scraper::ElementRef) -> bool {
     false
 }
 
-/// Recursively extract text from an element, skipping noise
-fn extract_element_text(element: &scraper::element_ref::ElementRef, output: &mut String) {
+/// Maximum DOM nesting depth we'll recurse into. Adversarial pages can
+/// contain thousands of nested elements; without a cap the recursion will
+/// stack-overflow. Real content sits well under this.
+const MAX_DOM_DEPTH: usize = 256;
+
+/// Recursively extract text from an element, skipping noise. Bails when
+/// `depth` exceeds [`MAX_DOM_DEPTH`] to keep the stack bounded on
+/// adversarial input.
+fn extract_element_text(
+    element: &scraper::element_ref::ElementRef,
+    output: &mut String,
+    depth: usize,
+) {
+    if depth > MAX_DOM_DEPTH {
+        return;
+    }
     for child in element.children() {
         match child.value() {
             scraper::node::Node::Text(text) => {
@@ -185,7 +199,7 @@ fn extract_element_text(element: &scraper::element_ref::ElementRef, output: &mut
                                     | "summary"
                             );
 
-                            extract_element_text(child_el, output);
+                            extract_element_text(child_el, output, depth + 1);
 
                             if is_block {
                                 output.push('\n');

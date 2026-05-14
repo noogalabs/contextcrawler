@@ -11,6 +11,15 @@ use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+// ===== contextzip-downstream: drop redundant `rtk ` prefix in display =====
+// Every tracked command starts with `rtk ` in the SQLite column because the
+// registry rewriter emits "rtk <subcmd> ..." strings. That prefix is the
+// same on every row — strip it at display time so the table stays useful.
+fn display_cmd(s: &str) -> &str {
+    s.strip_prefix("rtk ").unwrap_or(s)
+}
+// ===== end contextzip-downstream =====
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     project: bool, // added: per-project scope flag
@@ -208,7 +217,7 @@ pub fn run(
 
             for (idx, (cmd, count, saved, pct, avg_time)) in summary.by_command.iter().enumerate() {
                 let row_idx = format!("{:>2}.", idx + 1);
-                let cmd_cell = style_command_cell(&truncate_for_column(cmd, cmd_width)); // added: colored command
+                let cmd_cell = style_command_cell(&truncate_for_column(display_cmd(cmd), cmd_width)); // added: colored command
                 let count_cell = format!("{:>count_width$}", count, count_width = count_width);
                 let saved_cell = format!(
                     "{:>saved_width$}",
@@ -246,10 +255,11 @@ pub fn run(
                 println!("──────────────────────────────────────────────────────────");
                 for rec in recent {
                     let time = rec.timestamp.with_timezone(&Local).format("%m-%d %H:%M");
-                    let cmd_short = if rec.rtk_cmd.len() > 25 {
-                        format!("{}...", &rec.rtk_cmd[..22])
+                    let display = display_cmd(&rec.rtk_cmd);
+                    let cmd_short = if display.len() > 25 {
+                        format!("{}...", &display[..22])
                     } else {
-                        rec.rtk_cmd.clone()
+                        display.to_string()
                     };
                     // added: tier indicators by savings level
                     let sign = if rec.savings_pct >= 70.0 {
@@ -707,10 +717,11 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
         println!("{}", styled("Top Commands (by frequency)", true));
         println!("{}", "─".repeat(60));
         for (cmd, count) in &summary.top_commands {
-            let cmd_display = if cmd.len() > 50 {
-                format!("{}...", &cmd[..47])
+            let display = display_cmd(cmd);
+            let cmd_display = if display.len() > 50 {
+                format!("{}...", &display[..47])
             } else {
-                cmd.clone()
+                display.to_string()
             };
             println!("  {:>4}x  {}", count, cmd_display);
         }

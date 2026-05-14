@@ -64,6 +64,12 @@ pub enum FindingReason {
         id: String,
         summary: String,
     },
+    /// The install command contained an editable / path / URL token (e.g.
+    /// `-e .`, `git+...`, `https://...`) and the ecosystem config does not
+    /// allow these to bypass review.
+    UnvettableSource {
+        token_kind: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -508,7 +514,12 @@ fn urlencoding(s: &str) -> String {
 }
 
 /// Query OSV.dev for any vulns affecting (ecosystem, package, version).
-fn osv_query(eco: Ecosystem, pkg: &str, version: &str) -> Result<Vec<(String, String)>, String> {
+/// Returns (id, summary, severity) per vuln so callers can apply a threshold.
+fn osv_query(
+    eco: Ecosystem,
+    pkg: &str,
+    version: &str,
+) -> Result<Vec<(String, String, Severity)>, String> {
     let body = serde_json::json!({
         "package": { "name": pkg, "ecosystem": eco.as_str() },
         "version": version
@@ -528,7 +539,8 @@ fn osv_query(eco: Ecosystem, pkg: &str, version: &str) -> Result<Vec<(String, St
                 .and_then(|x| x.as_str())
                 .unwrap_or("(no summary)")
                 .to_string();
-            Some((id, summary))
+            let severity = osv_severity(vuln);
+            Some((id, summary, severity))
         })
         .collect())
 }
@@ -570,6 +582,20 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 fn cache_file(eco: Ecosystem, pkg: &str) -> Option<PathBuf> {
+    // Refuse anything that could escape the cache directory or smuggle a
+    // path separator the caller didn't anticipate. Real npm/pypi names
+    // are an allowlist of [A-Za-z0-9._@/-]; we additionally reject `..`
+    // sequences and any backslash. If we can't represent the name
+    // safely we skip the cache (worst case: re-query the registry).
+    if pkg.is_empty()
+        || pkg.contains("..")
+        || pkg.contains('\\')
+        || pkg
+            .chars()
+            .any(|c| c.is_control() || c == ':' || c == '*' || c == '?')
+    {
+        return None;
+    }
     let safe = pkg.replace('/', "_").replace('@', "_at_");
     cache_dir().map(|d| d.join(format!("{}-{}.json", eco.as_str(), safe)))
 }
@@ -637,11 +663,23 @@ pub fn check(cmd: &str) -> Verdict {
             Ecosystem::Npm => &config.npm,
             Ecosystem::Pypi => &config.pypi,
         };
-        // Editable / path / URL installs bypass the gate per ecosystem policy.
-        if install.has_editable && eco_cfg.allow_editable {
-            continue;
-        }
         let block_threshold = Severity::parse(&eco_cfg.block_severity).unwrap_or(Severity::High);
+
+        // Editable / path / URL token detected. If the ecosystem disallows
+        // these (default for npm), we can't query a registry for that
+        // source — surface a finding so the user reviews manually. Either
+        // way we fall through and still vet any sibling named packages
+        // (e.g. `pip install -e . requests` must still check `requests`).
+        if install.has_editable && !eco_cfg.allow_editable {
+            findings.push(Finding {
+                package: "<editable / path / url>".to_string(),
+                ecosystem: install.ecosystem.as_str().to_string(),
+                reason: FindingReason::UnvettableSource {
+                    token_kind: "editable_or_url".to_string(),
+                },
+                severity: Severity::High,
+            });
+        }
 
         // Dedupe within an install: pip install foo bar foo -> check foo once.
         let mut seen = std::collections::HashSet::<(String, Option<String>)>::new();
@@ -698,8 +736,7 @@ pub fn check(cmd: &str) -> Verdict {
 
             // CVE check against the specific resolved/pinned version
             if let Ok(vulns) = osv_query(install.ecosystem, &pkg, &version) {
-                for (id, summary) in vulns {
-                    let sev = Severity::High;
+                for (id, summary, sev) in vulns {
                     if sev >= block_threshold {
                         findings.push(Finding {
                             package: pkg.clone(),
@@ -796,6 +833,12 @@ pub fn render(verdict: &Verdict) -> String {
                         s.push_str(&format!(
                             "  {} [{}]: {} — {} (severity {:?})\n",
                             f.package, f.ecosystem, id, summary, f.severity
+                        ));
+                    }
+                    FindingReason::UnvettableSource { token_kind } => {
+                        s.push_str(&format!(
+                            "  {} [{}]: install command contained an {} token that the gate cannot query (severity {:?})\n",
+                            f.package, f.ecosystem, token_kind, f.severity
                         ));
                     }
                 }
@@ -917,5 +960,49 @@ mod tests {
         let v = detect_installs("pip install https://example.com/pkg.tar.gz");
         assert!(v[0].has_editable);
         assert!(v[0].packages.is_empty());
+    }
+
+    #[test]
+    fn mixed_editable_and_named_keeps_named_packages() {
+        // `pip install -e . requests` must still surface `requests` as a
+        // vettable package — the editable token is a sibling, not a free
+        // pass for the whole install.
+        let v = detect_installs("pip install -e . requests");
+        assert_eq!(v.len(), 1);
+        assert!(v[0].has_editable);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn cache_file_rejects_traversal() {
+        // Package name containing `..` must not resolve to a cache path
+        // (would write to parent directory).
+        assert!(cache_file(Ecosystem::Npm, "..").is_none());
+        assert!(cache_file(Ecosystem::Npm, "../etc/passwd").is_none());
+        assert!(cache_file(Ecosystem::Pypi, "foo..bar").is_none());
+        assert!(cache_file(Ecosystem::Pypi, "").is_none());
+        assert!(cache_file(Ecosystem::Npm, "foo\\bar").is_none());
+        // Real names still work.
+        assert!(cache_file(Ecosystem::Npm, "lodash").is_some());
+        assert!(cache_file(Ecosystem::Npm, "@types/node").is_some());
+    }
+
+    #[test]
+    fn osv_severity_extracts_from_database_specific() {
+        let v: Value = serde_json::from_str(
+            r#"{"database_specific":{"severity":"MODERATE"}}"#,
+        )
+        .unwrap();
+        assert_eq!(osv_severity(&v), Severity::Medium);
+
+        let v: Value = serde_json::from_str(
+            r#"{"severity":[{"score":"CVSS:3.1/.../A:H CRITICAL"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(osv_severity(&v), Severity::Critical);
+
+        // No severity info → default High (so it doesn't slip past a HIGH threshold).
+        let v: Value = serde_json::from_str(r#"{"id":"OSV-2024"}"#).unwrap();
+        assert_eq!(osv_severity(&v), Severity::High);
     }
 }
