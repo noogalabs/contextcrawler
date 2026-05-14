@@ -630,15 +630,21 @@ mod tests {
     fn test_gemini_hook_uses_rewrite_command() {
         assert_eq!(
             rewrite_command("git status", &[]),
-            Some("rtk git status".into())
+            Some("contextcrawler git status".into())
         );
         assert_eq!(
             rewrite_command("cargo test", &[]),
-            Some("rtk cargo test".into())
+            Some("contextcrawler cargo test".into())
         );
+        // Legacy `rtk` prefix is still recognized as already-rewritten —
+        // passthrough returns the input unchanged.
         assert_eq!(
             rewrite_command("rtk git status", &[]),
             Some("rtk git status".into())
+        );
+        assert_eq!(
+            rewrite_command("contextcrawler git status", &[]),
+            Some("contextcrawler git status".into())
         );
         assert_eq!(rewrite_command("cat <<EOF", &[]), None);
     }
@@ -649,7 +655,7 @@ mod tests {
         assert_eq!(rewrite_command("curl https://example.com", &excluded), None);
         assert_eq!(
             rewrite_command("git status", &excluded),
-            Some("rtk git status".into())
+            Some("contextcrawler git status".into())
         );
     }
 
@@ -657,7 +663,7 @@ mod tests {
     fn test_gemini_hook_env_prefix_preserved() {
         assert_eq!(
             rewrite_command("RUST_LOG=debug cargo test", &[]),
-            Some("RUST_LOG=debug rtk cargo test".into())
+            Some("RUST_LOG=debug contextcrawler cargo test".into())
         );
     }
 
@@ -691,7 +697,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "rtk git status");
+        assert_eq!(cmd, "contextcrawler git status");
     }
 
     #[test]
@@ -700,7 +706,7 @@ mod tests {
         let result = run_claude_inner(&input).unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
         let updated = &v["hookSpecificOutput"]["updatedInput"];
-        assert_eq!(updated["command"], "rtk git status");
+        assert_eq!(updated["command"], "contextcrawler git status");
         assert_eq!(updated["timeout"], 30000);
         assert_eq!(updated["description"], "Check repo status");
     }
@@ -743,7 +749,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "GIT_PAGER=cat rtk git status");
+        assert_eq!(cmd, "GIT_PAGER=cat contextcrawler git status");
     }
 
     #[test]
@@ -754,7 +760,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "rtk git add . && rtk cargo test");
+        assert_eq!(cmd, "contextcrawler git add . && contextcrawler cargo test");
     }
 
     #[test]
@@ -793,7 +799,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         // Default permission (no explicit allow rule) → "ask"
         assert_eq!(v["permission"], "ask");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "contextcrawler git status");
         assert!(v.get("hookSpecificOutput").is_none());
     }
 

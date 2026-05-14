@@ -462,11 +462,30 @@ pub fn rewrite_command(cmd: &str, excluded: &[String]) -> Option<String> {
         || trimmed.contains(';')
         || trimmed.contains('|')
         || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !has_compound
+        && (trimmed.starts_with("rtk ")
+            || trimmed == "rtk"
+            || trimmed.starts_with("contextcrawler ")
+            || trimmed == "contextcrawler")
+    {
         return Some(trimmed.to_string());
     }
 
     rewrite_compound(trimmed, &compiled)
+}
+
+/// Swap the leading internal `rtk ` token on a rule's `rtk_cmd` (or other
+/// rewrite-output fragment) for the user-facing binary name. Internal
+/// classification/lookup logic keeps using `rtk` for upstream-rebase friction;
+/// only the strings that escape to user-visible hook output go through here.
+fn display_rtk(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("rtk ") {
+        format!("contextcrawler {rest}")
+    } else if s == "rtk" {
+        "contextcrawler".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
@@ -575,7 +594,7 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --max-lines {}", file, n));
+            return Some(format!("contextcrawler read {} --max-lines {}", file, n));
         }
     }
     if cmd.starts_with("head -") {
@@ -590,7 +609,7 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --tail-lines {}", file, n));
+            return Some(format!("contextcrawler read {} --tail-lines {}", file, n));
         }
     }
     None
@@ -673,8 +692,13 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
     // e.g. "git status 2>&1" → match "git status", re-append " 2>&1"
     let (cmd_part, redirect_suffix) = strip_trailing_redirects(trimmed);
 
-    // Already RTK — pass through unchanged
-    if cmd_part.starts_with("rtk ") || cmd_part == "rtk" {
+    // Already rewritten (either historical `rtk ` prefix or current
+    // `contextcrawler `) — pass through unchanged.
+    if cmd_part.starts_with("rtk ")
+        || cmd_part == "rtk"
+        || cmd_part.starts_with("contextcrawler ")
+        || cmd_part == "contextcrawler"
+    {
         return Some(trimmed.to_string());
     }
 
@@ -683,7 +707,7 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
     }
 
     // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
-    // semantics than rtk read or no equivalent at all. Only `-n` (line numbers)
+    // semantics than contextcrawler read or no equivalent at all. Only `-n` (line numbers)
     // maps correctly to `rtk read -n`. Skip rewrite for any other flag.
     if let Some(cmd_args) = cmd_part.strip_prefix("cat ") {
         let args = cmd_args.trim_start();
@@ -726,10 +750,10 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
 
     if let Some(parts) = parse_golangci_run_parts(cmd_clean) {
         let rewritten = if parts.global_segment.is_empty() {
-            format!("{}rtk golangci-lint {}", env_prefix, parts.run_segment)
+            format!("{}contextcrawler golangci-lint {}", env_prefix, parts.run_segment)
         } else {
             format!(
-                "{}rtk golangci-lint {} {}",
+                "{}contextcrawler golangci-lint {} {}",
                 env_prefix, parts.global_segment, parts.run_segment
             )
         };
@@ -737,7 +761,7 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
     }
 
     // #196: gh with --json/--jq/--template produces structured output that
-    // rtk gh would corrupt — skip rewrite so the caller gets raw JSON.
+    // contextcrawler gh would corrupt — skip rewrite so the caller gets raw JSON.
     if rule.rtk_cmd == "rtk gh" {
         let args_lower = cmd_clean.to_lowercase();
         if args_lower.contains("--json")
@@ -749,12 +773,13 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
     }
 
     // Try each rewrite prefix (longest first) with word-boundary check
+    let display_cmd = display_rtk(rule.rtk_cmd);
     for &prefix in rule.rewrite_prefixes {
         if let Some(rest) = strip_word_prefix(cmd_clean, prefix) {
             let rewritten = if rest.is_empty() {
-                format!("{}{}{}", env_prefix, rule.rtk_cmd, redirect_suffix)
+                format!("{}{}{}", env_prefix, display_cmd, redirect_suffix)
             } else {
-                format!("{}{} {}{}", env_prefix, rule.rtk_cmd, rest, redirect_suffix)
+                format!("{}{} {}{}", env_prefix, display_cmd, rest, redirect_suffix)
             };
             return Some(rewritten);
         }
@@ -826,7 +851,7 @@ mod tests {
     fn test_rewrite_yadm_status() {
         assert_eq!(
             rewrite_command("yadm status", &[]),
-            Some("rtk git status".to_string())
+            Some("contextcrawler git status".to_string())
         );
     }
 
@@ -1128,7 +1153,7 @@ mod tests {
     fn test_rewrite_git_status() {
         assert_eq!(
             rewrite_command("git status", &[]),
-            Some("rtk git status".into())
+            Some("contextcrawler git status".into())
         );
     }
 
@@ -1136,7 +1161,7 @@ mod tests {
     fn test_rewrite_git_log() {
         assert_eq!(
             rewrite_command("git log -10", &[]),
-            Some("rtk git log -10".into())
+            Some("contextcrawler git log -10".into())
         );
     }
 
@@ -1146,7 +1171,7 @@ mod tests {
     fn test_rewrite_git_dash_c_status() {
         assert_eq!(
             rewrite_command("git -C /path/to/repo status", &[]),
-            Some("rtk git -C /path/to/repo status".into())
+            Some("contextcrawler git -C /path/to/repo status".into())
         );
     }
 
@@ -1154,7 +1179,7 @@ mod tests {
     fn test_rewrite_git_dash_c_log() {
         assert_eq!(
             rewrite_command("git -C /tmp/myrepo log --oneline -5", &[]),
-            Some("rtk git -C /tmp/myrepo log --oneline -5".into())
+            Some("contextcrawler git -C /tmp/myrepo log --oneline -5".into())
         );
     }
 
@@ -1162,7 +1187,7 @@ mod tests {
     fn test_rewrite_git_dash_c_diff() {
         assert_eq!(
             rewrite_command("git -C /home/user/project diff --name-only", &[]),
-            Some("rtk git -C /home/user/project diff --name-only".into())
+            Some("contextcrawler git -C /home/user/project diff --name-only".into())
         );
     }
 
@@ -1186,7 +1211,7 @@ mod tests {
     fn test_rewrite_cargo_test() {
         assert_eq!(
             rewrite_command("cargo test", &[]),
-            Some("rtk cargo test".into())
+            Some("contextcrawler cargo test".into())
         );
     }
 
@@ -1194,7 +1219,7 @@ mod tests {
     fn test_rewrite_compound_and() {
         assert_eq!(
             rewrite_command("git add . && cargo test", &[]),
-            Some("rtk git add . && rtk cargo test".into())
+            Some("contextcrawler git add . && contextcrawler cargo test".into())
         );
     }
 
@@ -1205,15 +1230,22 @@ mod tests {
                 "cargo fmt --all && cargo clippy --all-targets && cargo test",
                 &[]
             ),
-            Some("rtk cargo fmt --all && rtk cargo clippy --all-targets && rtk cargo test".into())
+            Some("contextcrawler cargo fmt --all && contextcrawler cargo clippy --all-targets && contextcrawler cargo test".into())
         );
     }
 
     #[test]
     fn test_rewrite_already_rtk() {
+        // Legacy `rtk` prefix is still recognized as already-rewritten —
+        // passthrough returns the input unchanged.
         assert_eq!(
             rewrite_command("rtk git status", &[]),
             Some("rtk git status".into())
+        );
+        // Current `contextcrawler` prefix likewise passes through.
+        assert_eq!(
+            rewrite_command("contextcrawler git status", &[]),
+            Some("contextcrawler git status".into())
         );
     }
 
@@ -1221,7 +1253,7 @@ mod tests {
     fn test_rewrite_background_single_amp() {
         assert_eq!(
             rewrite_command("cargo test & git status", &[]),
-            Some("rtk cargo test & rtk git status".into())
+            Some("contextcrawler cargo test & contextcrawler git status".into())
         );
     }
 
@@ -1229,7 +1261,7 @@ mod tests {
     fn test_rewrite_background_unsupported_right() {
         assert_eq!(
             rewrite_command("cargo test & htop", &[]),
-            Some("rtk cargo test & htop".into())
+            Some("contextcrawler cargo test & htop".into())
         );
     }
 
@@ -1238,7 +1270,7 @@ mod tests {
         // `&&` must still work after adding `&` support
         assert_eq!(
             rewrite_command("cargo test && git status", &[]),
-            Some("rtk cargo test && rtk git status".into())
+            Some("contextcrawler cargo test && contextcrawler git status".into())
         );
     }
 
@@ -1256,7 +1288,7 @@ mod tests {
     fn test_rewrite_with_env_prefix() {
         assert_eq!(
             rewrite_command("GIT_SSH_COMMAND=ssh git push", &[]),
-            Some("GIT_SSH_COMMAND=ssh rtk git push".into())
+            Some("GIT_SSH_COMMAND=ssh contextcrawler git push".into())
         );
     }
 
@@ -1282,7 +1314,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(&format!("{command} --noEmit"), &[]),
-                Some("rtk tsc --noEmit".into()),
+                Some("contextcrawler tsc --noEmit".into()),
                 "Failed for command: {}",
                 command
             );
@@ -1293,13 +1325,13 @@ mod tests {
     fn test_rewrite_cat_file() {
         assert_eq!(
             rewrite_command("cat src/main.rs", &[]),
-            Some("rtk read src/main.rs".into())
+            Some("contextcrawler read src/main.rs".into())
         );
     }
 
     #[test]
     fn test_rewrite_cat_with_incompatible_flags_skipped() {
-        // cat flags with different semantics than rtk read — skip rewrite
+        // cat flags with different semantics than contextcrawler read — skip rewrite
         assert_eq!(rewrite_command("cat -A file.cpp", &[]), None);
         assert_eq!(rewrite_command("cat -v file.txt", &[]), None);
         assert_eq!(rewrite_command("cat -e file.txt", &[]), None);
@@ -1310,10 +1342,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_cat_with_compatible_flags() {
-        // cat -n (line numbers) maps to rtk read -n — allow rewrite
+        // cat -n (line numbers) maps to contextcrawler read -n — allow rewrite
         assert_eq!(
             rewrite_command("cat -n file.txt", &[]),
-            Some("rtk read -n file.txt".into())
+            Some("contextcrawler read -n file.txt".into())
         );
     }
 
@@ -1321,7 +1353,7 @@ mod tests {
     fn test_rewrite_rg_pattern() {
         assert_eq!(
             rewrite_command("rg \"fn main\"", &[]),
-            Some("rtk grep \"fn main\"".into())
+            Some("contextcrawler grep \"fn main\"".into())
         );
     }
 
@@ -1347,7 +1379,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(&format!("{command} test"), &[]),
-                Some("rtk playwright test".into()),
+                Some("contextcrawler playwright test".into()),
                 "Failed for command: {}",
                 command
             );
@@ -1376,7 +1408,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(&format!("{command} --turbo"), &[]),
-                Some("rtk next --turbo".into()),
+                Some("contextcrawler next --turbo".into()),
                 "Failed for command: {}",
                 command
             );
@@ -1388,13 +1420,13 @@ mod tests {
         // After a pipe, the filter command stays raw
         assert_eq!(
             rewrite_command("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            Some("contextcrawler git log -10 | grep feat".into())
         );
     }
 
     #[test]
     fn test_rewrite_find_pipe_skipped() {
-        // find in a pipe should NOT be rewritten — rtk find output format
+        // find in a pipe should NOT be rewritten — contextcrawler find output format
         // is incompatible with pipe consumers like xargs (#439)
         assert_eq!(
             rewrite_command("find . -name '*.rs' | xargs grep 'fn run'", &[]),
@@ -1412,7 +1444,7 @@ mod tests {
         // find WITHOUT a pipe should still be rewritten
         assert_eq!(
             rewrite_command("find . -name '*.rs'", &[]),
-            Some("rtk find . -name '*.rs'".into())
+            Some("contextcrawler find . -name '*.rs'".into())
         );
     }
 
@@ -1429,10 +1461,11 @@ mod tests {
 
     #[test]
     fn test_rewrite_mixed_compound_partial() {
-        // First segment already RTK, second gets rewritten
+        // First segment already RTK (legacy prefix passes through unchanged),
+        // second gets rewritten to the current `contextcrawler` prefix.
         assert_eq!(
             rewrite_command("rtk git add . && cargo test", &[]),
-            Some("rtk git add . && rtk cargo test".into())
+            Some("rtk git add . && contextcrawler cargo test".into())
         );
     }
 
@@ -1507,7 +1540,7 @@ mod tests {
     fn test_rewrite_non_rtk_disabled_env_still_rewrites() {
         assert_eq!(
             rewrite_command("SOME_VAR=1 git status", &[]),
-            Some("SOME_VAR=1 rtk git status".into())
+            Some("SOME_VAR=1 contextcrawler git status".into())
         );
     }
 
@@ -1518,7 +1551,7 @@ mod tests {
                 r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git push"#,
                 &[]
             ),
-            Some(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" rtk git push"#.into())
+            Some(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" contextcrawler git push"#.into())
         );
     }
 
@@ -1526,7 +1559,7 @@ mod tests {
     fn test_rewrite_env_single_quoted_value_with_spaces() {
         assert_eq!(
             rewrite_command("EDITOR='vim -u NONE' git commit", &[]),
-            Some("EDITOR='vim -u NONE' rtk git commit".into())
+            Some("EDITOR='vim -u NONE' contextcrawler git commit".into())
         );
     }
 
@@ -1534,7 +1567,7 @@ mod tests {
     fn test_rewrite_env_quoted_plus_unquoted() {
         assert_eq!(
             rewrite_command(r#"FOO="bar baz" BAR=1 git status"#, &[]),
-            Some(r#"FOO="bar baz" BAR=1 rtk git status"#.into())
+            Some(r#"FOO="bar baz" BAR=1 contextcrawler git status"#.into())
         );
     }
 
@@ -1542,7 +1575,7 @@ mod tests {
     fn test_rewrite_env_escaped_quotes_in_value() {
         assert_eq!(
             rewrite_command(r#"FOO="he said \"hello\"" git status"#, &[]),
-            Some(r#"FOO="he said \"hello\"" rtk git status"#.into())
+            Some(r#"FOO="he said \"hello\"" contextcrawler git status"#.into())
         );
     }
 
@@ -1565,7 +1598,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
         assert_eq!(
             rewrite_command("cargo test 2>&1 | head", &[]),
-            Some("rtk cargo test 2>&1 | head".into())
+            Some("contextcrawler cargo test 2>&1 | head".into())
         );
     }
 
@@ -1573,7 +1606,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_trailing() {
         assert_eq!(
             rewrite_command("cargo test 2>&1", &[]),
-            Some("rtk cargo test 2>&1".into())
+            Some("contextcrawler cargo test 2>&1".into())
         );
     }
 
@@ -1582,7 +1615,7 @@ mod tests {
         // 2>/dev/null has no `&`, never broken — non-regression
         assert_eq!(
             rewrite_command("git status 2>/dev/null", &[]),
-            Some("rtk git status 2>/dev/null".into())
+            Some("contextcrawler git status 2>/dev/null".into())
         );
     }
 
@@ -1590,7 +1623,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_with_and() {
         assert_eq!(
             rewrite_command("cargo test 2>&1 && echo done", &[]),
-            Some("rtk cargo test 2>&1 && echo done".into())
+            Some("contextcrawler cargo test 2>&1 && echo done".into())
         );
     }
 
@@ -1598,7 +1631,7 @@ mod tests {
     fn test_rewrite_redirect_amp_gt_devnull() {
         assert_eq!(
             rewrite_command("cargo test &>/dev/null", &[]),
-            Some("rtk cargo test &>/dev/null".into())
+            Some("contextcrawler cargo test &>/dev/null".into())
         );
     }
 
@@ -1607,7 +1640,7 @@ mod tests {
         // Double redirect: only last one stripped, but full command rewrites correctly
         assert_eq!(
             rewrite_command("git status 2>&1 >/dev/null", &[]),
-            Some("rtk git status 2>&1 >/dev/null".into())
+            Some("contextcrawler git status 2>&1 >/dev/null".into())
         );
     }
 
@@ -1616,7 +1649,7 @@ mod tests {
         // 2>&- (close stderr fd)
         assert_eq!(
             rewrite_command("git status 2>&-", &[]),
-            Some("rtk git status 2>&-".into())
+            Some("contextcrawler git status 2>&-".into())
         );
     }
 
@@ -1636,7 +1669,7 @@ mod tests {
         // background `&` must still work after redirect fix
         assert_eq!(
             rewrite_command("cargo test & git status", &[]),
-            Some("rtk cargo test & rtk git status".into())
+            Some("contextcrawler cargo test & contextcrawler git status".into())
         );
     }
 
@@ -1644,10 +1677,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_head_numeric_flag() {
-        // head -20 file → rtk read file --max-lines 20 (not rtk read -20 file)
+        // head -20 file → contextcrawler read file --max-lines 20 (not contextcrawler read -20 file)
         assert_eq!(
             rewrite_command("head -20 src/main.rs", &[]),
-            Some("rtk read src/main.rs --max-lines 20".into())
+            Some("contextcrawler read src/main.rs --max-lines 20".into())
         );
     }
 
@@ -1655,7 +1688,7 @@ mod tests {
     fn test_rewrite_head_lines_long_flag() {
         assert_eq!(
             rewrite_command("head --lines=50 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --max-lines 50".into())
+            Some("contextcrawler read src/lib.rs --max-lines 50".into())
         );
     }
 
@@ -1664,7 +1697,7 @@ mod tests {
         // plain `head file` → `rtk read file` (no numeric flag)
         assert_eq!(
             rewrite_command("head src/main.rs", &[]),
-            Some("rtk read src/main.rs".into())
+            Some("contextcrawler read src/main.rs".into())
         );
     }
 
@@ -1678,7 +1711,7 @@ mod tests {
     fn test_rewrite_tail_numeric_flag() {
         assert_eq!(
             rewrite_command("tail -20 src/main.rs", &[]),
-            Some("rtk read src/main.rs --tail-lines 20".into())
+            Some("contextcrawler read src/main.rs --tail-lines 20".into())
         );
     }
 
@@ -1686,7 +1719,7 @@ mod tests {
     fn test_rewrite_tail_n_space_flag() {
         assert_eq!(
             rewrite_command("tail -n 12 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --tail-lines 12".into())
+            Some("contextcrawler read src/lib.rs --tail-lines 12".into())
         );
     }
 
@@ -1694,7 +1727,7 @@ mod tests {
     fn test_rewrite_tail_lines_long_flag() {
         assert_eq!(
             rewrite_command("tail --lines=7 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --tail-lines 7".into())
+            Some("contextcrawler read src/lib.rs --tail-lines 7".into())
         );
     }
 
@@ -1702,7 +1735,7 @@ mod tests {
     fn test_rewrite_tail_lines_space_flag() {
         assert_eq!(
             rewrite_command("tail --lines 7 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --tail-lines 7".into())
+            Some("contextcrawler read src/lib.rs --tail-lines 7".into())
         );
     }
 
@@ -1808,7 +1841,7 @@ mod tests {
     fn test_rewrite_glab_mr_list() {
         assert_eq!(
             rewrite_command("glab mr list", &[]),
-            Some("rtk glab mr list".into())
+            Some("contextcrawler glab mr list".into())
         );
     }
 
@@ -1816,7 +1849,7 @@ mod tests {
     fn test_rewrite_glab_ci_status() {
         assert_eq!(
             rewrite_command("glab ci status", &[]),
-            Some("rtk glab ci status".into())
+            Some("contextcrawler glab ci status".into())
         );
     }
 
@@ -1912,7 +1945,7 @@ mod tests {
     fn test_rewrite_tree() {
         assert_eq!(
             rewrite_command("tree src/", &[]),
-            Some("rtk tree src/".into())
+            Some("contextcrawler tree src/".into())
         );
     }
 
@@ -1920,7 +1953,7 @@ mod tests {
     fn test_rewrite_diff() {
         assert_eq!(
             rewrite_command("diff file1.txt file2.txt", &[]),
-            Some("rtk diff file1.txt file2.txt".into())
+            Some("contextcrawler diff file1.txt file2.txt".into())
         );
     }
 
@@ -1928,7 +1961,7 @@ mod tests {
     fn test_rewrite_gh_release() {
         assert_eq!(
             rewrite_command("gh release list", &[]),
-            Some("rtk gh release list".into())
+            Some("contextcrawler gh release list".into())
         );
     }
 
@@ -1936,7 +1969,7 @@ mod tests {
     fn test_rewrite_cargo_install() {
         assert_eq!(
             rewrite_command("cargo install rtk", &[]),
-            Some("rtk cargo install rtk".into())
+            Some("contextcrawler cargo install rtk".into())
         );
     }
 
@@ -1944,7 +1977,7 @@ mod tests {
     fn test_rewrite_kubectl_describe() {
         assert_eq!(
             rewrite_command("kubectl describe pod mypod", &[]),
-            Some("rtk kubectl describe pod mypod".into())
+            Some("contextcrawler kubectl describe pod mypod".into())
         );
     }
 
@@ -1952,7 +1985,7 @@ mod tests {
     fn test_rewrite_docker_run() {
         assert_eq!(
             rewrite_command("docker run --rm ubuntu bash", &[]),
-            Some("rtk docker run --rm ubuntu bash".into())
+            Some("contextcrawler docker run --rm ubuntu bash".into())
         );
     }
 
@@ -1973,7 +2006,7 @@ mod tests {
     fn test_rewrite_swift_test() {
         assert_eq!(
             rewrite_command("swift test --parallel", &[]),
-            Some("rtk swift test --parallel".into())
+            Some("contextcrawler swift test --parallel".into())
         );
     }
 
@@ -1983,7 +2016,7 @@ mod tests {
     fn test_rewrite_docker_compose_ps() {
         assert_eq!(
             rewrite_command("docker compose ps", &[]),
-            Some("rtk docker compose ps".into())
+            Some("contextcrawler docker compose ps".into())
         );
     }
 
@@ -1991,7 +2024,7 @@ mod tests {
     fn test_rewrite_docker_compose_logs() {
         assert_eq!(
             rewrite_command("docker compose logs web", &[]),
-            Some("rtk docker compose logs web".into())
+            Some("contextcrawler docker compose logs web".into())
         );
     }
 
@@ -1999,7 +2032,7 @@ mod tests {
     fn test_rewrite_docker_compose_build() {
         assert_eq!(
             rewrite_command("docker compose build", &[]),
-            Some("rtk docker compose build".into())
+            Some("contextcrawler docker compose build".into())
         );
     }
 
@@ -2071,7 +2104,7 @@ mod tests {
     fn test_rewrite_aws() {
         assert_eq!(
             rewrite_command("aws s3 ls", &[]),
-            Some("rtk aws s3 ls".into())
+            Some("contextcrawler aws s3 ls".into())
         );
     }
 
@@ -2079,7 +2112,7 @@ mod tests {
     fn test_rewrite_aws_ec2() {
         assert_eq!(
             rewrite_command("aws ec2 describe-instances --region us-east-1", &[]),
-            Some("rtk aws ec2 describe-instances --region us-east-1".into())
+            Some("contextcrawler aws ec2 describe-instances --region us-east-1".into())
         );
     }
 
@@ -2087,7 +2120,7 @@ mod tests {
     fn test_rewrite_psql() {
         assert_eq!(
             rewrite_command("psql -U postgres -d mydb", &[]),
-            Some("rtk psql -U postgres -d mydb".into())
+            Some("contextcrawler psql -U postgres -d mydb".into())
         );
     }
 
@@ -2163,7 +2196,7 @@ mod tests {
     fn test_rewrite_ruff_check() {
         assert_eq!(
             rewrite_command("ruff check .", &[]),
-            Some("rtk ruff check .".into())
+            Some("contextcrawler ruff check .".into())
         );
     }
 
@@ -2171,7 +2204,7 @@ mod tests {
     fn test_rewrite_ruff_format() {
         assert_eq!(
             rewrite_command("ruff format src/", &[]),
-            Some("rtk ruff format src/".into())
+            Some("contextcrawler ruff format src/".into())
         );
     }
 
@@ -2179,7 +2212,7 @@ mod tests {
     fn test_rewrite_pytest() {
         assert_eq!(
             rewrite_command("pytest tests/", &[]),
-            Some("rtk pytest tests/".into())
+            Some("contextcrawler pytest tests/".into())
         );
     }
 
@@ -2187,7 +2220,7 @@ mod tests {
     fn test_rewrite_python_m_pytest() {
         assert_eq!(
             rewrite_command("python -m pytest -x tests/", &[]),
-            Some("rtk pytest -x tests/".into())
+            Some("contextcrawler pytest -x tests/".into())
         );
     }
 
@@ -2195,7 +2228,7 @@ mod tests {
     fn test_rewrite_pip_list() {
         assert_eq!(
             rewrite_command("pip list", &[]),
-            Some("rtk pip list".into())
+            Some("contextcrawler pip list".into())
         );
     }
 
@@ -2203,7 +2236,7 @@ mod tests {
     fn test_rewrite_pip_outdated() {
         assert_eq!(
             rewrite_command("pip outdated", &[]),
-            Some("rtk pip outdated".into())
+            Some("contextcrawler pip outdated".into())
         );
     }
 
@@ -2211,7 +2244,7 @@ mod tests {
     fn test_rewrite_uv_pip_list() {
         assert_eq!(
             rewrite_command("uv pip list", &[]),
-            Some("rtk pip list".into())
+            Some("contextcrawler pip list".into())
         );
     }
 
@@ -2331,7 +2364,7 @@ mod tests {
     fn test_rewrite_go_test() {
         assert_eq!(
             rewrite_command("go test ./...", &[]),
-            Some("rtk go test ./...".into())
+            Some("contextcrawler go test ./...".into())
         );
     }
 
@@ -2339,7 +2372,7 @@ mod tests {
     fn test_rewrite_go_build() {
         assert_eq!(
             rewrite_command("go build ./...", &[]),
-            Some("rtk go build ./...".into())
+            Some("contextcrawler go build ./...".into())
         );
     }
 
@@ -2347,7 +2380,7 @@ mod tests {
     fn test_rewrite_go_vet() {
         assert_eq!(
             rewrite_command("go vet ./...", &[]),
-            Some("rtk go vet ./...".into())
+            Some("contextcrawler go vet ./...".into())
         );
     }
 
@@ -2355,7 +2388,7 @@ mod tests {
     fn test_rewrite_golangci_lint() {
         assert_eq!(
             rewrite_command("golangci-lint run ./...", &[]),
-            Some("rtk golangci-lint run ./...".into())
+            Some("contextcrawler golangci-lint run ./...".into())
         );
     }
 
@@ -2363,7 +2396,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_flag_before_run() {
         assert_eq!(
             rewrite_command("golangci-lint -v run ./...", &[]),
-            Some("rtk golangci-lint -v run ./...".into())
+            Some("contextcrawler golangci-lint -v run ./...".into())
         );
     }
 
@@ -2371,7 +2404,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_value_flag_before_run() {
         assert_eq!(
             rewrite_command("golangci-lint --color never run ./...", &[]),
-            Some("rtk golangci-lint --color never run ./...".into())
+            Some("contextcrawler golangci-lint --color never run ./...".into())
         );
     }
 
@@ -2379,7 +2412,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_inline_value_flag_before_run() {
         assert_eq!(
             rewrite_command("golangci-lint --color=never run ./...", &[]),
-            Some("rtk golangci-lint --color=never run ./...".into())
+            Some("contextcrawler golangci-lint --color=never run ./...".into())
         );
     }
 
@@ -2387,7 +2420,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_inline_config_flag_before_run() {
         assert_eq!(
             rewrite_command("golangci-lint --config=foo.yml run ./...", &[]),
-            Some("rtk golangci-lint --config=foo.yml run ./...".into())
+            Some("contextcrawler golangci-lint --config=foo.yml run ./...".into())
         );
     }
 
@@ -2395,7 +2428,7 @@ mod tests {
     fn test_rewrite_env_prefixed_golangci_lint_with_value_flag_before_run() {
         assert_eq!(
             rewrite_command("FOO=1 golangci-lint --color never run ./...", &[]),
-            Some("FOO=1 rtk golangci-lint --color never run ./...".into())
+            Some("FOO=1 contextcrawler golangci-lint --color never run ./...".into())
         );
     }
 
@@ -2403,7 +2436,7 @@ mod tests {
     fn test_rewrite_env_prefixed_golangci_lint_with_inline_value_flag_before_run() {
         assert_eq!(
             rewrite_command("FOO=1 golangci-lint --color=never run ./...", &[]),
-            Some("FOO=1 rtk golangci-lint --color=never run ./...".into())
+            Some("FOO=1 contextcrawler golangci-lint --color=never run ./...".into())
         );
     }
 
@@ -2527,7 +2560,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(command, &[]),
-                Some("rtk lint".into()),
+                Some("contextcrawler lint".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2620,7 +2653,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(command, &[]),
-                Some("rtk jest".into()),
+                Some("contextcrawler jest".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2713,7 +2746,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(command, &[]),
-                Some("rtk vitest".into()),
+                Some("contextcrawler vitest".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2776,7 +2809,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(format!("{command} migrate dev").as_str(), &[]),
-                Some("rtk prisma migrate dev".into()),
+                Some("contextcrawler prisma migrate dev".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2805,7 +2838,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(format!("{command} --check src/").as_str(), &[]),
-                Some("rtk prettier --check src/".into()),
+                Some("contextcrawler prettier --check src/".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2827,7 +2860,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(format!("pnpm {command}").as_str(), &[]),
-                Some(format!("rtk pnpm {command}")),
+                Some(format!("contextcrawler pnpm {command}")),
                 "Failed for command: pnpm {}",
                 command
             );
@@ -2840,7 +2873,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command(format!("npm {command}").as_str(), &[]),
-                Some(format!("rtk npm {command}")),
+                Some(format!("contextcrawler npm {command}")),
                 "Failed for bare command: npm {}",
                 command
             );
@@ -2851,11 +2884,11 @@ mod tests {
     fn test_rewrite_npm_with_args() {
         assert_eq!(
             rewrite_command("npm run test", &[]),
-            Some("rtk npm run test".to_string()),
+            Some("contextcrawler npm run test".to_string()),
         );
         assert_eq!(
             rewrite_command("npm exec vitest", &[]),
-            Some("rtk vitest".to_string()),
+            Some("contextcrawler vitest".to_string()),
         );
     }
 
@@ -2863,7 +2896,7 @@ mod tests {
     fn test_rewrite_npx() {
         assert_eq!(
             rewrite_command("npx svgo", &[]),
-            Some("rtk npx svgo".to_string()),
+            Some("contextcrawler npx svgo".to_string()),
         );
     }
     // --- Compound operator edge cases ---
@@ -2873,7 +2906,7 @@ mod tests {
         // `||` fallback: left rewritten, right rewritten
         assert_eq!(
             rewrite_command("cargo test || cargo build", &[]),
-            Some("rtk cargo test || rtk cargo build".into())
+            Some("contextcrawler cargo test || contextcrawler cargo build".into())
         );
     }
 
@@ -2881,7 +2914,7 @@ mod tests {
     fn test_rewrite_compound_semicolon() {
         assert_eq!(
             rewrite_command("git status; cargo test", &[]),
-            Some("rtk git status; rtk cargo test".into())
+            Some("contextcrawler git status; contextcrawler cargo test".into())
         );
     }
 
@@ -2890,7 +2923,7 @@ mod tests {
         // Pipe: rewrite first segment only, pass through rest unchanged
         assert_eq!(
             rewrite_command("cargo test | grep FAILED", &[]),
-            Some("rtk cargo test | grep FAILED".into())
+            Some("contextcrawler cargo test | grep FAILED".into())
         );
     }
 
@@ -2898,7 +2931,7 @@ mod tests {
     fn test_rewrite_compound_pipe_git_grep() {
         assert_eq!(
             rewrite_command("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            Some("contextcrawler git log -10 | grep feat".into())
         );
     }
 
@@ -2910,7 +2943,7 @@ mod tests {
                 &[]
             ),
             Some(
-                "rtk cargo fmt --all && rtk cargo clippy && rtk cargo test && rtk git status"
+                "contextcrawler cargo fmt --all && contextcrawler cargo clippy && contextcrawler cargo test && contextcrawler git status"
                     .into()
             )
         );
@@ -2921,7 +2954,7 @@ mod tests {
         // unsupported segments stay raw
         assert_eq!(
             rewrite_command("cargo test && htop", &[]),
-            Some("rtk cargo test && htop".into())
+            Some("contextcrawler cargo test && htop".into())
         );
     }
 
@@ -2937,7 +2970,7 @@ mod tests {
     fn test_rewrite_sudo_docker() {
         assert_eq!(
             rewrite_command("sudo docker ps", &[]),
-            Some("sudo rtk docker ps".into())
+            Some("sudo contextcrawler docker ps".into())
         );
     }
 
@@ -2945,7 +2978,7 @@ mod tests {
     fn test_rewrite_env_var_prefix() {
         assert_eq!(
             rewrite_command("GIT_SSH_COMMAND=ssh git push origin main", &[]),
-            Some("GIT_SSH_COMMAND=ssh rtk git push origin main".into())
+            Some("GIT_SSH_COMMAND=ssh contextcrawler git push origin main".into())
         );
     }
 
@@ -2955,7 +2988,7 @@ mod tests {
     fn test_rewrite_find_with_flags() {
         assert_eq!(
             rewrite_command("find . -name '*.rs' -type f", &[]),
-            Some("rtk find . -name '*.rs' -type f".into())
+            Some("contextcrawler find . -name '*.rs' -type f".into())
         );
     }
 
@@ -2997,7 +3030,7 @@ mod tests {
         let excluded = vec!["curl".to_string()];
         assert_eq!(
             rewrite_command("git status", &excluded),
-            Some("rtk git status".into())
+            Some("contextcrawler git status".into())
         );
     }
 
@@ -3013,7 +3046,7 @@ mod tests {
         let excluded = vec!["curl".to_string()];
         assert_eq!(
             rewrite_command("git status && curl https://api.example.com", &excluded),
-            Some("rtk git status && curl https://api.example.com".into())
+            Some("contextcrawler git status && curl https://api.example.com".into())
         );
     }
 
@@ -3116,7 +3149,7 @@ mod tests {
     fn test_rewrite_gh_without_json_still_works() {
         assert_eq!(
             rewrite_command("gh pr list", &[]),
-            Some("rtk gh pr list".into())
+            Some("contextcrawler gh pr list".into())
         );
     }
 
@@ -3255,7 +3288,7 @@ mod tests {
     fn test_rewrite_git_dash_c() {
         assert_eq!(
             rewrite_command("git -C /tmp status", &[]),
-            Some("rtk git -C /tmp status".to_string())
+            Some("contextcrawler git -C /tmp status".to_string())
         );
     }
 
@@ -3263,7 +3296,7 @@ mod tests {
     fn test_rewrite_git_no_pager() {
         assert_eq!(
             rewrite_command("git --no-pager log -5", &[]),
-            Some("rtk git --no-pager log -5".to_string())
+            Some("contextcrawler git --no-pager log -5".to_string())
         );
     }
 
@@ -3334,7 +3367,7 @@ mod tests {
     fn test_rewrite_wc() {
         assert_eq!(
             rewrite_command("wc -l src/main.rs", &[]),
-            Some("rtk wc -l src/main.rs".into())
+            Some("contextcrawler wc -l src/main.rs".into())
         );
     }
 
@@ -3342,7 +3375,7 @@ mod tests {
     fn test_rewrite_wc_multi_file() {
         assert_eq!(
             rewrite_command("wc src/*.rs", &[]),
-            Some("rtk wc src/*.rs".into())
+            Some("contextcrawler wc src/*.rs".into())
         );
     }
 
@@ -3363,7 +3396,7 @@ mod tests {
     fn test_rewrite_command_substitution_passthrough() {
         assert_eq!(
             rewrite_command("git log $(git rev-parse HEAD~1)", &[]),
-            Some("rtk git log $(git rev-parse HEAD~1)".into())
+            Some("contextcrawler git log $(git rev-parse HEAD~1)".into())
         );
     }
 
@@ -3379,7 +3412,7 @@ mod tests {
     fn test_shell_prefix_noglob() {
         assert_eq!(
             rewrite_command("noglob git status", &[]),
-            Some("noglob rtk git status".into())
+            Some("noglob contextcrawler git status".into())
         );
     }
 
@@ -3387,7 +3420,7 @@ mod tests {
     fn test_shell_prefix_command() {
         assert_eq!(
             rewrite_command("command git status", &[]),
-            Some("command rtk git status".into())
+            Some("command contextcrawler git status".into())
         );
     }
 
@@ -3395,15 +3428,15 @@ mod tests {
     fn test_shell_prefix_builtin_exec_nocorrect() {
         assert_eq!(
             rewrite_command("builtin git status", &[]),
-            Some("builtin rtk git status".into())
+            Some("builtin contextcrawler git status".into())
         );
         assert_eq!(
             rewrite_command("exec git status", &[]),
-            Some("exec rtk git status".into())
+            Some("exec contextcrawler git status".into())
         );
         assert_eq!(
             rewrite_command("nocorrect git status", &[]),
-            Some("nocorrect rtk git status".into())
+            Some("nocorrect contextcrawler git status".into())
         );
     }
 
@@ -3416,7 +3449,7 @@ mod tests {
     fn test_python3_m_pytest() {
         assert_eq!(
             rewrite_command("python3 -m pytest tests/", &[]),
-            Some("rtk pytest tests/".into())
+            Some("contextcrawler pytest tests/".into())
         );
     }
 
@@ -3424,13 +3457,13 @@ mod tests {
     fn test_pip_show() {
         assert_eq!(
             rewrite_command("pip show flask", &[]),
-            Some("rtk pip show flask".into())
+            Some("contextcrawler pip show flask".into())
         );
     }
 
     #[test]
     fn test_gt_graphite() {
-        assert_eq!(rewrite_command("gt log", &[]), Some("rtk gt log".into()));
+        assert_eq!(rewrite_command("gt log", &[]), Some("contextcrawler gt log".into()));
     }
 
     #[test]
@@ -3447,7 +3480,7 @@ mod tests {
     fn test_rewrite_pipe_then_and() {
         assert_eq!(
             rewrite_command("git log | head -5 && git stash", &[]),
-            Some("rtk git log | head -5 && rtk git stash".into())
+            Some("contextcrawler git log | head -5 && contextcrawler git stash".into())
         );
     }
 
@@ -3455,7 +3488,7 @@ mod tests {
     fn test_rewrite_pipe_then_semicolon() {
         assert_eq!(
             rewrite_command("cargo test | head; git status", &[]),
-            Some("rtk cargo test | head; rtk git status".into())
+            Some("contextcrawler cargo test | head; contextcrawler git status".into())
         );
     }
 
@@ -3463,7 +3496,7 @@ mod tests {
     fn test_rewrite_pipe_then_or() {
         assert_eq!(
             rewrite_command("cargo test | grep FAIL || git stash", &[]),
-            Some("rtk cargo test | grep FAIL || rtk git stash".into())
+            Some("contextcrawler cargo test | grep FAIL || contextcrawler git stash".into())
         );
     }
 
@@ -3474,7 +3507,7 @@ mod tests {
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 rtk cargo test 2>&1 | grep FAILED && rtk git stash".into())
+            Some("RUST_BACKTRACE=1 contextcrawler cargo test 2>&1 | grep FAILED && contextcrawler git stash".into())
         );
     }
 
@@ -3482,7 +3515,7 @@ mod tests {
     fn test_rewrite_and_then_pipe() {
         assert_eq!(
             rewrite_command("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && rtk cargo test | grep FAIL".into())
+            Some("contextcrawler git status && contextcrawler cargo test | grep FAIL".into())
         );
     }
 
@@ -3490,7 +3523,7 @@ mod tests {
     fn test_rewrite_multi_pipe_then_and() {
         assert_eq!(
             rewrite_command("git log | head | tail && git status", &[]),
-            Some("rtk git log | head | tail && rtk git status".into())
+            Some("contextcrawler git log | head | tail && contextcrawler git status".into())
         );
     }
 }
