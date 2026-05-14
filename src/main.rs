@@ -1242,6 +1242,13 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
         parse_error.exit();
     }
 
+    // args[0] is a flag (e.g. `contextcrawler -v`, `contextcrawler --foo`).
+    // Don't try to exec flags as binaries — that produces a misleading
+    // "No such file or directory" error. Show Clap's parse error instead.
+    if args[0].starts_with('-') {
+        parse_error.exit();
+    }
+
     let raw_command = args.join(" ");
     let error_message = core::utils::strip_ansi(&parse_error.to_string());
 
@@ -1324,7 +1331,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             Err(e) => {
                 // Command not found — same behaviour as no-TOML path
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
-                eprintln!("[rtk: {}]", e);
+                eprintln!("[contextcrawler: {}]", e);
                 Ok(127)
             }
         }
@@ -1348,7 +1355,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             Err(e) => {
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
                 // Command not found or other OS error — single message, no duplicate Clap error
-                eprintln!("[rtk: {}]", e);
+                eprintln!("[contextcrawler: {}]", e);
                 Ok(127)
             }
         }
