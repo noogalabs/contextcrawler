@@ -88,11 +88,11 @@ via the agent's permission hook.
 
 | Mitigation | Layer | Status |
 |---|---|---|
-| Argv-mode default — shlex split, no shell | `cmds/rust/runner.rs`, `cmds/system/summary.rs` | **Live** since v0.1.5 (GHSA-3mmh-86cm-g6w4) |
+| Argv-mode default — shlex split, no shell | `src/cmds/rust/runner.rs`, `src/cmds/system/summary.rs` | **Live** since v0.1.5 (GHSA-3mmh-86cm-g6w4) |
 | Shell-metacharacter reject (` \| ; & < > backtick $ \n `) | same | **Live** |
 | Refuse known shell binaries (`sh`, `bash`, … and `.exe` variants) and exec wrappers (`env`, `sudo`, `nohup`, …) as first token | same | **Live** |
 | `--shell` opt-in escape hatch (documented trust boundary: agent rewrites must not carry `--shell`) | same | **Live** |
-| Hook integrity SHA-256 check on `.claude/hooks/contextcrawler-rewrite.sh` | `hooks/integrity.rs` | **Live** (inherited from upstream) |
+| Hook integrity SHA-256 check on the agent rewrite hook script (`rtk-rewrite.sh` — filename retains the `rtk-` prefix per the rebrand-internals-later policy in `src/main.rs`) | `src/hooks/integrity.rs` | **Live** (inherited from upstream) |
 
 **Residual risk:** Argv mode catches the obvious cases. An agent that
 emits a legitimate-looking single-command argv with a credential or
@@ -109,9 +109,9 @@ survive as plain text once the terminal ignores them.
 
 | Mitigation | Layer | Status |
 |---|---|---|
-| `strip_ansi` covers CSI (incl. private DEC), OSC + OSC 8 hyperlinks, DCS, SOS, PM, APC, Fe/Fp/Fs escapes | `core/utils.rs` | **Live** since v0.1.5 (GHSA-wjx4-ffxm-fxxp) |
-| Callers in `cmds/git/`, `cmds/cloud/`, `cmds/js/prisma_cmd.rs`, `cmds/python/pip_cmd.rs`, `cmds/dotnet/`, `cmds/system/grep_cmd.rs`, `cmds/js/pnpm_cmd.rs`, `core/runner.rs` all invoke `strip_ansi` on failure-path raw emits | various | **Live** after the raw-emit sweep |
-| Filter output is *opt-in* per command — modules without filters fall through to the raw passthrough path | `cmds/*/registry.rs` | Bypassable by design; the trust assumption is the filter author has handled escape stripping. |
+| `strip_ansi` covers CSI (incl. private DEC), OSC + OSC 8 hyperlinks, DCS, SOS, PM, APC, Fe/Fp/Fs escapes | `src/core/utils.rs` | **Live** since v0.1.5 (GHSA-wjx4-ffxm-fxxp) |
+| Callers in `src/cmds/git/`, `src/cmds/cloud/`, `src/cmds/js/`, `src/cmds/python/`, `src/cmds/dotnet/`, `src/cmds/system/grep_cmd.rs`, `src/cmds/go/`, `src/core/runner.rs` all invoke `strip_ansi` on failure-path raw emits | various | **Live** after the raw-emit sweep (ships on the `feat/sec-raw-emit-sweep` branch in this v0.1.6 cycle) |
+| Filter output is *opt-in* per command — modules without filters fall through to the raw passthrough path | `src/cmds/*/registry.rs` | Bypassable by design; the trust assumption is the filter author has handled escape stripping. |
 
 **Residual risk:** Prompt-injection text in tool stdout is still verbatim
 visible to the LLM. There's no semantic filtering here — only escape /
@@ -128,7 +128,7 @@ recirculate into context on every read.
 
 | Mitigation | Layer | Status |
 |---|---|---|
-| `scrub_secrets` at INSERT boundary in `core/tracking.rs::record` | `core/tracking.rs` | **Live** since v0.1.5 (GHSA-2cwv-rr7c-2p4c) |
+| `scrub_secrets` at INSERT boundary in `src/core/tracking.rs::record` | `src/core/tracking.rs` | **Live** since v0.1.5 (GHSA-2cwv-rr7c-2p4c) |
 | Patterns covered: credential-bearing flags, Authorization headers, URL userinfo, AWS keys, GitHub classic + fine-grained PATs, Slack tokens, mysql `-p` (scoped) | same | **Live** |
 | Same scrub applied in `record_parse_failure` | same | **Live** |
 | Escape-aware quoted-value matching | `FLAG_VALUE` regex | **Live** |
@@ -147,7 +147,7 @@ in command output.
 
 | Mitigation | Layer | Status |
 |---|---|---|
-| SHA-256 trust store for project-local filters | `hooks/trust.rs` | **Live** (inherited, SA-2025-RTK-002 / upstream PR #623) |
+| SHA-256 trust store for project-local filters | `src/hooks/trust.rs` | **Live** (inherited, SA-2025-RTK-002 / upstream PR #623) |
 | Default: untrusted = skip, not warn-and-load | same | **Live** |
 | Content change → auto-revoke trust, require re-review | same | **Live** |
 | `CONTEXTCRAWLER_TRUST_PROJECT_FILTERS=1` for CI | env override | **Live** but accepts repo-controlled `CI=1` — same as upstream H-2 limitation |
@@ -165,10 +165,10 @@ auto-approved commands.
 
 | Mitigation | Layer | Status |
 |---|---|---|
-| SHA-256 hash stored at install time | `hooks/integrity.rs` | **Live** |
+| SHA-256 hash stored at install time | `src/hooks/integrity.rs` | **Live** |
 | Runtime check on operational commands; fail closed | same | **Live** |
 | No env-var bypass (PR #1078 / upstream fix(integrity)) | same | **Live** |
-| Recovery: `contextcrawler init -g --auto-patch` re-baselines | `hooks/init.rs` | **Live** |
+| Recovery: `contextcrawler init -g --auto-patch` re-baselines | `src/hooks/init.rs` | **Live** |
 
 ### Surface 6: build-host metadata in released binary
 
@@ -179,9 +179,9 @@ learns the builder's username and directory layout.
 
 | Mitigation | Layer | Status |
 |---|---|---|
-| `scripts/build-release.sh` sets `RUSTFLAGS=--remap-path-prefix=…` for CARGO_HOME and workspace | repo root | **Live** (this branch) |
+| `scripts/build-release.sh` sets `RUSTFLAGS=--remap-path-prefix=…` for CARGO_HOME and workspace | repo root | **Live** (ships on the `feat/sec-strip-build-paths` branch this cycle) |
 | `--verify` mode asserts the produced binary contains zero builder paths | same | **Live** |
-| Proposed CI job runs `--verify` on every PR | `docs/quality/CI_JOBS_PROPOSED.md` | **Drafted**, not wired yet (`.github/` is gitignored on the fork) |
+| Proposed CI job runs `--verify` on every PR | `docs/quality/CI_JOBS_PROPOSED.md` (ships on the `chore/quality-baselines` branch this cycle) | **Drafted**, not wired yet (`.github/` is gitignored on the fork) |
 
 ### Surface 7: supply chain
 
@@ -191,11 +191,11 @@ at build time (proc macros, build scripts) and at runtime.
 | Mitigation | Layer | Status |
 |---|---|---|
 | `cargo audit` on PR via CI | `.github/workflows/ci.yml` (upstream) | **Live** |
-| `cargo deny` config covers advisories, licenses, bans, sources | `deny.toml` | **Live** (this branch) |
+| `cargo deny` config covers advisories, licenses, bans, sources | `deny.toml` (ships on the `chore/quality-baselines` branch this cycle) | **Live** |
 | Wildcard deps denied; unknown registries denied | `deny.toml` | **Live** |
-| One accepted advisory exception: `RUSTSEC-2025-0057` (fxhash via scraper, unmaintained, no CVE) | `deny.toml` + BASELINE.md | **Documented** |
+| One accepted advisory exception: `RUSTSEC-2025-0057` (fxhash via scraper, unmaintained, no CVE) | `deny.toml` + `docs/quality/BASELINE.md` | **Documented** |
 | `Cargo.lock` checked in | repo root | **Live** |
-| ContextCrawler's own pre-install supply-chain gate (age + OSV CVE) — for agent-installed packages, not for our own builds | `hooks/supply_chain_gate.rs` | **Live**, opt-in |
+| ContextCrawler's own pre-install supply-chain gate (age + OSV CVE) — for agent-installed packages, not for our own builds | `src/hooks/supply_chain_gate.rs` | **Live**, opt-in |
 
 ## Accepted limitations
 
@@ -217,6 +217,13 @@ v0.1.x. Each has a tracking note elsewhere; re-evaluate at v0.2.0.
    time. Tracked in `docs/quality/BASELINE.md`.
 4. **`fxhash` unmaintained advisory** is allow-listed in `deny.toml`.
    No active CVE. Re-evaluate when `scraper` upgrades.
+5. **Global TOML filter trust check not yet inherited.** Project-local
+   `.rtk/filters.toml` is trust-gated (SA-2025-RTK-002 fix is in), but
+   `~/.config/rtk/filters.toml` at `src/core/toml_filter.rs:218` loads
+   without an integrity check. Upstream PR #1068 fixed this in rtk; we
+   need to either cherry-pick it or wrap the global load with the same
+   `hooks::trust` check. Surfaced during the 2026-05-15 audit's Codex
+   re-review; do not carry into v0.2.0.
 
 ## Out of scope
 
