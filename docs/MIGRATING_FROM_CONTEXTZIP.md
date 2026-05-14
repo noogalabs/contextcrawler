@@ -63,19 +63,30 @@ Everything contextzip already did continues to work — under the unified
 
 ## Migration steps
 
-### 1. Uninstall existing contextzip
+### 1. Uninstall existing contextzip (and/or rtk)
+
+If you also ran upstream `rtk` at any point, do the same cleanup for
+its hook artifacts — otherwise stale `PreToolUse` entries pointing at
+the old `rtk` binary will silently fail-open once `contextcrawler`
+takes over.
 
 ```sh
-# Remove the binary
+# Old contextzip binary + hook
 rm -f ~/.local/bin/contextzip
-
-# Remove its hook (if installed via `contextzip init -g`)
 rm -f ~/.claude/hooks/contextzip-rewrite.sh
 rm -f ~/.claude/hooks/.contextzip-hook.sha256
 
-# Clean its settings entry (you'll replace this with ContextCrawler's hook below)
-# Edit ~/.claude/settings.json and remove any hooks.PreToolUse entry referencing
-# contextzip-rewrite.sh.
+# Old rtk binary + hook (skip if you never used it)
+rtk init -g --uninstall 2>/dev/null || true
+rm -f ~/.local/bin/rtk
+rm -f ~/.claude/hooks/rtk-rewrite.sh
+rm -f ~/.claude/RTK.md
+
+# Clean the settings.json hook entries: edit ~/.claude/settings.json
+# and remove any hooks.PreToolUse entry referencing
+# contextzip-rewrite.sh, rtk-rewrite.sh, or the `rtk` binary directly.
+# Repeat for ~/.cursor/hooks.json if you used Cursor, and any other
+# agent configs (codex, windsurf, cline, kilocode, antigravity).
 ```
 
 ### 2. Build ContextCrawler

@@ -248,6 +248,29 @@ flowchart TB
 Requires a Rust toolchain (`rustup`, stable channel). There are no
 pre-built binaries — single-maintainer fork, build it yourself.
 
+> [!IMPORTANT]
+> **If you previously ran upstream `rtk` or `jee599/contextzip`**, your
+> agent configs likely still hold hook entries pointing at the old
+> `rtk` binary or `~/.claude/hooks/rtk-rewrite.sh` etc. Those will
+> silently fail-open once `contextcrawler` takes over. Clean them out
+> first — at minimum:
+>
+> ```sh
+> # If you have the old binary, use its own uninstall first.
+> rtk init -g --uninstall    2>/dev/null || true
+>
+> # Then check (and remove leftovers manually) in:
+> #   ~/.claude/settings.json        — PreToolUse hook entry
+> #   ~/.claude/hooks/rtk-rewrite.sh — leftover hook script
+> #   ~/.claude/RTK.md / @RTK.md ref in CLAUDE.md
+> #   ~/.cursor/hooks.json           — Cursor hook entry
+> #   ~/.codex/AGENTS.md             — Codex rules block
+> #   ~/.windsurfrules, ~/.clinerules — rules files
+> ```
+>
+> After installing `contextcrawler` (below), `contextcrawler init -g`
+> re-creates everything cleanly for whichever agents you use.
+
 **One-liner with `cargo install` (latest release):**
 
 ```sh
