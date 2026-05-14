@@ -31,6 +31,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::ffi::OsString;
@@ -40,6 +41,56 @@ use std::time::Instant;
 // ── Project path helpers ── // added: project-scoped tracking support
 
 /// Get the canonical project path string for the current working directory.
+/// Scrub well-known credential patterns before persistence.
+///
+/// The tracking database retains commands for 90 days and `gain --history`
+/// renders rows back into agent context. Bearer tokens, --password values,
+/// AWS keys and the like must not survive that round trip. This function is
+/// applied to every command string at the INSERT boundary.
+///
+/// The list is intentionally narrow — patterns that are unambiguous as
+/// secrets and where redaction does not destroy debugging context.
+pub fn scrub_secrets(cmd: &str) -> String {
+    use lazy_static::lazy_static;
+    lazy_static! {
+        // `--password VALUE` / `--password=VALUE`, also --token, --api-key,
+        // --secret, --access-key, --auth-token. Captures the flag form so we
+        // can reproduce it in the redaction.
+        static ref FLAG_VALUE: Regex = Regex::new(
+            r"(?i)(--(?:password|token|api[-_]?key|secret|access[-_]?key|auth[-_]?token|client[-_]?secret))(=|\s+)(\S+)"
+        ).unwrap();
+        // mysql-style -pPASSWORD (no space) and -W (postgres password is interactive,
+        // so we only catch -p<token> with a non-empty value to avoid false hits).
+        static ref MYSQL_P: Regex = Regex::new(r"(\s|^)-p(\S+)").unwrap();
+        // `-H 'Authorization: <scheme> <token>'` (curl). Match both single and
+        // double-quoted forms, and the unquoted equivalent.
+        static ref AUTH_HEADER: Regex = Regex::new(
+            r#"(?i)(authorization:\s*(?:bearer|basic|token|apikey)\s+)([^'"\s]+)"#
+        ).unwrap();
+        // URL with embedded credentials: scheme://user:pass@host
+        static ref URL_USERPASS: Regex = Regex::new(
+            r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^:/\s]+):([^@\s]+)@"
+        ).unwrap();
+        // AWS access key id (AKIA / ASIA prefix, 20 chars total).
+        static ref AWS_KEY: Regex = Regex::new(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b").unwrap();
+        // GitHub personal access tokens and app tokens.
+        static ref GH_TOKEN: Regex = Regex::new(
+            r"\b(gh[pousr])_[A-Za-z0-9]{36,}\b"
+        ).unwrap();
+        // Slack tokens (xox[abprs]-...).
+        static ref SLACK_TOKEN: Regex = Regex::new(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b").unwrap();
+    }
+
+    let s = FLAG_VALUE.replace_all(cmd, "$1$2<REDACTED>");
+    let s = MYSQL_P.replace_all(&s, "$1-p<REDACTED>");
+    let s = AUTH_HEADER.replace_all(&s, "$1<REDACTED>");
+    let s = URL_USERPASS.replace_all(&s, "$1$2:<REDACTED>@");
+    let s = AWS_KEY.replace_all(&s, "<REDACTED-AWS-KEY>");
+    let s = GH_TOKEN.replace_all(&s, "<REDACTED-GH-TOKEN>");
+    let s = SLACK_TOKEN.replace_all(&s, "<REDACTED-SLACK-TOKEN>");
+    s.to_string()
+}
+
 fn current_project_path_string() -> String {
     std::env::current_dir()
         .ok()
@@ -416,6 +467,11 @@ impl Tracker {
 
         let project_path = current_project_path_string(); // added: record cwd
 
+        // Secrets in command strings would otherwise survive 90 days in the DB
+        // and resurface via `gain --history` back into agent context.
+        let original_cmd = scrub_secrets(original_cmd);
+        let rtk_cmd = scrub_secrets(rtk_cmd);
+
         self.conn.execute(
             "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", // added: project_path
@@ -469,6 +525,7 @@ impl Tracker {
         error_message: &str,
         fallback_succeeded: bool,
     ) -> Result<()> {
+        let raw_command = scrub_secrets(raw_command);
         self.conn.execute(
             "INSERT INTO parse_failures (timestamp, raw_command, error_message, fallback_succeeded)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1422,6 +1479,106 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_redacts_password_flag_with_equals() {
+        let out = scrub_secrets("psql --password=hunter2 -h db");
+        assert_eq!(out, "psql --password=<REDACTED> -h db");
+    }
+
+    #[test]
+    fn scrub_redacts_password_flag_with_space() {
+        let out = scrub_secrets("aws --profile prod --password supersecret123");
+        assert!(out.contains("--password <REDACTED>"), "got: {out}");
+        assert!(!out.contains("supersecret123"));
+    }
+
+    #[test]
+    fn scrub_redacts_token_and_api_key_flags() {
+        for (input, needle) in [
+            ("foo --token=abc.def.ghi bar", "--token=<REDACTED>"),
+            ("foo --api-key xyz123 bar", "--api-key <REDACTED>"),
+            ("foo --api_key xyz123 bar", "--api_key <REDACTED>"),
+            ("foo --secret=topsecret bar", "--secret=<REDACTED>"),
+            ("foo --access-key abc bar", "--access-key <REDACTED>"),
+            ("foo --auth-token def bar", "--auth-token <REDACTED>"),
+            ("foo --client-secret ghi bar", "--client-secret <REDACTED>"),
+        ] {
+            let out = scrub_secrets(input);
+            assert!(out.contains(needle), "expected {needle} in {out}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_authorization_header() {
+        let out = scrub_secrets(
+            r#"curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig" https://api"#,
+        );
+        assert!(out.contains("Authorization: Bearer <REDACTED>"), "got: {out}");
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"));
+    }
+
+    #[test]
+    fn scrub_redacts_basic_auth_header() {
+        let out = scrub_secrets(r#"curl -H 'Authorization: Basic dXNlcjpwYXNz' https://api"#);
+        assert!(out.contains("Authorization: Basic <REDACTED>"), "got: {out}");
+    }
+
+    #[test]
+    fn scrub_redacts_url_userpass() {
+        let out = scrub_secrets("git clone https://alice:hunter2@example.com/repo");
+        assert_eq!(out, "git clone https://alice:<REDACTED>@example.com/repo");
+    }
+
+    #[test]
+    fn scrub_redacts_aws_access_key() {
+        let out = scrub_secrets("aws s3 ls --access-key-id AKIAIOSFODNN7EXAMPLE");
+        // Both the AWS key regex and the access-key flag regex apply here.
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "got: {out}");
+    }
+
+    #[test]
+    fn scrub_redacts_github_pat() {
+        for token in [
+            "ghp_AbCdEf0123456789AbCdEf0123456789AbCd",
+            "gho_AbCdEf0123456789AbCdEf0123456789AbCd",
+            "ghs_AbCdEf0123456789AbCdEf0123456789AbCd",
+        ] {
+            let input = format!("git push https://{token}@github.com/u/r");
+            let out = scrub_secrets(&input);
+            assert!(!out.contains(token), "leaked: {out}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_mysql_inline_password() {
+        let out = scrub_secrets("mysql -uadmin -phunter2 -hdb.local");
+        assert!(out.contains("-p<REDACTED>"), "got: {out}");
+        assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn scrub_leaves_benign_commands_unchanged() {
+        for safe in [
+            "git status",
+            "cargo test --lib",
+            "ls -la /tmp",
+            "curl https://example.com",
+            "psql -h localhost -U readonly mydb",
+        ] {
+            assert_eq!(scrub_secrets(safe), safe, "false-positive on {safe}");
+        }
+    }
+
+    #[test]
+    fn scrub_handles_multiple_secrets_in_one_command() {
+        let out = scrub_secrets(
+            "curl -H 'Authorization: Bearer tok123' --api-key=xyz https://u:p@h/path",
+        );
+        assert!(!out.contains("tok123"), "Bearer leaked: {out}");
+        assert!(!out.contains("xyz"), "api-key leaked: {out}");
+        assert!(out.contains(":<REDACTED>@"), "URL pwd not redacted: {out}");
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
