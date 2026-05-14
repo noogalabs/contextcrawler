@@ -197,8 +197,8 @@ contextcrawler security --log            # tail recent gate downgrades
 | Variable | Effect |
 |---|---|
 | (default) | fail-open: if Tirith isn't installed, no gate, original rtk verdict stands |
-| `CONTEXTZIP_TIRITH_REQUIRED=1` | fail-closed: refuse auto-allow without a working Tirith verdict |
-| `CONTEXTZIP_TIRITH_DISABLED=1` | bypass the gate entirely (debug only) |
+| `CONTEXTCRAWLER_TIRITH_REQUIRED=1` | fail-closed: refuse auto-allow without a working Tirith verdict |
+| `CONTEXTCRAWLER_TIRITH_DISABLED=1` | bypass the gate entirely (debug only) |
 
 ## License
 

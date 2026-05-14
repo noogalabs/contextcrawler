@@ -23,7 +23,7 @@ pub enum Verdict {
 
 pub fn check(cmd: &str) -> Verdict {
     // Soft opt-out for debugging.
-    if std::env::var("CONTEXTZIP_TIRITH_DISABLED").as_deref() == Ok("1") {
+    if std::env::var("CONTEXTCRAWLER_TIRITH_DISABLED").as_deref() == Ok("1") {
         return Verdict::Unavailable;
     }
 
@@ -72,7 +72,7 @@ pub fn check(cmd: &str) -> Verdict {
 }
 
 pub fn require_tirith() -> bool {
-    std::env::var("CONTEXTZIP_TIRITH_REQUIRED").as_deref() == Ok("1")
+    std::env::var("CONTEXTCRAWLER_TIRITH_REQUIRED").as_deref() == Ok("1")
 }
 
 /// Decide whether an upstream `Allow` verdict should be downgraded.

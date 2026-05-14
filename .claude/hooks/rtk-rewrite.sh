@@ -100,7 +100,7 @@ else
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "permissionDecisionReason": "RTK auto-rewrite",
+        "permissionDecisionReason": "ContextCrawler auto-rewrite",
         "updatedInput": $updated
       }
     }'

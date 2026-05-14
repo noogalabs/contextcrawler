@@ -1,32 +1,32 @@
-# RTK - Rust Token Killer (Codex CLI)
+# ContextCrawler (Codex CLI)
 
-**Usage**: Token-optimized CLI proxy for shell commands.
+**Usage**: Token-optimized CLI proxy for shell commands. Downstream of
+[rtk-ai/rtk](https://github.com/rtk-ai/rtk).
 
 ## Rule
 
-Always prefix shell commands with `rtk`.
-
-Examples:
+Always prefix shell commands with `contextcrawler`.
 
 ```bash
-rtk git status
-rtk cargo test
-rtk npm run build
-rtk pytest -q
+contextcrawler git status
+contextcrawler cargo test
+contextcrawler npm run build
+contextcrawler pytest -q
 ```
 
-## Meta Commands
+## Meta commands
 
 ```bash
-rtk gain            # Token savings analytics
-rtk gain --history  # Recent command savings history
-rtk proxy <cmd>     # Run raw command without filtering
+contextcrawler gain            # Token savings analytics
+contextcrawler gain --history  # Recent command savings history
+contextcrawler proxy <cmd>     # Run raw command without filtering
+contextcrawler security        # Tirith defense-in-depth gate (if installed)
 ```
 
 ## Verification
 
 ```bash
-rtk --version
-rtk gain
-which rtk
+contextcrawler --version
+contextcrawler gain
+which contextcrawler
 ```

@@ -419,9 +419,11 @@ fn print_tirith_missing() {
     println!("  unavailable. Install for defense-in-depth:");
     println!();
     println!("    cargo install tirith");
-    println!("    eval \"$(tirith init --shell zsh)\"   # or bash/fish");
     println!();
-    println!("  Set CONTEXTZIP_TIRITH_REQUIRED=1 to fail-closed when Tirith");
+    println!("  ContextCrawler calls tirith as a subprocess from the agent path,");
+    println!("  so the binary on PATH is all the gate needs — no shell hook required.");
+    println!();
+    println!("  Set CONTEXTCRAWLER_TIRITH_REQUIRED=1 to fail-closed when Tirith");
     println!("  is missing (refuses auto-allow without a verdict).");
 }
 
@@ -447,11 +449,11 @@ fn print_human(bin: &str, stats: &Option<AuditStats>, doctor: &DoctorStatus) {
     );
 
     let gate_state = match (
-        std::env::var("CONTEXTZIP_TIRITH_REQUIRED").as_deref() == Ok("1"),
-        std::env::var("CONTEXTZIP_TIRITH_DISABLED").as_deref() == Ok("1"),
+        std::env::var("CONTEXTCRAWLER_TIRITH_REQUIRED").as_deref() == Ok("1"),
+        std::env::var("CONTEXTCRAWLER_TIRITH_DISABLED").as_deref() == Ok("1"),
     ) {
-        (_, true) => "DISABLED (CONTEXTZIP_TIRITH_DISABLED=1)",
-        (true, false) => "fail-closed (CONTEXTZIP_TIRITH_REQUIRED=1)",
+        (_, true) => "DISABLED (CONTEXTCRAWLER_TIRITH_DISABLED=1)",
+        (true, false) => "fail-closed (CONTEXTCRAWLER_TIRITH_REQUIRED=1)",
         (false, false) => "fail-open (default)",
     };
     println!("  Rewrite gate:  {}", gate_state);
@@ -500,8 +502,8 @@ fn print_json(bin: &str, stats: &Option<AuditStats>, doctor: &DoctorStatus) {
         "hook_configured": doctor.hook_configured,
         "shell": doctor.shell,
         "rewrite_gate": {
-            "required": std::env::var("CONTEXTZIP_TIRITH_REQUIRED").as_deref() == Ok("1"),
-            "disabled": std::env::var("CONTEXTZIP_TIRITH_DISABLED").as_deref() == Ok("1"),
+            "required": std::env::var("CONTEXTCRAWLER_TIRITH_REQUIRED").as_deref() == Ok("1"),
+            "disabled": std::env::var("CONTEXTCRAWLER_TIRITH_DISABLED").as_deref() == Ok("1"),
         },
         "audit_stats": stats.as_ref().map(|s| json!({
             "total_commands": s.total_commands,

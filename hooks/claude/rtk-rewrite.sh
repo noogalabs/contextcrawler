@@ -19,7 +19,7 @@ if ! command -v jq &>/dev/null; then
 fi
 
 if ! command -v contextcrawler &>/dev/null; then
-  echo "[contextcrawler] WARNING: contextcrawler is not installed or not in PATH. Hook cannot rewrite commands. Install: https://github.com/rtk-ai/rtk#installation" >&2
+  echo "[contextcrawler] WARNING: contextcrawler is not installed or not in PATH. Hook cannot rewrite commands. Install: https://github.com/thehoff/contextcrawler#install" >&2
   exit 0
 fi
 
@@ -84,7 +84,7 @@ else
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "permissionDecisionReason": "RTK auto-rewrite",
+        "permissionDecisionReason": "ContextCrawler auto-rewrite",
         "updatedInput": .tool_input
       }
     }' <<<"$INPUT"

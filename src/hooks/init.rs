@@ -414,13 +414,13 @@ fn prompt_telemetry_consent() -> Result<()> {
 
     eprintln!();
     eprintln!("--- Telemetry ---");
-    eprintln!("RTK collects anonymous usage metrics once per day to improve filters.");
+    eprintln!("ContextCrawler inherits rtk's anonymous telemetry pipeline (once per day).");
     eprintln!();
     eprintln!("  What:    command names (not arguments), token savings, OS, version");
     eprintln!("  Why:     prioritize filter development for the most-used commands");
-    eprintln!("  Who:     RTK AI Labs, contact@rtk-ai.app");
-    eprintln!("  Rights:  disable anytime with `rtk telemetry disable`,");
-    eprintln!("           request erasure with `rtk telemetry forget`");
+    eprintln!("  Who:     upstream — RTK AI Labs <contact@rtk-ai.app>");
+    eprintln!("  Rights:  disable anytime with `contextcrawler telemetry disable`,");
+    eprintln!("           request erasure with `contextcrawler telemetry forget`");
     eprintln!("  Details: https://github.com/rtk-ai/rtk/blob/main/docs/TELEMETRY.md");
     eprintln!();
     eprint!("Enable anonymous telemetry? [y/N] ");
