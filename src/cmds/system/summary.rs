@@ -8,8 +8,22 @@ use regex::Regex;
 use std::process::Command;
 
 // See cmds/rust/runner.rs: argv mode rejects shell metacharacters so
-// agent-rewritten input cannot smuggle pipes/redirects/chains into the child.
+// agent-rewritten input cannot smuggle pipes/redirects/chains into the child,
+// and refuses to spawn a known shell binary so an agent cannot trivially
+// reintroduce sh -c by emitting `sh -c '<payload>'` as the whole argv.
 const SHELL_METACHARS: &[char] = &['|', ';', '&', '<', '>', '`', '$', '\n'];
+const SHELL_BINARIES: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "ash",
+    "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+];
+
+fn is_shell_binary(bin: &str) -> bool {
+    let basename = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(bin);
+    SHELL_BINARIES.iter().any(|s| s.eq_ignore_ascii_case(basename))
+}
 
 fn build_command(command: &str, use_shell: bool) -> Result<Command> {
     if use_shell {
@@ -35,6 +49,12 @@ fn build_command(command: &str, use_shell: bool) -> Result<Command> {
     let (bin, rest) = tokens
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("command is empty"))?;
+    if is_shell_binary(bin) {
+        anyhow::bail!(
+            "refusing to spawn shell binary '{}' in argv mode; pass --shell if you need sh -c semantics",
+            bin
+        );
+    }
     let mut c = Command::new(bin);
     c.args(rest);
     Ok(c)

@@ -115,8 +115,24 @@ fn build_shell_command(command: &str) -> Command {
 // silently. See SECURITY.md "Trust boundary for command-string subcommands".
 const SHELL_METACHARS: &[char] = &['|', ';', '&', '<', '>', '`', '$', '\n'];
 
+// Argv mode also refuses to spawn a shell directly. Otherwise an agent could
+// reintroduce sh -c semantics simply by emitting `sh -c '<payload>'` as the
+// whole argv. The list covers the common interactive/non-interactive shells.
+const SHELL_BINARIES: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "ash",
+    "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+];
+
 fn contains_shell_metachars(command: &str) -> Option<char> {
     command.chars().find(|c| SHELL_METACHARS.contains(c))
+}
+
+fn is_shell_binary(bin: &str) -> bool {
+    let basename = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(bin);
+    SHELL_BINARIES.iter().any(|s| s.eq_ignore_ascii_case(basename))
 }
 
 /// Build a `Command` either by argv (default, no shell) or by `sh -c` (`--shell`).
@@ -137,6 +153,12 @@ fn build_command(command: &str, use_shell: bool) -> Result<Command> {
     let (bin, rest) = tokens
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("command is empty"))?;
+    if is_shell_binary(bin) {
+        anyhow::bail!(
+            "refusing to spawn shell binary '{}' in argv mode; pass --shell if you need sh -c semantics",
+            bin
+        );
+    }
     let mut c = Command::new(bin);
     c.args(rest);
     Ok(c)
@@ -371,5 +393,55 @@ mod tests {
         let cmd = build_command("cargo test ; echo done", true).expect("shell mode bypasses guard");
         let program = cmd.get_program();
         assert!(program == "sh" || program == "cmd");
+    }
+
+    #[test]
+    fn argv_mode_rejects_shell_binary_bare() {
+        // The metachar guard catches `cargo ; sh -c …` but not `sh` alone.
+        // This catches an agent emitting `sh -c '<payload>'` as the whole argv.
+        for shell in ["sh", "bash", "zsh", "dash", "ksh", "fish", "ash"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_shell_binary_absolute_path() {
+        // basename match — `/bin/sh` and `/usr/local/bin/bash` must also be rejected.
+        for shell in ["/bin/sh", "/usr/bin/bash", "/usr/local/bin/zsh"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_windows_shells() {
+        for shell in ["cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh"] {
+            let err = build_command(&format!("{shell} /c whoami"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_allows_non_shell_binaries() {
+        // Sanity: only known shell names trip the guard.
+        for cmd in ["cargo test", "go test ./...", "python -m pytest", "node test.js"] {
+            assert!(build_command(cmd, false).is_ok(), "false reject: {cmd}");
+        }
+    }
+
+    #[test]
+    fn shell_mode_allows_explicit_sh_call() {
+        // --shell is the documented escape hatch.
+        assert!(build_command("sh -c 'echo ok'", true).is_ok());
     }
 }

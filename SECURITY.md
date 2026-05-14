@@ -111,9 +111,15 @@ Out of scope:
 
 `contextcrawler err`, `contextcrawler test`, and `contextcrawler summary`
 accept a free-form command string (`trailing_var_arg`). By default this
-string is **parsed as argv and executed without a shell**: shell
-metacharacters (`|`, `;`, `&`, `<`, `>`, backtick, `$`, newline) cause the
-command to be rejected.
+string is **parsed as argv and executed without a shell**:
+
+- Shell metacharacters (`|`, `;`, `&`, `<`, `>`, backtick, `$`, newline)
+  cause the command to be rejected outright.
+- The first token must not be a known shell binary
+  (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, `tcsh`, `csh`, `ash`,
+  `cmd`, `cmd.exe`, `powershell`, `pwsh`, with or without absolute path).
+  Otherwise an agent could trivially reintroduce `sh -c` semantics by
+  emitting `sh -c '<payload>'` as the whole argv.
 
 This guards against a prompt-injection → shell-injection chain where an
 agent rewrites a user's `cargo test` into something like
