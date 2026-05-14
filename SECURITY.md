@@ -1,217 +1,113 @@
 # Security Policy
 
-## Reporting a Vulnerability
+## Reporting a Vulnerability in ContextCrawler
 
-If you discover a security vulnerability in RTK, please report it to the maintainers privately:
+If you discover a security vulnerability in ContextCrawler, please report it
+**privately** — do not file a public issue.
 
-- **Email**: security@rtk-ai.app (or create a private security advisory on GitHub)
-- **Response time**: We aim to acknowledge reports within 48 hours
-- **Disclosure**: We follow responsible disclosure practices (90-day embargo)
+### Preferred channel: GitHub Security Advisories
 
-**Please do NOT:**
-- Open public GitHub issues for security vulnerabilities
-- Disclose vulnerabilities on social media or forums before we've had a chance to address them
+Open a private security advisory at:
 
----
+**<https://github.com/thehoff/contextcrawler/security/advisories/new>**
 
-## Security Review Process for Pull Requests
+GitHub will route the report directly to the maintainer and start a private
+collaboration thread.
 
-RTK is a CLI tool that executes shell commands and handles user input. PRs from external contributors undergo enhanced security review to protect against:
+### Fallback channel: email
 
-- **Shell injection** (command execution vulnerabilities)
-- **Supply chain attacks** (malicious dependencies)
-- **Backdoors** (logic bombs, exfiltration code)
-- **Data leaks** (tracking.db exposure, telemetry abuse)
+If you can't use GitHub's advisory flow, email:
 
----
+**daniel@hoff.id.au**
 
-## Automated Security Checks
+Please include:
 
-Every PR triggers our [`security-check.yml`](.github/workflows/security-check.yml) workflow:
+- A clear description of the issue and its impact
+- Reproduction steps (a minimal PoC if possible)
+- The affected version(s) — `contextcrawler --version`
+- Your preferred attribution name / handle for the eventual public advisory
 
-1. **Dependency audit** (`cargo audit`) - Detects known CVEs
-2. **Critical files alert** - Flags modifications to high-risk files
-3. **Dangerous pattern scan** - Regex-based detection of:
-   - Shell execution (`Command::new("sh")`)
-   - Environment manipulation (`.env("LD_PRELOAD")`)
-   - Network operations (`reqwest::`, `std::net::`)
-   - Unsafe code blocks
-   - Panic-inducing patterns (`.unwrap()` in production)
-4. **Clippy security lints** - Enforces Rust best practices
+### What to expect
 
-Results are posted in the PR's GitHub Actions summary.
+- **Acknowledgment**: within 72 hours (often faster).
+- **Triage**: a few business days after acknowledgment. I'll let you know
+  whether the report is in scope, what the severity looks like, and the
+  rough fix timeline.
+- **Coordinated disclosure**: 90-day embargo by default. I'll work with
+  you on a public advisory and credit you (with permission) once a fix is
+  available.
 
----
+### Please do NOT
 
-## Critical Files Requiring Enhanced Review
-
-The following files are considered **high-risk** and trigger mandatory 2-reviewer approval:
-
-### Tier 1: Shell Execution & System Interaction
-- **`src/runner.rs`** - Shell command execution engine (primary injection vector)
-- **`src/summary.rs`** - Command output aggregation (data exfiltration risk)
-- **`src/tracking.rs`** - SQLite database operations (privacy/telemetry concerns)
-- **`src/discover/registry.rs`** - Rewrite logic for all commands (command injection risk via rewrite rules)
-- **`hooks/rtk-rewrite.sh`** / **`.claude/hooks/rtk-rewrite.sh`** - Thin delegator hook (executes in Claude Code context, intercepts all commands)
-
-### Tier 2: Input Validation
-- **`src/pnpm_cmd.rs`** - Package name validation (prevents injection via malicious names)
-- **`src/container.rs`** - Docker/container operations (privilege escalation risk)
-
-### Tier 3: Supply Chain & CI/CD
-- **`Cargo.toml`** - Dependency manifest (typosquatting, backdoored crates)
-- **`.github/workflows/*.yml`** - CI/CD pipelines (release tampering, secret exfiltration)
-
-**If your PR modifies ANY of these files**, expect:
-- Detailed manual security review
-- Request for clarification on design choices
-- Potentially slower merge timeline
+- Open a public GitHub issue describing the vulnerability.
+- Disclose the issue on social media, forums, or a public blog before a
+  coordinated disclosure has happened.
+- Run automated scans or pentest tools against third parties' deployments
+  of ContextCrawler without explicit permission.
 
 ---
 
-## Review Workflow
+## Upstream vulnerabilities
 
-### For External Contributors
+ContextCrawler is a downstream distribution of
+[`rtk-ai/rtk`](https://github.com/rtk-ai/rtk). If a vulnerability looks
+like it lives in upstream rtk's code (anywhere outside the
+`// ===== contextzip-downstream =====` sentinel blocks), please **also**
+report it to upstream's security channel — that fix benefits the broader
+rtk ecosystem and ContextCrawler will inherit it on the next rebase.
 
-1. **Submit PR** → Automated `security-check.yml` runs
-2. **Review automated results** → Fix any flagged issues
-3. **Manual review** → Maintainer performs comprehensive security audit
-4. **Approval** → Merge (or request for changes)
-
-### For Maintainers
-
-Use the comprehensive security review process:
-
-```bash
-# If Claude Code available, run the dedicated skill:
-/rtk-pr-security <PR_NUMBER>
-
-# Manual review (without Claude):
-gh pr view <PR_NUMBER>
-gh pr diff <PR_NUMBER> > /tmp/pr.diff
-bash scripts/detect-dangerous-patterns.sh /tmp/pr.diff
-```
-
-**Review checklist:**
-- [ ] No critical files modified OR changes justified + reviewed by 2 maintainers
-- [ ] No dangerous patterns OR patterns explained + safe
-- [ ] No new dependencies OR deps audited on crates.io (downloads, maintainer, license)
-- [ ] PR description matches actual code changes (intent vs reality)
-- [ ] No logic bombs (time-based triggers, conditional backdoors)
-- [ ] Code quality acceptable (no unexplained complexity spikes)
+Upstream contact details are in
+[`docs/upstream/RTK_README.md`](docs/upstream/RTK_README.md) and the
+upstream repo's own `SECURITY.md`.
 
 ---
 
-## Dangerous Patterns We Check For
+## Tirith integration
 
-| Pattern | Risk | Example |
-|---------|------|---------|
-| `Command::new("sh")` | Shell injection | Spawns shell with user input |
-| `.env("LD_PRELOAD")` | Library hijacking | Preloads malicious shared libraries |
-| `reqwest::`, `std::net::` | Data exfiltration | Unexpected network operations |
-| `unsafe {` | Memory safety | Bypasses Rust's guarantees |
-| `.unwrap()` in `src/` | DoS via panic | Crashes on invalid input |
-| `SystemTime::now() > ...` | Logic bombs | Delayed malicious behavior |
-| Base64/hex strings | Obfuscation | Hides malicious URLs/commands |
+ContextCrawler ships an optional pre-execution gate that calls
+[`tirith`](https://github.com/sheeki03/tirith) as a subprocess. Tirith's
+own security disclosures are handled by the Tirith project; if your
+report concerns Tirith specifically, please route to upstream tirith.
 
-See [Dangerous Patterns Reference](https://github.com/rtk-ai/rtk/wiki/Dangerous-Patterns) for exploitation examples.
+If the issue is in *how ContextCrawler integrates with Tirith* (e.g., a
+way to bypass our gate), that's in scope here — report via the channels
+above.
 
 ---
 
-## Dependency Security
+## Supported versions
 
-New dependencies added to `Cargo.toml` must meet these criteria:
-
-- **Downloads**: >10,000 on crates.io (or strong justification if lower)
-- **Maintainer**: Verified GitHub profile + track record of other crates
-- **License**: MIT or Apache-2.0 compatible
-- **Activity**: Recent commits (within 6 months)
-- **No typosquatting**: Manual verification against similar crate names
-
-**Red flags:**
-- Brand new crate (<1 month old) with low downloads
-- Anonymous maintainer with no GitHub history
-- Crate name suspiciously similar to popular crate (e.g., `serid` vs `serde`)
-- License change in recent versions
+| Version | Supported |
+| ------- | --------- |
+| 0.1.x   | ✅        |
+| < 0.1   | ❌ (pre-release; do not use) |
 
 ---
 
-## Security Best Practices for Contributors
+## Scope
 
-### Avoid These Anti-Patterns
+In scope:
 
-**❌ DON'T:**
-```rust
-// Shell injection risk
-let user_input = get_arg();
-Command::new("sh").arg("-c").arg(format!("echo {}", user_input)).output();
+- The `contextcrawler` binary and any of its subcommands
+- Hook scripts under `hooks/`
+- Build / install / update paths
+- The Tirith pre-execution gate logic (anything inside the
+  `// ===== contextzip-downstream =====` sentinel blocks)
+- Dependencies pinned by `Cargo.toml` / `Cargo.lock`
 
-// Panic on invalid input
-let path = std::env::args().nth(1).unwrap();
+Out of scope:
 
-// Hardcoded secrets
-const API_KEY: &str = "sk_live_1234567890abcdef";
-```
-
-**✅ DO:**
-```rust
-// No shell, direct binary execution
-let user_input = get_arg();
-Command::new("echo").arg(user_input).output();
-
-// Graceful error handling
-let path = std::env::args().nth(1).context("Missing path argument")?;
-
-// Env vars or config files for secrets
-let api_key = std::env::var("API_KEY").context("API_KEY not set")?;
-```
-
-### Error Handling Guidelines
-
-- Use `anyhow::Result<T>` with `.context()` for all error propagation
-- NEVER use `.unwrap()` in `src/` (tests are OK)
-- Prefer `.expect("descriptive message")` over `.unwrap()` if unavoidable
-- Use `?` operator instead of `unwrap()` for propagation
-
-### Input Validation
-
-- Validate all user input before passing to `Command`
-- Use allowlists for command flags (not denylists)
-- Canonicalize file paths to prevent traversal attacks
-- Sanitize package names with strict regex patterns
+- Issues in upstream rtk that aren't materially worsened by our
+  downstream additions (please report those to rtk-ai/rtk).
+- Issues in Tirith itself (report to sheeki03/tirith).
+- Configuration mistakes a user makes in their own Claude Code /
+  agent settings.
+- DoS via running ContextCrawler with extremely large inputs locally —
+  it's a single-user CLI.
 
 ---
 
-## Disclosure Timeline
+## Acknowledgements
 
-When vulnerabilities are reported:
-
-1. **Day 0**: Acknowledgment sent to reporter
-2. **Day 7**: Maintainers assess severity and impact
-3. **Day 14**: Patch development begins
-4. **Day 30**: Patch released + CVE filed (if applicable)
-5. **Day 90**: Public disclosure (or earlier if patch is deployed)
-
-Critical vulnerabilities (remote code execution, data exfiltration) may be fast-tracked.
-
----
-
-## Security Tooling
-
-- **`cargo audit`** - Automated CVE scanning (runs in CI)
-- **`cargo deny`** - License compliance + banned dependencies
-- **`cargo clippy`** - Lints for unsafe patterns
-- **GitHub Dependabot** - Automated dependency updates
-- **GitHub Code Scanning** - Static analysis via CodeQL (planned)
-
----
-
-## Contact
-
-- **Security issues**: security@rtk-ai.app
-- **General questions**: https://github.com/rtk-ai/rtk/discussions
-- **Maintainers**: @FlorianBruniaux (active fork maintainer)
-
----
-
-**Last updated**: 2026-03-05
+We will credit security researchers in the published advisory and the
+project changelog, with their permission.
