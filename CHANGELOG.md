@@ -3,6 +3,62 @@
 All notable changes to ContextCrawler are documented here. Format adapted
 from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.3] — 2026-05-14
+
+Polish release. Empirically surfaced via fresh-install devel-testing on
+macOS and Ubuntu (Framework). v0.1.2 binaries still emitted legacy `rtk`
+strings in user-facing output and tried to exec `rtk` from a CLI
+fallback path that broke flag-only invocations. Internal `rtk`
+identifiers (struct / module / field names, `rtk_cmd:` rule values,
+`rtk_equivalent` classification keys) are intentionally retained to
+keep upstream rebases against rtk-ai/rtk small.
+
+### Fixed (correctness)
+
+- **Hook rewrite prefix.** Every rewrite emitted `rtk <subcmd> ...` —
+  on machines where only the new `contextcrawler` binary is on PATH
+  (the documented install), Claude Code then failed with `command not
+  found: rtk` when it tried to execute the rewritten command. The
+  rewrite output now emits `contextcrawler <subcmd> ...`. Both prefixes
+  are still accepted as "already-rewritten" passthrough so legacy
+  `Bash(rtk:*)` allowlist entries keep working. (#1)
+- **`contextcrawler -v` (and any flag-only invocation).** The CLI
+  fallback path attempted to exec `args[0]` as a binary when clap
+  parsing failed. With `args[0]` = `-v`, that produced a misleading
+  `[rtk: No such file or directory (os error 2)]`. Now: leading-dash
+  guard re-raises clap's parse error so `-v` shows the proper
+  "subcommand required" message; passthrough-failure prefix is
+  `[contextcrawler: ...]`. (#4)
+
+### Fixed (cosmetic, user-facing)
+
+- `gain` dashboard header: `RTK Token Savings` → `ContextCrawler Token
+  Savings` (Project and Global scopes). Empty-state hint reworded. (#1)
+- `cc_economics` empty-state hint reworded. (#1)
+- `init -g` success output: `RTK hook registered` → `ContextCrawler
+  hook registered`; label `RTK.md:` now matches actual file
+  `CONTEXTCRAWLER.md`; `@RTK.md reference added` → `@CONTEXTCRAWLER.md
+  reference added` (sourced from the existing `RTK_MD_REF` constant).
+  Companion fixes in uninstall messages, codex config listing, agent
+  hook output for cline / windsurf / kilocode / antigravity, and the
+  `init -g` usage help text. (#3)
+
+### Added
+
+- **Tirith gate status in `contextcrawler init -g`.** Reports whether
+  the URL-security defense-in-depth gate will be armed at the Claude
+  Code rewrite boundary. Detect-only — does NOT modify the user's
+  `~/.bashrc` / `~/.zshrc` / `~/.config/fish/config.fish`. The gate
+  operates exclusively at the CC PreToolUse hook layer via subprocess
+  invocation of `tirith check`; no interactive-shell integration is
+  involved. (#2 superseded by #5)
+
+### Internal
+
+- Source-level `rtk` identifiers, `rtk_cmd:` rule values, and
+  `rtk_equivalent` classification keys are unchanged. Upstream
+  rebase surface remains tight.
+
 ## [0.1.2] — 2026-05-14
 
 The first release where `contextcrawler init -g` actually wires up a
