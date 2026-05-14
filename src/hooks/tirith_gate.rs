@@ -11,7 +11,20 @@
 //!
 //! Subprocess-only invocation; no statically-linked AGPL code.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+use wait_timeout::ChildExt;
+
+/// Hard cap on how long we wait for `tirith check` before treating it as
+/// unavailable. A hung tirith would otherwise block the agent's PreToolUse
+/// hook indefinitely (until the host agent itself times out — multi-second
+/// freeze of the agent UI).
+const TIRITH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Hard cap on tirith stdout size. A trusted tirith returns a small JSON
+/// verdict; a compromised one could emit gigabytes and OOM us.
+const TIRITH_STDOUT_MAX: u64 = 4 * 1024 * 1024;
 
 pub enum Verdict {
     Allow,
@@ -43,7 +56,9 @@ pub fn check(cmd: &str) -> Verdict {
     };
 
     // Tirith puts the verdict in stdout JSON; exit code is 0 even on block.
-    let output = Command::new(&bin)
+    // Spawn explicitly (not output()) so we can apply a wall-clock timeout
+    // and a stdout size cap. F-01 / F-02 from the 2026-05-15 module audit.
+    let mut child = match Command::new(&bin)
         .args([
             "check",
             "--format",
@@ -53,13 +68,39 @@ pub fn check(cmd: &str) -> Verdict {
             "--",
         ])
         .arg(cmd)
-        .output();
-
-    let output = match output {
-        Ok(o) => o,
+        // Don't inherit stdin from the host agent's hook pipe (F-05).
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(_) => return Verdict::Unavailable,
     };
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    let exit_status = match child.wait_timeout(TIRITH_TIMEOUT) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // Timed out. Kill the child so it doesn't linger; fall through
+            // to Unavailable (caller decides fail-open vs fail-closed).
+            let _ = child.kill();
+            let _ = child.wait();
+            return Verdict::Unavailable;
+        }
+        Err(_) => return Verdict::Unavailable,
+    };
+
+    let _ = exit_status; // tirith returns 0 on both allow and block; rely on JSON content.
+
+    // Read piped stdout with a hard size cap.
+    let mut stdout_buf = Vec::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s
+            .by_ref()
+            .take(TIRITH_STDOUT_MAX)
+            .read_to_end(&mut stdout_buf);
+    }
+    let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
 
     // Parse structurally — substring matching on JSON is fragile (pretty-
     // printed output, descriptions containing the word "block", etc.).
