@@ -40,7 +40,6 @@ Everything contextzip already did continues to work — under the unified
 
 - **9 minor versions of upstream rtk improvements**, including:
   - permission verdict system (deny / ask / allow / default), with default = ask
-
   - lexer-based compound-command splitter (better quoting / heredoc handling)
   - new per-language modules: vitest, playwright, prisma, rake, rspec, rubocop,
     and more
@@ -114,12 +113,14 @@ Then restart Claude Code.
 ### 4. (Optional) Install Tirith for the defense-in-depth gate
 
 ```sh
-cargo install tirith
-eval "$(tirith init --shell zsh)"   # or bash / fish
+cargo install tirith   # binary on PATH is all the gate needs
+# Optional separately: have Tirith vet your interactive shell commands too.
+# eval "$(tirith init --shell zsh)"   # or bash / fish
 ```
 
-ContextCrawler's gate is fail-open by default — no Tirith means no gate, but
-nothing breaks.
+ContextCrawler invokes `tirith` as a subprocess from the agent path —
+no shell preexec hook required. The gate is fail-open by default: no
+Tirith means no gate, but nothing breaks.
 
 ### 5. Verify
 

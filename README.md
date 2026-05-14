@@ -134,8 +134,12 @@ cp rtk-fork/target/release/contextcrawler ~/.local/bin/contextcrawler
 contextcrawler init -g
 
 # Optional: defense-in-depth gate
+# ContextCrawler shells out to `tirith` directly, so the binary on PATH
+# is all the gate needs — no shell hook required.
 cargo install tirith
-eval "$(tirith init --shell zsh)"   # or bash / fish
+
+# Optional separately: have Tirith also vet your own typed commands.
+# eval "$(tirith init --shell zsh)"   # or bash / fish
 ```
 
 Migrating from jee599/contextzip? See [`MIGRATING_FROM_CONTEXTZIP.md`](MIGRATING_FROM_CONTEXTZIP.md).
