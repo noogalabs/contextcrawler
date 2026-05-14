@@ -3,7 +3,53 @@
 All notable changes to ContextCrawler are documented here. Format adapted
 from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.4] — 2026-05-15
+## [0.1.5] — 2026-05-15
+
+Security release. Three downstream-only fixes covering attack surfaces
+that upstream rtk-ai/rtk has declined to address (`#640` "by design /
+tracking"). Each landed on its own feature branch with full Codex peer
+review (three review passes); tracked privately as GitHub Security
+Advisories on `thehoff/contextcrawler` until publication.
+
+### Security
+
+- **GHSA-3mmh-86cm-g6w4** — `contextcrawler err / test / summary` now
+  parse the trailing command as argv and exec without a shell by
+  default. Shell metacharacters cause rejection; the first token is
+  refused if it's a known shell (sh / bash / zsh / dash / ksh / fish /
+  tcsh / csh / ash and their `.exe` variants; cmd / powershell / pwsh;
+  busybox / toybox) or an exec wrapper (env / nice / nohup / time /
+  timeout / gtimeout / ionice / chroot / setpriv / unshare / taskset /
+  stdbuf / script / xargs / watch / sudo / doas / su / runuser /
+  pkexec). `--shell` is the documented escape hatch for users who
+  actually need `sh -c` semantics. Closes a prompt-injection →
+  shell-injection chain where an agent could append a shell payload
+  to a build-triage command and have it auto-execute.
+- **GHSA-wjx4-ffxm-fxxp** — `strip_ansi` now covers OSC (including OSC 8
+  terminal hyperlinks — visible text preserved, URL payload dropped),
+  DCS, SOS, PM, APC, private DEC CSI modes, and standalone Fe/Fp/Fs
+  escapes, on top of the existing CSI coverage. Prisma command paths
+  (`run_generate` / `run_migrate` / `run_db_push`) now wrap their
+  failure-fallback `eprint!` calls in `strip_ansi`. A broader audit of
+  remaining raw-emit paths (git / container / dotnet / python / pnpm /
+  grep) is tracked as follow-up in SECURITY.md.
+- **GHSA-2cwv-rr7c-2p4c** — `scrub_secrets` redacts well-known
+  credential patterns before insert into `tracking.db` (which feeds
+  `gain --history` back into agent context). Covers credential-bearing
+  flags (`--password` / `--token` / `--api-key` / `--secret` /
+  `--access-key` / `--auth-token` / `--client-secret`, with `=value`,
+  space-value, and escape-aware quoted-value forms), HTTP
+  `Authorization` headers, URL-embedded `user:password@`, AWS access
+  keys, GitHub PATs (classic + fine-grained `github_pat_…`), Slack
+  tokens, and mysql/mariadb `-p<password>` (scoped to mysql / mariadb
+  / .exe variants only — `curl -p3000` and similar are not rewritten).
+
+### Tests
+
+- 1828 passed, 0 failed across all three branches and the merged
+  `develop`. Each fix landed with a dedicated regression-test block.
+
+
 
 Mop-up release covering two surfaces v0.1.3 didn't touch.
 
