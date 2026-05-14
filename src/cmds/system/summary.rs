@@ -14,7 +14,12 @@ use std::process::Command;
 const SHELL_METACHARS: &[char] = &['|', ';', '&', '<', '>', '`', '$', '\n'];
 const SHELL_BINARIES: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "ash",
+    "sh.exe", "bash.exe", "zsh.exe", "dash.exe", "ksh.exe", "fish.exe",
     "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+    "busybox", "busybox.exe", "toybox",
+    "env", "nice", "nohup", "time", "timeout", "gtimeout",
+    "ionice", "chroot", "setpriv", "unshare", "taskset", "stdbuf",
+    "script", "xargs", "watch", "sudo", "doas",
 ];
 
 fn is_shell_binary(bin: &str) -> bool {

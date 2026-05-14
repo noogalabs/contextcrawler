@@ -115,12 +115,24 @@ fn build_shell_command(command: &str) -> Command {
 // silently. See SECURITY.md "Trust boundary for command-string subcommands".
 const SHELL_METACHARS: &[char] = &['|', ';', '&', '<', '>', '`', '$', '\n'];
 
-// Argv mode also refuses to spawn a shell directly. Otherwise an agent could
-// reintroduce sh -c semantics simply by emitting `sh -c '<payload>'` as the
-// whole argv. The list covers the common interactive/non-interactive shells.
+// Argv mode also refuses to spawn a shell directly, OR a wrapper utility whose
+// job is to exec a target command. Otherwise an agent could reintroduce sh -c
+// semantics by emitting either `sh -c '<payload>'` or `env sh -c '<payload>'`
+// as the whole argv. Codex review of 3fe0d41 caught both gaps (.exe variants
+// for unix shells, and exec wrappers).
 const SHELL_BINARIES: &[&str] = &[
+    // POSIX / interactive shells
     "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "ash",
+    "sh.exe", "bash.exe", "zsh.exe", "dash.exe", "ksh.exe", "fish.exe",
+    // Windows shells
     "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+    // Embedded multi-tool shells
+    "busybox", "busybox.exe", "toybox",
+    // Exec wrappers — replace the process image with arg[1+], reintroducing
+    // the attack surface this guard exists to prevent.
+    "env", "nice", "nohup", "time", "timeout", "gtimeout",
+    "ionice", "chroot", "setpriv", "unshare", "taskset", "stdbuf",
+    "script", "xargs", "watch", "sudo", "doas",
 ];
 
 fn contains_shell_metachars(command: &str) -> Option<char> {
@@ -443,5 +455,57 @@ mod tests {
     fn shell_mode_allows_explicit_sh_call() {
         // --shell is the documented escape hatch.
         assert!(build_command("sh -c 'echo ok'", true).is_ok());
+    }
+
+    #[test]
+    fn argv_mode_rejects_unix_shell_exe_variants() {
+        // Codex re-review of 3fe0d41: .exe variants of unix shells slipped
+        // through the original blocklist (only cmd.exe / powershell.exe /
+        // pwsh.exe were covered).
+        for shell in ["sh.exe", "bash.exe", "zsh.exe", "dash.exe", "ksh.exe", "fish.exe"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_exec_wrappers() {
+        // Codex re-review of 3fe0d41: wrapper utilities like `env`, `nohup`,
+        // `timeout`, `sudo` replace the process image with arg[1+], so
+        // `env sh -c '<payload>'` bypasses the shell-binary check on
+        // basename `env`. Treat the wrappers as shell-equivalent.
+        for wrapper in [
+            "env", "nice", "nohup", "time", "timeout", "ionice", "chroot",
+            "unshare", "taskset", "stdbuf", "script", "xargs", "watch",
+            "sudo", "doas", "busybox", "toybox",
+        ] {
+            let err = build_command(&format!("{wrapper} echo hi"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{wrapper}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_still_allows_real_interpreters() {
+        // Sanity that the wrapper expansion didn't accidentally trip
+        // common build / test invocations.
+        for cmd in [
+            "cargo test --lib",
+            "go test ./...",
+            "python -m pytest",
+            "node --version",
+            "make build",
+            "ruby -e 'puts 1'",
+        ] {
+            assert!(
+                build_command(cmd, false).is_ok(),
+                "false reject on benign command: {cmd}"
+            );
+        }
     }
 }

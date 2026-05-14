@@ -115,11 +115,22 @@ string is **parsed as argv and executed without a shell**:
 
 - Shell metacharacters (`|`, `;`, `&`, `<`, `>`, backtick, `$`, newline)
   cause the command to be rejected outright.
-- The first token must not be a known shell binary
-  (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, `tcsh`, `csh`, `ash`,
-  `cmd`, `cmd.exe`, `powershell`, `pwsh`, with or without absolute path).
-  Otherwise an agent could trivially reintroduce `sh -c` semantics by
-  emitting `sh -c '<payload>'` as the whole argv.
+- The first token must not be:
+  - a shell binary — `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`,
+    `tcsh`, `csh`, `ash`, with their `.exe` Windows variants; `cmd`,
+    `cmd.exe`, `powershell`, `powershell.exe`, `pwsh`, `pwsh.exe`; or
+    multi-tool shells `busybox`, `toybox`;
+  - an exec wrapper that replaces the process image with `arg[1+]` —
+    `env`, `nice`, `nohup`, `time`, `timeout`, `gtimeout`, `ionice`,
+    `chroot`, `setpriv`, `unshare`, `taskset`, `stdbuf`, `script`,
+    `xargs`, `watch`, `sudo`, `doas`. Without this, an agent could
+    bypass the shell guard via `env sh -c '<payload>'`.
+
+  Match is basename-only and case-insensitive (so `/usr/bin/bash` and
+  `BASH.EXE` both trip). Tradeoff: a legitimate binary coincidentally
+  named `sh` / `bash` / `env` / etc. cannot be invoked through these
+  subcommands in argv mode. Use `--shell` if you have such a case;
+  document it in your project's setup.
 
 This guards against a prompt-injection → shell-injection chain where an
 agent rewrites a user's `cargo test` into something like
