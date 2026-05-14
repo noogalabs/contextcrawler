@@ -75,7 +75,7 @@ impl DiscoverReport {
 pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> String {
     let mut out = String::with_capacity(2048);
 
-    out.push_str("RTK Discover -- Savings Opportunities\n");
+    out.push_str("ContextCrawler Discover -- Savings Opportunities\n");
     out.push_str(&"=".repeat(52));
     out.push('\n');
     out.push_str(&format!(
@@ -83,7 +83,7 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
         report.sessions_scanned, report.since_days, report.total_commands
     ));
     out.push_str(&format!(
-        "Already using RTK: {} commands ({:.1}%)\n",
+        "Already using contextcrawler: {} commands ({:.1}%)\n",
         report.already_rtk,
         if report.total_commands > 0 {
             report.already_rtk as f64 * 100.0 / report.total_commands as f64
@@ -93,26 +93,29 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     ));
 
     if report.supported.is_empty() && report.unsupported.is_empty() {
-        out.push_str("\nNo missed savings found. RTK usage looks good!\n");
+        out.push_str("\nNo missed savings found. ContextCrawler usage looks good!\n");
         return out;
     }
 
     // Missed savings
     if !report.supported.is_empty() {
-        out.push_str("\nMISSED SAVINGS -- Commands RTK already handles\n");
+        out.push_str("\nMISSED SAVINGS -- Commands ContextCrawler already handles\n");
         out.push_str(&"-".repeat(72));
         out.push('\n');
         out.push_str(&format!(
-            "{:<24} {:>5}    {:<18} {:<13} {:>12}\n",
-            "Command", "Count", "RTK Equivalent", "Status", "Est. Savings"
+            "{:<24} {:>5}    {:<26} {:<13} {:>12}\n",
+            "Command", "Count", "ContextCrawler Equivalent", "Status", "Est. Savings"
         ));
 
         for entry in report.supported.iter().take(limit) {
+            // `entry.rtk_equivalent` is the rule's internal `rtk_cmd` ("rtk git",
+            // "rtk cargo", …). Transform to the user-facing prefix on display
+            // — internal lookup keys stay aligned with upstream rtk.
             out.push_str(&format!(
-                "{:<24} {:>5}    {:<18} {:<13} ~{}\n",
+                "{:<24} {:>5}    {:<26} {:<13} ~{}\n",
                 truncate_str(&entry.command, 23),
                 entry.count,
-                entry.rtk_equivalent,
+                super::registry::display_rtk(entry.rtk_equivalent),
                 entry.rtk_status.as_str(),
                 format_tokens(entry.estimated_savings_tokens),
             ));
