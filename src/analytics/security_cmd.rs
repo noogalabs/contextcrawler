@@ -101,7 +101,7 @@ impl LogEvent {
 }
 
 /// Entry point for `contextcrawler security log`.
-pub fn run_log(format: &str, limit: usize, _verbose: u8) -> Result<()> {
+pub fn run_log(format: &str, limit: usize, histogram: bool, _verbose: u8) -> Result<()> {
     let dir = dirs::data_local_dir()
         .map(|d| d.join("contextcrawler"))
         .ok_or_else(|| anyhow::anyhow!("could not resolve data_local_dir"))?;
@@ -129,6 +129,16 @@ pub fn run_log(format: &str, limit: usize, _verbose: u8) -> Result<()> {
     // Sort by timestamp ascending (oldest first), then take the tail.
     events.sort_by(|a, b| a.timestamp().cmp(b.timestamp()));
     let total = events.len();
+
+    if histogram {
+        let buckets = bucket_events(&events);
+        match format {
+            "json" => render_histogram_json(&dir, total, &buckets),
+            _ => render_histogram_human(&dir, total, &buckets),
+        }
+        return Ok(());
+    }
+
     let start = total.saturating_sub(limit);
     let tail = &events[start..];
 
@@ -137,6 +147,82 @@ pub fn run_log(format: &str, limit: usize, _verbose: u8) -> Result<()> {
         _ => render_log_human(&dir, total, tail),
     }
     Ok(())
+}
+
+/// Group events by (source, category) where category is the Tirith reason or
+/// the supply-chain verdict. Returns buckets sorted by count descending.
+fn bucket_events(events: &[LogEvent]) -> Vec<(&'static str, String, usize)> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<(&'static str, String), usize> = HashMap::new();
+    for ev in events {
+        match ev {
+            LogEvent::Tirith { reason, .. } => {
+                *counts.entry(("tirith", reason.clone())).or_insert(0) += 1;
+            }
+            LogEvent::SupplyChain { verdict, .. } => {
+                *counts
+                    .entry(("supply-chain", verdict.to_lowercase()))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    let mut buckets: Vec<(&'static str, String, usize)> = counts
+        .into_iter()
+        .map(|((src, cat), n)| (src, cat, n))
+        .collect();
+    buckets.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)).then(a.1.cmp(&b.1)));
+    buckets
+}
+
+fn render_histogram_human(
+    dir: &std::path::Path,
+    total: usize,
+    buckets: &[(&'static str, String, usize)],
+) {
+    println!("ContextCrawler Gate Activity — Histogram");
+    println!("{}", "═".repeat(60));
+    println!("  Sources:");
+    println!("    {}", dir.join("downgrades.jsonl").display());
+    println!("    {}", dir.join("supply_chain.jsonl").display());
+    println!("  Total events: {}", total);
+    println!();
+    if buckets.is_empty() {
+        println!("  No gate activity yet. Enable the gates and run a few commands.");
+        return;
+    }
+    let max = buckets.iter().map(|b| b.2).max().unwrap_or(1);
+    // Bar width: scale longest bucket to 24 cells.
+    let bar_max = 24usize;
+    for (src, cat, n) in buckets {
+        let cells = ((*n as f64) / (max as f64) * (bar_max as f64)).round() as usize;
+        let bar = "█".repeat(cells.max(1));
+        println!("  {:<13} {:<30} {:>5}  {}", src, cat, n, bar);
+    }
+    println!();
+    println!("  Auto-allow decisions are not logged — only gate downgrades and");
+    println!("  supply-chain verdicts. Use `contextcrawler gain` for total command volume.");
+}
+
+fn render_histogram_json(
+    dir: &std::path::Path,
+    total: usize,
+    buckets: &[(&'static str, String, usize)],
+) {
+    let arr: Vec<serde_json::Value> = buckets
+        .iter()
+        .map(|(src, cat, n)| {
+            serde_json::json!({ "source": src, "category": cat, "count": n })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "sources": {
+            "tirith": dir.join("downgrades.jsonl").display().to_string(),
+            "supply_chain": dir.join("supply_chain.jsonl").display().to_string(),
+        },
+        "total": total,
+        "buckets": arr,
+    });
+    println!("{}", body);
 }
 
 fn parse_tirith_line(line: &str) -> Option<LogEvent> {

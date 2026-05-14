@@ -813,6 +813,9 @@ enum SecurityCommands {
         /// Maximum number of recent events to show.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Print a bucketed histogram of all events instead of the event tail.
+        #[arg(long)]
+        histogram: bool,
     },
 }
 // ===== end contextzip-downstream Security =====
@@ -2521,9 +2524,13 @@ fn run_cli() -> Result<i32> {
                     let fmt = if json { "json" } else { "text" };
                     analytics::security_cmd::run_dashboard(fmt, cli.verbose)?;
                 }
-                Some(SecurityCommands::Log { json, limit }) => {
+                Some(SecurityCommands::Log {
+                    json,
+                    limit,
+                    histogram,
+                }) => {
                     let fmt = if json { "json" } else { "text" };
-                    analytics::security_cmd::run_log(fmt, limit, cli.verbose)?;
+                    analytics::security_cmd::run_log(fmt, limit, histogram, cli.verbose)?;
                 }
             }
             0
