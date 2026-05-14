@@ -65,7 +65,7 @@ fn run_gt_filtered(
     }
 
     if !cmd_output.stderr.trim().is_empty() {
-        eprintln!("{}", cmd_output.stderr.trim());
+        eprintln!("{}", strip_ansi(&cmd_output.stderr).trim());
     }
 
     let label = if args.is_empty() {

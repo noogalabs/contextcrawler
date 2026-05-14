@@ -304,10 +304,10 @@ fn run_show(
     }
     let summary_result = exec_capture(&mut summary_cmd).context("Failed to run git show")?;
     if !summary_result.success() {
-        eprintln!("{}", summary_result.stderr);
+        eprintln!("{}", strip_ansi(&summary_result.stderr));
         return Ok(summary_result.exit_code);
     }
-    println!("{}", summary_result.stdout.trim());
+    println!("{}", strip_ansi(&summary_result.stdout).trim());
 
     // Step 2: --stat summary
     let mut stat_cmd = git_cmd(global_args);
@@ -1095,10 +1095,10 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         );
     } else {
         if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
+            eprint!("{}", strip_ansi(&stderr));
         }
         if !stdout.trim().is_empty() {
-            eprint!("{}", stdout);
+            eprint!("{}", strip_ansi(&stdout));
         }
         timer.track(&original_cmd, "rtk git commit", &raw_output, &raw_output);
         return Ok(exit_code);
@@ -1161,10 +1161,10 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
     } else {
         eprintln!("FAILED: git push");
         if !stderr.trim().is_empty() {
-            eprintln!("{}", stderr);
+            eprintln!("{}", strip_ansi(&stderr));
         }
         if !stdout.trim().is_empty() {
-            eprintln!("{}", stdout);
+            eprintln!("{}", strip_ansi(&stdout));
         }
         return Ok(exit_code_from_output(&output, "git push"));
     }

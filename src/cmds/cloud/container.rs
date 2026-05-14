@@ -532,7 +532,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
         .context("Failed to run docker compose ps")?;
 
     if !raw_result.success() {
-        eprintln!("{}", raw_result.stderr);
+        eprintln!("{}", strip_ansi(&raw_result.stderr));
         return Ok(raw_result.exit_code);
     }
     let raw = raw_result.stdout;

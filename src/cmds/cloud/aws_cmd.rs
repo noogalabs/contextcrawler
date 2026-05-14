@@ -252,7 +252,7 @@ fn run_generic(subcommand: &str, args: &[String], verbose: u8, full_sub: &str) -
             &stderr,
             &stderr,
         );
-        eprintln!("{}", stderr.trim());
+        eprintln!("{}", strip_ansi(&stderr).trim());
         return Ok(crate::core::utils::exit_code_from_output(&output, "aws"));
     }
 
@@ -318,7 +318,7 @@ fn run_aws_json(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if !output.status.success() {
-        eprintln!("{}", stderr.trim());
+        eprintln!("{}", strip_ansi(&stderr).trim());
     }
 
     Ok((stdout, stderr, output.status))
@@ -350,7 +350,7 @@ fn run_aws_filtered(
         if let Some(hint) = crate::core::tee::tee_and_hint(&raw, &slug, exit_code) {
             eprintln!("{}\n{}", stderr.trim(), hint);
         } else {
-            eprintln!("{}", stderr.trim());
+            eprintln!("{}", strip_ansi(&stderr).trim());
         }
         timer.track(&cmd_label, &rtk_label, &raw, &stderr);
         return Ok(exit_code);
@@ -403,7 +403,7 @@ fn run_s3_ls(extra_args: &[String], verbose: u8) -> Result<i32> {
         if let Some(hint) = crate::core::tee::tee_and_hint(&raw, "aws_s3_ls", exit_code) {
             eprintln!("{}\n{}", stderr.trim(), hint);
         } else {
-            eprintln!("{}", stderr.trim());
+            eprintln!("{}", strip_ansi(&stderr).trim());
         }
         timer.track("aws s3 ls", "rtk aws s3 ls", &raw, &stderr);
         return Ok(exit_code);
@@ -456,7 +456,7 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
         if let Some(hint) = crate::core::tee::tee_and_hint(&raw, &slug, exit_code) {
             eprintln!("{}\n{}", stderr.trim(), hint);
         } else {
-            eprintln!("{}", stderr.trim());
+            eprintln!("{}", strip_ansi(&stderr).trim());
         }
         timer.track(&cmd_label, &rtk_label, &raw, &stderr);
         return Ok(exit_code);
