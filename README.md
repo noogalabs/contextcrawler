@@ -13,12 +13,28 @@
 > a second opinion (why not). **Don't trust me — verify.** Bug reports
 > welcome; expectations of stability shouldn't be.
 
-A downstream distribution of [rtk-ai/rtk](https://github.com/rtk-ai/rtk)
-that brings the [jee599/contextzip](https://github.com/jee599/contextzip)
-feature set forward to current rtk and stitches in
-[Tirith](https://tirith.sh) for defense-in-depth on the auto-allow path.
+ContextCrawler is a CLI proxy for AI coding agents (Claude Code, Cursor,
+Copilot, Gemini, …) that does two things:
+
+1. **Compresses** noisy command output before it eats your LLM context window.
+2. **Gates** risky shell commands and supply-chain installs before any
+   auto-approval reaches the agent.
 
 One binary, one name: **`contextcrawler`**.
+
+## Built from
+
+| Component | What it brings | License |
+|---|---|---|
+| [rtk-ai/rtk](https://github.com/rtk-ai/rtk) | The core CLI proxy framework: 60+ command filters (git, cargo, npm, kubectl, docker, …), the permission-verdict system (`allow` / `ask` / `deny` / `default`), and the agent-hook entrypoints used by every supported integration. Tracked via rebase against tagged releases. | Apache-2.0 / MIT |
+| [jee599/contextzip](https://github.com/jee599/contextzip) | The session-JSONL compactor for Claude Code, the multi-language stacktrace compressor (Node / Python / Rust / Go / Java), and the HTML web-content extractor. Ported forward to current rtk with per-file SPDX headers preserving attribution. | MIT |
+| [Tirith](https://tirith.sh) ([sheeki03/tirith](https://github.com/sheeki03/tirith)) | A shell-syntax security inspector. ContextCrawler invokes it via subprocess as an optional defense-in-depth gate on the auto-allow path — block-level findings downgrade the verdict to *Ask*. | AGPL-3.0 (subprocess-only) |
+
+Plus one capability **built in-tree**:
+
+| Component | What it brings | Where |
+|---|---|---|
+| Supply-chain gate | Pre-install age-of-release + OSV CVE lookup for `npm` / `pnpm` / `yarn` and `pip` / `uv` / `poetry` / `pipx` installs. Honors pinned versions; caches lookups for 24 h. Opt-in via `~/.config/contextcrawler/supply-chain.toml`. | `src/hooks/supply_chain_gate.rs` |
 
 ## Goal
 
@@ -33,27 +49,132 @@ you work:
   and pre-install supply-chain checks (package age + OSV CVE lookup).
   Neither is mandatory; both are opt-in.
 
-If you were using `jee599/contextzip` and want the same features but on
-**current rtk**, this is the migration path.
-[`MIGRATING_FROM_CONTEXTZIP.md`](MIGRATING_FROM_CONTEXTZIP.md) walks
-you through it.
+## Capabilities
 
-## Features at a glance
+Grouped by which upstream the capability comes from. Everything is one
+binary; the split is for navigation, not packaging.
+
+### 1. Context & cache (from rtk + contextzip)
+
+| Command | Purpose | Source |
+|---|---|---|
+| `contextcrawler <git / cargo / npm / …>` | Drop-in for everyday rtk-style filtering — 60+ command filters inherited from upstream. | rtk |
+| `contextcrawler web <url>` | Fetch a URL and strip HTML chrome (nav, ads, scripts). ~86% byte savings on typical landing pages. | contextzip |
+| `contextcrawler sessions compact <id>` | Compact a Claude Code session-JSONL log. Dedupes repeated file-reads, recompresses past Bash outputs. Sidecar-based; never touches the original. | contextzip |
+| `contextcrawler sessions apply <id>` / `expand <id>` | Promote a sidecar to live, or roll it back. | contextzip |
+| Stacktrace compressor | Detects framework frames in Node / Python / Rust / Go / Java tracebacks and drops them. Wired into the runner pipeline — automatic. | contextzip |
+| `contextcrawler gain` | Token-savings stats. Preserves your existing `contextzip` SQLite DB. | rtk |
+| `contextcrawler init -g` | Register the agent hook with Claude Code (and other agents via `--agent`). | rtk |
+| `contextcrawler hook claude` / `cursor` / `copilot` / `gemini` | Built-in agent-hook entrypoints. Configured by `contextcrawler init -g`. | rtk |
+
+### 2. Security gate (Tirith pairing)
+
+Optional. The gate only fires when [`tirith`](https://tirith.sh) is on
+`PATH`; fail-open by default. Invoked subprocess-only — no statically
+linked AGPL code.
+
+| Command | Purpose | Source |
+|---|---|---|
+| `contextcrawler security` | Tirith integration dashboard — audit stats, gate mode, shell-hook status, top detection rules. | downstream |
+| `contextcrawler security log` | Merged gate-activity log: Tirith downgrades + supply-chain events, sorted by time. `--limit N`, `--json`. | downstream |
+| `contextcrawler security log --histogram` | Bucketed counts of gate activity by `(source, category)` with proportional bars. Three-line situational awareness. | downstream |
+| Tirith pre-execution gate | Routes auto-allow rewrites through `tirith check` first. Block-level findings downgrade to *Ask* so the user reviews the original command. | downstream + Tirith |
+
+**Env knobs:**
+
+| Variable | Effect |
+|---|---|
+| *(default)* | fail-open: if Tirith isn't installed, no gate, original rtk verdict stands |
+| `CONTEXTCRAWLER_TIRITH_REQUIRED=1` | fail-closed: refuse auto-allow without a working Tirith verdict |
+| `CONTEXTCRAWLER_TIRITH_DISABLED=1` | bypass the gate entirely (debug only) |
+
+### 3. Supply-chain pipeline control
+
+Optional. Opt-in via `~/.config/contextcrawler/supply-chain.toml`.
+Detects `npm`/`pnpm`/`yarn` and `pip`/`uv`/`poetry`/`pipx` install
+commands; blocks auto-allow when the resolved version is younger than a
+configurable cooldown or carries OSV-known CVEs.
 
 | Command | Purpose |
 |---|---|
-| `contextcrawler <git / cargo / npm / ...>` | Drop-in for everyday rtk-style filtering — 60+ command filters inherited from upstream. |
-| `contextcrawler web <url>` | Fetch a URL and strip HTML chrome (nav, ads, scripts). ~86% byte savings on typical landing pages. |
-| `contextcrawler sessions compact <id>` / `apply` / `expand` | Compact / promote / rollback Claude Code session-JSONL logs. Sidecar-based; never touches the original. |
-| `contextcrawler security` | Tirith integration dashboard — audit stats, gate mode, shell-hook status, top detection rules. |
-| `contextcrawler security log` | Merged gate-activity log (Tirith downgrades + supply-chain events), human-readable. `--json` for tooling. |
-| `contextcrawler supply-chain check '<cmd>'` | Inspect an install command for recent uploads + known CVEs. Opt-in via config. |
-| `contextcrawler hook claude` / `cursor` / `copilot` / `gemini` | Built-in agent-hook entrypoints. Configured by `contextcrawler init -g`. |
-| `contextcrawler gain` | Token-savings stats. Preserves your existing `contextzip` SQLite DB. |
-| `contextcrawler init -g` | Register with Claude Code (and other agents via `--agent`). |
-| Multi-language stacktrace compression | Wired into the runner pipeline. Detects framework frames in Node / Python / Rust / Go / Java tracebacks and drops them. Automatic. |
-| Tirith pre-execution gate | Optional. When Tirith is installed, auto-allow rewrites are routed through `tirith check` first. Block-level findings downgrade to *Ask*. Fail-open by default. |
-| Supply-chain pre-install gate | Optional. Refuses to auto-allow `npm install foo` or `pip install foo` when the resolved version is younger than a configurable cooldown (default 3d) or carries OSV-known CVEs. Honors pinned versions. |
+| `contextcrawler supply-chain check '<cmd>'` | Inspect an install command. Reports age, CVEs, verdict. Useful for shell-side spot-checks before sharing a snippet with an agent. |
+| Supply-chain pre-install gate | Runs automatically on auto-allow when an install is detected. Block reasons (age below cooldown, known CVE) downgrade to *Ask*. Honors pinned versions; cached for 24 h at `~/.cache/contextcrawler/supply-chain/`. |
+| Config: `[npm].cooldown_days`, `[pypi].cooldown_days` | Minimum days since publish before auto-allow (default `3`). |
+| Config: `[npm].block_severity`, `[pypi].block_severity` | Minimum OSV severity that blocks (default `HIGH`). |
+| Config: `[overrides].always_allow`, `[overrides].always_deny` | Per-package globs (`@types/*` etc.) to bypass either side of the gate. |
+
+## Sample output
+
+The histogram subcommand is the quickest way to see what the gates are
+doing in your environment:
+
+```text
+$ contextcrawler security log --histogram
+
+ContextCrawler Gate Activity — Histogram
+════════════════════════════════════════════════════════════
+  Sources:
+    ~/Library/Application Support/contextcrawler/downgrades.jsonl
+    ~/Library/Application Support/contextcrawler/supply_chain.jsonl
+  Total events: 43
+
+  supply-chain  skip                              20  ████████████████████████
+  supply-chain  block                             11  █████████████
+  supply-chain  allow                              7  ████████
+  tirith        tirith_block                       3  ████
+  supply-chain  unavailable                        1  █
+  tirith        tirith_required_unavailable        1  █
+
+  Auto-allow decisions are not logged — only gate downgrades and
+  supply-chain verdicts. Use `contextcrawler gain` for total command volume.
+```
+
+The Tirith dashboard, when Tirith is installed:
+
+```text
+$ contextcrawler security
+
+ContextCrawler Security (Tirith Integration)
+════════════════════════════════════════════════════════════
+
+  Tirith binary: ~/.cargo/bin/tirith (0.3.1)
+  Shell:         zsh
+  Shell hook:    NOT configured (commands NOT intercepted at the shell)
+  Rewrite gate:  fail-open (default)
+
+Audit Log Summary
+────────────────────────────────────────────────────────────
+  Commands analyzed: 2189
+  Findings:          154
+  Action breakdown:  Allow 2129 | Warn 3 | Block 57 (2.6% block rate)
+
+Top detection rules:
+     32  raw_ip_url
+     27  plain_http_to_sink
+     24  private_network_access
+     21  pipe_to_interpreter
+      8  schemeless_to_sink
+      ...
+```
+
+A supply-chain check that finds something:
+
+```text
+$ contextcrawler supply-chain check 'pip install requests==2.20.0'
+
+[contextcrawler supply-chain] BLOCKED
+  requests [PyPI]: GHSA-9hjg-9r4m-mvj7 — Requests vulnerable to .netrc credentials leak via malicious URLs (severity High)
+  requests [PyPI]: GHSA-9wx4-h78v-vm56 — Requests `Session` object does not verify requests after making first request with verify=False (severity High)
+  requests [PyPI]: GHSA-gc5v-m9x4-r6x2 — Requests has Insecure Temp File Reuse in its extract_zipped_paths() utility function (severity High)
+  requests [PyPI]: GHSA-j8r2-6x86-q33q — Unintended leak of Proxy-Authorization header in requests (severity High)
+  requests [PyPI]: PYSEC-2023-74 — (no summary) (severity High)
+  Overrides: rerun with CONTEXTCRAWLER_SUPPLY_CHAIN=off, or add the package
+  to ~/.config/contextcrawler/supply-chain.toml [overrides.always_allow]
+```
+
+The default tail of `security log` shows the same events in chronological
+order with per-finding detail — handy when triaging which install or which
+shell pattern actually fired.
 
 ## Diagrams
 
@@ -141,64 +262,6 @@ cargo install tirith
 # Optional separately: have Tirith also vet your own typed commands.
 # eval "$(tirith init --shell zsh)"   # or bash / fish
 ```
-
-Migrating from jee599/contextzip? See [`MIGRATING_FROM_CONTEXTZIP.md`](MIGRATING_FROM_CONTEXTZIP.md).
-
-## Layout
-
-```
-contextZip/
-├── rtk-fork/             # git clone of rtk-ai/rtk on branch contextzip-downstream
-│                         #   atop v0.39.0. Carries small downstream patches.
-├── notes/                # design notes + decision logs
-├── CHANGELOG.md
-├── MIGRATING_FROM_CONTEXTZIP.md
-└── README.md             # this file
-```
-
-The rtk-fork uses a plain rebase model — every downstream commit lands
-inside `// ===== contextzip-downstream =====` sentinel-block pairs in
-`main.rs`, `runner.rs`, `rewrite_cmd.rs`, `hook_cmd.rs`, and a few hook
-scripts, so upstream rebases stay confined to predictable lines.
-
-## Track upstream
-
-```sh
-cd rtk-fork
-git fetch origin
-git rebase v0.40.0 contextzip-downstream   # resolve any sentinel conflicts
-cargo build --release && cargo test --release
-```
-
-`git rerere` is enabled to auto-replay repeated conflict resolutions
-across rebases.
-
-## Defense-in-depth gate (optional Tirith pairing)
-
-| | ContextCrawler | Tirith |
-|---|---|---|
-| Purpose | Shrink command output | Inspect commands |
-| When | Post-execution filter | Pre-execution gate |
-| Latency | ms–seconds | < 2 ms |
-
-The gate calls `tirith check --format json` on any rewrite that would
-auto-approve. When Tirith returns `action="block"`, the verdict is
-downgraded to *Ask* so the user reviews the original command. The gate is
-subprocess-only — no statically linked AGPL code.
-
-```sh
-contextcrawler security                  # human format
-contextcrawler security --format json    # parseable
-contextcrawler security --log            # tail recent gate downgrades
-```
-
-**Env knobs:**
-
-| Variable | Effect |
-|---|---|
-| (default) | fail-open: if Tirith isn't installed, no gate, original rtk verdict stands |
-| `CONTEXTCRAWLER_TIRITH_REQUIRED=1` | fail-closed: refuse auto-allow without a working Tirith verdict |
-| `CONTEXTCRAWLER_TIRITH_DISABLED=1` | bypass the gate entirely (debug only) |
 
 ## License
 

@@ -46,5 +46,11 @@ claudedocs
 .vitals/
 .worktrees/
 
-# icm 
+# icm
 .fastembed_cache/
+
+# ContextCrawler: personal/AI workspace — never publish
+local/
+.claude/
+.github/
+.rtk/
