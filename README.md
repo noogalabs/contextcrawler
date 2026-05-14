@@ -122,31 +122,8 @@ flowchart TB
 
 </details>
 
-<details>
-<summary><strong>3. Feature surface — what the binary exposes</strong></summary>
-
-```mermaid
-flowchart TB
-    BIN["<code>contextcrawler</code>"]
-
-    BIN --> FILTERS["Command filters<br/>(60+ from rtk):<br/>git · cargo · npm · pnpm ·<br/>vitest · playwright · docker ·<br/>kubectl · pytest · ..."]
-    BIN --> WEB["<code>web &lt;url&gt;</code><br/>HTML content extractor"]
-    BIN --> SESSIONS["<code>sessions</code><br/>compact / apply / expand<br/>Claude JSONL logs"]
-    BIN --> SECURITY["<code>security</code><br/>+ <code>security log</code><br/>Tirith dashboard + activity log"]
-    BIN --> SUPPLY["<code>supply-chain check</code><br/>opt-in pre-install gate"]
-    BIN --> HOOK_SUB["<code>hook &lt;agent&gt;</code><br/>built-in agent hook"]
-    BIN --> INIT["<code>init -g</code><br/>register with agents"]
-    BIN --> GAIN["<code>gain</code><br/>token-savings stats<br/>(your contextzip DB)"]
-
-    classDef new fill:#2a0a2e,stroke:#e83e8c,color:#fff
-    classDef inherited fill:#1a1a2e,stroke:#888,color:#ddd
-    class WEB,SESSIONS,SECURITY,SUPPLY new
-    class FILTERS,HOOK_SUB,INIT,GAIN inherited
-```
-
-Pink boxes are ContextCrawler additions; grey are inherited from upstream rtk.
-
-</details>
+The Features table above already enumerates every subcommand; a
+feature-surface fan-out diagram would just repeat it.
 
 ## Install
 
