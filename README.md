@@ -266,12 +266,30 @@ cargo build --release
 cp target/release/contextcrawler ~/.local/bin/contextcrawler
 ```
 
-**Wire up the agent hook:**
+**Wire up the agent hook(s):**
+
+Each agent needs its own init call — `init -g` only writes the chosen
+agent's config per invocation. Run as many as you use; the hook scripts
+for every supported agent are bundled into the binary, so you don't
+need to install anything else.
 
 ```sh
-# Hook into Claude Code (and other agents — see `contextcrawler init --help`)
-contextcrawler init -g
+contextcrawler init -g                       # Claude Code (default)
+contextcrawler init -g --opencode            # OpenCode plugin (additive: also installs Claude)
+contextcrawler init -g --copilot             # GitHub Copilot (VS Code + CLI)
+contextcrawler init -g --gemini              # Gemini CLI
+contextcrawler init -g --codex               # Codex CLI
+contextcrawler init -g --agent cursor        # Cursor Agent (editor + CLI)
+contextcrawler init -g --agent windsurf      # Windsurf (Cascade)
+contextcrawler init -g --agent cline         # Cline / Roo Code (VS Code)
+contextcrawler init -g --agent kilocode      # Kilo Code
+contextcrawler init -g --agent antigravity   # Google Antigravity
 ```
+
+`contextcrawler init --show` prints what's currently registered.
+`contextcrawler init -g --uninstall` reverses the last install for the
+selected agent. See `contextcrawler init --help` for the full surface
+(`--hook-only`, `--auto-patch`, `--no-patch`, `--claude-md` legacy).
 
 **Optional defense-in-depth gate:**
 
