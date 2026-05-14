@@ -87,7 +87,7 @@ pub fn run(
 
     if summary.total_commands == 0 {
         println!("No tracking data yet.");
-        println!("Run some rtk commands to start tracking savings.");
+        println!("Run some contextcrawler commands to start tracking savings.");
         return Ok(());
     }
 
@@ -95,9 +95,9 @@ pub fn run(
     if !daily && !weekly && !monthly && !all {
         // added: scope-aware styled header // changed: merged upstream styled + project scope
         let title = if project_scope.is_some() {
-            "RTK Token Savings (Project Scope)"
+            "ContextCrawler Token Savings (Project Scope)"
         } else {
-            "RTK Token Savings (Global Scope)"
+            "ContextCrawler Token Savings (Global Scope)"
         };
         println!("{}", styled(title, true));
         println!("{}", "═".repeat(60));
