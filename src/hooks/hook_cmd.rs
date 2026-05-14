@@ -340,10 +340,27 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     });
 
     if verdict == PermissionVerdict::Allow {
-        hook_output
-            .as_object_mut()
-            .unwrap()
-            .insert("permissionDecision".into(), json!("allow"));
+        // ===== contextzip-downstream: Tirith gate fires here =====
+        // When defense-in-depth is installed, consult Tirith before
+        // auto-allowing. Block-level verdicts (or fail-closed +
+        // unavailable) cause us to omit permissionDecision so Claude
+        // Code's normal review prompt fires for the original command.
+        let tirith_verdict = super::tirith_gate::check(cmd);
+        match super::tirith_gate::should_downgrade(&tirith_verdict) {
+            Some((reason, tirith_json)) => {
+                super::tirith_gate::log_downgrade(cmd, reason, tirith_json);
+                // Intentionally do NOT insert "permissionDecision" — the
+                // rewrite still flows to Claude Code via updatedInput,
+                // but without the auto-allow flag the user gets prompted.
+            }
+            None => {
+                hook_output
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("permissionDecision".into(), json!("allow"));
+            }
+        }
+        // ===== contextzip-downstream: end Tirith gate =====
     }
 
     PayloadAction::Rewrite {
