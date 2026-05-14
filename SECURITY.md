@@ -125,6 +125,15 @@ Anything in those payloads counts as untrusted input and must not reach
 the model. Coverage is tested against fixtures with mixed CSI/OSC/DCS
 and explicit "OSC URL must not leak" assertions.
 
+`strip_ansi` itself is correct; **callers must invoke it**. The Prisma
+command paths in `src/cmds/js/prisma_cmd.rs` were missing the wrap on
+their failure fallbacks (raw `eprint!` of stdout/stderr) and are now
+fixed. A broader audit of remaining failure-path raw emits in
+`cmds/git/`, `cmds/cloud/container.rs`, `cmds/dotnet/`, `cmds/python/`,
+`cmds/js/pnpm_cmd.rs`, `cmds/system/grep_cmd.rs` is tracked as a
+follow-up — those paths can still pass terminal escape sequences
+through on tool failure.
+
 Tracked by [GHSA-wjx4-ffxm-fxxp](https://github.com/thehoff/contextcrawler/security/advisories/GHSA-wjx4-ffxm-fxxp).
 
 ---
