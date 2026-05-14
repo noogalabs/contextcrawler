@@ -23,13 +23,18 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "deny"
 
-# Known accepted exceptions. Document why each is here.
+# Known accepted exceptions. Each entry is scoped to a specific crate so
+# the ignore doesn't silently cover unrelated crates that pick up the
+# same advisory in future.
 ignore = [
-    # fxhash 0.2.1: unmaintained. Pulled in transitively via:
-    #   contextcrawler -> scraper -> selectors -> fxhash
-    # Used only by the web-extract path. No active CVE. Re-evaluate when
-    # selectors upgrades; tracked in docs/quality/BASELINE.md.
-    "RUSTSEC-2025-0057",
+    # RUSTSEC-2025-0057 — currently fires only for fxhash 0.2.1 (transitive
+    # via contextcrawler -> scraper -> selectors -> fxhash). Used only by
+    # the web-extract path. No active CVE. Re-evaluate when selectors
+    # upgrades. cargo-deny 0.19 doesn't accept crate-scoping on advisory
+    # ignores, so this entry is global by advisory ID. If a future advisory
+    # database release reassigns this ID to a different crate, audit the
+    # delta — the comment in BASELINE.md tracks the expected scope.
+    { id = "RUSTSEC-2025-0057", reason = "Unmaintained fxhash 0.2.1, transitive via scraper. No active CVE. Tracked in docs/quality/BASELINE.md." },
 ]
 
 # ─── Licenses ────────────────────────────────────────────────────────
@@ -42,12 +47,13 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",  # unicode-ident
-    "Unicode-3.0",       # newer unicode-ident
+    "Unicode-DFS-2016",      # unicode-ident (older)
+    "Unicode-3.0",           # unicode-ident (newer)
     "Zlib",
     "CC0-1.0",
     "0BSD",
     "MPL-2.0",
+    "CDLA-Permissive-2.0",   # webpki-roots (transitive via ureq + rustls)
 ]
 confidence-threshold = 0.93
 
