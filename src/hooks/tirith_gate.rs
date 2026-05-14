@@ -71,7 +71,12 @@ pub fn check(cmd: &str) -> Verdict {
         // Don't inherit stdin from the host agent's hook pipe (F-05).
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // stderr to /dev/null, not piped. A noisy tirith would otherwise
+        // fill the ~64 KiB kernel pipe buffer and block on write until
+        // our 8s wait_timeout fires — turning a successful check into an
+        // 8-second stall. We don't surface tirith stderr anywhere, so
+        // discarding directly is safe. (Codex review follow-up.)
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(c) => c,
