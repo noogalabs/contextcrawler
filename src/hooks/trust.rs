@@ -178,7 +178,15 @@ pub fn list_trusted() -> Result<HashMap<String, TrustEntry>> {
 // ---------------------------------------------------------------------------
 
 /// Run `rtk trust` — review and trust project-local filters.
-pub fn run_trust(list: bool) -> Result<()> {
+/// Resolve the global filter path (`~/.config/rtk/filters.toml` on Linux,
+/// platform equivalent elsewhere). Returns None if dirs can't locate
+/// a config directory.
+fn global_filter_path() -> Option<std::path::PathBuf> {
+    use crate::core::constants::{FILTERS_TOML, RTK_DATA_DIR};
+    dirs::config_dir().map(|d| d.join(RTK_DATA_DIR).join(FILTERS_TOML))
+}
+
+pub fn run_trust(list: bool, global: bool) -> Result<()> {
     if list {
         // Renamed from `trusted` to defuse CodeQL's name-based
         // `rust/cleartext-logging` heuristic. This is the explicit
@@ -187,10 +195,10 @@ pub fn run_trust(list: bool) -> Result<()> {
         // command, not a leak.
         let entries = list_trusted()?;
         if entries.is_empty() {
-            println!("No trusted project filters.");
+            println!("No trusted filters.");
             return Ok(());
         }
-        println!("Trusted project filters:");
+        println!("Trusted filters:");
         println!("{}", "═".repeat(60));
         for (path, entry) in &entries {
             let date = entry.trusted_at.get(..10).unwrap_or(&entry.trusted_at);
@@ -200,18 +208,33 @@ pub fn run_trust(list: bool) -> Result<()> {
         return Ok(());
     }
 
-    let filter_path = Path::new(".rtk/filters.toml");
-    if !filter_path.exists() {
-        anyhow::bail!("No .rtk/filters.toml found in current directory");
-    }
+    let (filter_path, label) = if global {
+        let p = global_filter_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not locate user config directory"))?;
+        if !p.exists() {
+            anyhow::bail!(
+                "No global filter file at {} — create it first, then re-run.",
+                p.display()
+            );
+        }
+        let label = format!("{}", p.display());
+        (p, label)
+    } else {
+        let p = std::path::PathBuf::from(".rtk/filters.toml");
+        if !p.exists() {
+            anyhow::bail!("No .rtk/filters.toml found in current directory");
+        }
+        (p, ".rtk/filters.toml".to_string())
+    };
 
     // Read ONCE to prevent TOCTOU: display + hash from same buffer
-    let content_bytes = std::fs::read(filter_path).context("Failed to read .rtk/filters.toml")?;
+    let content_bytes =
+        std::fs::read(&filter_path).with_context(|| format!("Failed to read {}", label))?;
     let content = String::from_utf8_lossy(&content_bytes);
 
-    println!("=== .rtk/filters.toml ===");
+    println!("=== {} ===", label);
     println!("{}", content);
-    println!("=========================");
+    println!("{}", "=".repeat(label.len() + 8));
     println!();
 
     // Risk summary
@@ -226,28 +249,48 @@ pub fn run_trust(list: bool) -> Result<()> {
     };
 
     // Store trust with pre-computed hash
-    trust_filter_with_hash(filter_path, &hash)?;
+    trust_filter_with_hash(&filter_path, &hash)?;
     println!();
     println!(
-        "Trusted .rtk/filters.toml (sha256:{})",
+        "Trusted {} (sha256:{})",
+        label,
         hash.get(..16).unwrap_or(&hash)
     );
-    println!("Project-local filters will now be applied.");
+    if global {
+        println!("User-global filters will now be applied.");
+    } else {
+        println!("Project-local filters will now be applied.");
+    }
 
     Ok(())
 }
 
-/// Run `rtk untrust` — revoke trust for project-local filters.
-pub fn run_untrust() -> Result<()> {
-    let filter_path = Path::new(".rtk/filters.toml");
+/// Run `rtk untrust` — revoke trust for project-local or user-global filters.
+pub fn run_untrust(global: bool) -> Result<()> {
+    let (filter_path, label) = if global {
+        let p = global_filter_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not locate user config directory"))?;
+        let label = format!("{}", p.display());
+        (p, label)
+    } else {
+        (
+            std::path::PathBuf::from(".rtk/filters.toml"),
+            ".rtk/filters.toml".to_string(),
+        )
+    };
+
     // If file doesn't exist, untrust by canonical path lookup won't work.
     // Try anyway (file may have been deleted after trust), fallback gracefully.
-    let removed = untrust_filter(filter_path).unwrap_or(false);
+    let removed = untrust_filter(&filter_path).unwrap_or(false);
     if removed {
-        println!("Trust revoked for .rtk/filters.toml");
-        println!("Project-local filters will no longer be applied.");
+        println!("Trust revoked for {}", label);
+        if global {
+            println!("User-global filters will no longer be applied.");
+        } else {
+            println!("Project-local filters will no longer be applied.");
+        }
     } else {
-        println!("No trust entry found for current directory.");
+        println!("No trust entry found for {}.", label);
     }
     Ok(())
 }
