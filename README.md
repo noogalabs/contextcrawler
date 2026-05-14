@@ -248,22 +248,31 @@ flowchart TB
 Requires a Rust toolchain (`rustup`, stable channel). There are no
 pre-built binaries — single-maintainer fork, build it yourself.
 
-**One-liner with `cargo install`:**
+**One-liner with `cargo install` (latest release):**
 
 ```sh
-cargo install --git https://github.com/thehoff/contextcrawler --branch develop --locked
+cargo install --git https://github.com/thehoff/contextcrawler --tag v0.1.0 --locked
 ```
 
 This drops `contextcrawler` into `~/.cargo/bin/`. Make sure that's on
-your `PATH`.
+your `PATH`. Bump the `--tag` value when newer releases ship — see the
+[releases page](https://github.com/thehoff/contextcrawler/releases).
 
 **Or clone and build (recommended if you want to read the diff first):**
 
 ```sh
 git clone https://github.com/thehoff/contextcrawler.git
 cd contextcrawler
+git checkout v0.1.0          # pin to the latest tagged release
 cargo build --release
 cp target/release/contextcrawler ~/.local/bin/contextcrawler
+```
+
+**Bleeding edge** (unreleased fixes on `develop`, expect churn):
+
+```sh
+cargo install --git https://github.com/thehoff/contextcrawler --branch develop --locked
+# or, in a clone, omit the `git checkout v0.1.0` step above
 ```
 
 **Wire up the agent hook(s):**
