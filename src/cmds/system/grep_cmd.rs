@@ -1,6 +1,7 @@
 //! Filters grep output by grouping matches by file.
 
 use crate::core::config;
+use crate::core::utils::strip_ansi;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
@@ -58,9 +59,9 @@ pub fn run(
 
     // Passthrough output flags that produce output that is already small.
     if has_format_flag(extra_args) {
-        print!("{}", result.stdout);
+        print!("{}", strip_ansi(&result.stdout));
         if !result.stderr.is_empty() {
-            eprint!("{}", result.stderr.trim());
+            eprint!("{}", strip_ansi(&result.stderr).trim());
         }
 
         let args_display = if extra_args.is_empty() {
@@ -82,7 +83,7 @@ pub fn run(
     if result.stdout.trim().is_empty() {
         // Show stderr for errors (bad regex, missing file, etc.)
         if exit_code == 2 && !result.stderr.trim().is_empty() {
-            eprintln!("{}", result.stderr.trim());
+            eprintln!("{}", strip_ansi(&result.stderr).trim());
         }
         let msg = format!("0 matches for '{}'", pattern);
         println!("{}", msg);

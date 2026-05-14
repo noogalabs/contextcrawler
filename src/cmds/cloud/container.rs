@@ -1,6 +1,7 @@
 //! Filters Docker and kubectl output into compact summaries.
 
 use crate::core::runner::{self, RunOptions};
+use crate::core::utils::strip_ansi;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
@@ -66,7 +67,7 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
     .context("Failed to run docker ps")?;
 
     if !result.success() {
-        eprint!("{}", result.stderr);
+        eprint!("{}", strip_ansi(&result.stderr));
         timer.track("docker ps", "rtk docker ps", &raw, &raw);
         return Ok(result.exit_code);
     }
@@ -130,7 +131,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
     .context("Failed to run docker images")?;
 
     if !result.success() {
-        eprint!("{}", result.stderr);
+        eprint!("{}", strip_ansi(&result.stderr));
         timer.track("docker images", "rtk docker images", &raw, &raw);
         return Ok(result.exit_code);
     }
@@ -546,7 +547,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
     .context("Failed to run docker compose ps --format")?;
 
     if !result.success() {
-        eprintln!("{}", result.stderr);
+        eprintln!("{}", strip_ansi(&result.stderr));
         return Ok(result.exit_code);
     }
     let structured = result.stdout;

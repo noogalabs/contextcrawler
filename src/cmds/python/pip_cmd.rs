@@ -1,6 +1,7 @@
 //! Filters pip and uv package manager output.
 
 use crate::core::stream::exec_capture;
+use crate::core::utils::strip_ansi;
 use crate::core::tracking;
 use crate::core::utils::{resolved_command, tool_exists};
 use anyhow::{Context, Result};
@@ -127,8 +128,8 @@ fn run_passthrough(base_cmd: &str, args: &[String], verbose: u8) -> Result<(Stri
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 
-    print!("{}", result.stdout);
-    eprint!("{}", result.stderr);
+    print!("{}", strip_ansi(&result.stdout));
+    eprint!("{}", strip_ansi(&result.stderr));
 
     Ok((raw.clone(), raw, result.exit_code))
 }

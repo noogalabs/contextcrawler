@@ -1,6 +1,7 @@
 //! Filters dotnet CLI output — build, test, and format results.
 
 use crate::binlog;
+use crate::core::utils::strip_ansi;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::{resolved_command, truncate};
@@ -95,8 +96,8 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 
-    print!("{}", result.stdout);
-    eprint!("{}", result.stderr);
+    print!("{}", strip_ansi(&result.stdout));
+    eprint!("{}", strip_ansi(&result.stderr));
 
     timer.track(
         &format!("dotnet {}", subcommand),
