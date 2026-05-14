@@ -579,7 +579,7 @@ fn remove_hook_from_settings(verbose: u8) -> Result<bool> {
         atomic_write(&settings_path, &serialized)?;
 
         if verbose > 0 {
-            eprintln!("Removed RTK hook from settings.json");
+            eprintln!("Removed ContextCrawler hook from settings.json");
         }
     }
 
@@ -605,7 +605,7 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
             }
             println!("\nRestart Cursor to apply changes.");
         } else {
-            println!("RTK Cursor support was not installed (nothing to remove)");
+            println!("ContextCrawler Cursor support was not installed (nothing to remove)");
         }
         return Ok(());
     }
@@ -628,7 +628,7 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
             }
             println!("\nRestart Gemini CLI to apply changes.");
         } else {
-            println!("RTK Gemini support was not installed (nothing to remove)");
+            println!("ContextCrawler Gemini support was not installed (nothing to remove)");
         }
         return Ok(());
     }
@@ -706,7 +706,7 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
 
     // 4. Remove hook entry from settings.json
     if remove_hook_from_settings(verbose)? {
-        removed.push("settings.json: removed RTK hook entry".to_string());
+        removed.push("settings.json: removed ContextCrawler hook entry".to_string());
     }
 
     // 5. Remove OpenCode plugin
@@ -721,7 +721,7 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
 
     // Report results
     if removed.is_empty() {
-        println!("RTK was not installed (nothing to remove)");
+        println!("ContextCrawler was not installed (nothing to remove)");
         println!("  Checked: {}", hook_path.display());
         println!("  Checked: {}", claude_dir.join(RTK_MD).display());
         println!("  Checked: {}", claude_md_path.display());
@@ -748,7 +748,7 @@ fn uninstall_codex(global: bool, verbose: u8) -> Result<()> {
     let removed = uninstall_codex_at(&codex_dir, verbose)?;
 
     if removed.is_empty() {
-        println!("RTK was not installed for Codex CLI (nothing to remove)");
+        println!("ContextCrawler was not installed for Codex CLI (nothing to remove)");
     } else {
         println!("RTK uninstalled for Codex CLI:");
         for item in removed {
@@ -768,7 +768,7 @@ fn uninstall_codex_at(codex_dir: &Path, verbose: u8) -> Result<Vec<String>> {
         fs::remove_file(&rtk_md_path)
             .with_context(|| format!("Failed to remove RTK.md: {}", rtk_md_path.display()))?;
         if verbose > 0 {
-            eprintln!("Removed RTK.md: {}", rtk_md_path.display());
+            eprintln!("Removed {}: {}", RTK_MD, rtk_md_path.display());
         }
         removed.push(format!("RTK.md: {}", rtk_md_path.display()));
     }
@@ -1022,17 +1022,21 @@ fn run_default_mode(
     let migrated = patch_claude_md(&claude_md_path, verbose)?;
 
     // 4. Print success message
-    println!("\nRTK hook registered (global).\n");
-    println!("  Command:   {}", CLAUDE_HOOK_COMMAND);
-    println!("  RTK.md:    {} (10 lines)", rtk_md_path.display());
+    println!("\nContextCrawler hook registered (global).\n");
+    println!("  Command:           {}", CLAUDE_HOOK_COMMAND);
+    println!(
+        "  {}: {} (10 lines)",
+        RTK_MD,
+        rtk_md_path.display()
+    );
     if let Some(path) = &opencode_plugin_path {
-        println!("  OpenCode:  {}", path.display());
+        println!("  OpenCode:          {}", path.display());
     }
-    println!("  CLAUDE.md: @RTK.md reference added");
+    println!("  CLAUDE.md:         {} reference added", RTK_MD_REF);
 
     if migrated {
-        println!("\n  [ok] Migrated: removed 137-line RTK block from CLAUDE.md");
-        println!("              replaced with @RTK.md (10 lines)");
+        println!("\n  [ok] Migrated: removed 137-line legacy RTK block from CLAUDE.md");
+        println!("              replaced with {} (10 lines)", RTK_MD_REF);
     }
 
     // 5. Patch settings.json with binary command
@@ -1256,13 +1260,14 @@ fn run_hook_only_mode(
         None
     };
 
-    println!("\nRTK hook registered (hook-only mode).\n");
+    println!("\nContextCrawler hook registered (hook-only mode).\n");
     println!("  Command: {}", CLAUDE_HOOK_COMMAND);
     if let Some(path) = &opencode_plugin_path {
         println!("  OpenCode: {}", path.display());
     }
     println!(
-        "  Note: No RTK.md created. Claude won't know about meta commands (gain, discover, proxy)."
+        "  Note: No {} created. Claude won't know about meta commands (gain, discover, proxy).",
+        RTK_MD
     );
 
     // Patch settings.json with binary command
@@ -1393,7 +1398,7 @@ fn run_cline_mode(verbose: u8) -> Result<()> {
 
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
-        println!("\nRTK already configured for Cline in this project.\n");
+        println!("\nContextCrawler already configured for Cline in this project.\n");
         println!("  Rules: .clinerules (already present)");
     } else {
         let new_content = if existing.trim().is_empty() {
@@ -1407,7 +1412,7 @@ fn run_cline_mode(verbose: u8) -> Result<()> {
             eprintln!("Wrote .clinerules");
         }
 
-        println!("\nRTK configured for Cline.\n");
+        println!("\nContextCrawler configured for Cline.\n");
         println!("  Rules: .clinerules (installed)");
     }
     println!("  Cline will now use rtk commands for token savings.");
@@ -1423,7 +1428,7 @@ fn run_windsurf_mode(verbose: u8) -> Result<()> {
 
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
-        println!("\nRTK already configured for Windsurf in this project.\n");
+        println!("\nContextCrawler already configured for Windsurf in this project.\n");
         println!("  Rules: .windsurfrules (already present)");
     } else {
         let new_content = if existing.trim().is_empty() {
@@ -1437,7 +1442,7 @@ fn run_windsurf_mode(verbose: u8) -> Result<()> {
             eprintln!("Wrote .windsurfrules");
         }
 
-        println!("\nRTK configured for Windsurf Cascade.\n");
+        println!("\nContextCrawler configured for Windsurf Cascade.\n");
         println!("  Rules: .windsurfrules (installed)");
     }
     println!("  Cascade will now use rtk commands for token savings.");
@@ -1461,7 +1466,7 @@ fn run_kilocode_mode_at(base_dir: &Path, verbose: u8) -> Result<()> {
 
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
-        println!("\nRTK already configured for Kilo Code in this project.\n");
+        println!("\nContextCrawler already configured for Kilo Code in this project.\n");
         println!("  Rules: .kilocode/rules/rtk-rules.md (already present)");
     } else {
         fs::create_dir_all(&target_dir).context("Failed to create .kilocode/rules directory")?;
@@ -1477,7 +1482,7 @@ fn run_kilocode_mode_at(base_dir: &Path, verbose: u8) -> Result<()> {
             eprintln!("Wrote .kilocode/rules/rtk-rules.md");
         }
 
-        println!("\nRTK configured for Kilo Code.\n");
+        println!("\nContextCrawler configured for Kilo Code.\n");
         println!("  Rules: .kilocode/rules/rtk-rules.md (installed)");
     }
     println!("  Kilo Code will now use rtk commands for token savings.");
@@ -1501,7 +1506,7 @@ fn run_antigravity_mode_at(base_dir: &Path, verbose: u8) -> Result<()> {
 
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
-        println!("\nRTK already configured for Antigravity in this project.\n");
+        println!("\nContextCrawler already configured for Antigravity in this project.\n");
         println!("  Rules: .agents/rules/antigravity-rtk-rules.md (already present)");
     } else {
         fs::create_dir_all(&target_dir).context("Failed to create .agents/rules directory")?;
@@ -1517,7 +1522,7 @@ fn run_antigravity_mode_at(base_dir: &Path, verbose: u8) -> Result<()> {
             eprintln!("Wrote .agents/rules/antigravity-rtk-rules.md");
         }
 
-        println!("\nRTK configured for Google Antigravity.\n");
+        println!("\nContextCrawler configured for Google Antigravity.\n");
         println!("  Rules: .agents/rules/antigravity-rtk-rules.md (installed)");
     }
     println!("  Antigravity will now use rtk commands for token savings.");
@@ -1570,7 +1575,7 @@ fn run_codex_mode_with_paths(
     write_if_changed(&rtk_md_path, RTK_SLIM_CODEX, RTK_MD, verbose)?;
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, verbose)?;
 
-    println!("\nRTK configured for Codex CLI.\n");
+    println!("\nContextCrawler configured for Codex CLI.\n");
     println!("  RTK.md:    {}", rtk_md_path.display());
     if added_ref {
         println!("  AGENTS.md: {} reference added", rtk_md_ref);
@@ -1680,7 +1685,7 @@ fn patch_claude_md(path: &Path, verbose: u8) -> Result<bool> {
     // Check if @RTK.md already present
     if content.contains(RTK_MD_REF) {
         if verbose > 0 {
-            eprintln!("@RTK.md reference already present in CLAUDE.md");
+            eprintln!("{} reference already present in CLAUDE.md", RTK_MD_REF);
         }
         if migrated {
             fs::write(path, content)?;
@@ -1996,7 +2001,7 @@ fn patch_cursor_hooks_json(path: &Path, verbose: u8) -> Result<bool> {
     // Check idempotency
     if cursor_hook_already_present(&root) {
         if verbose > 0 {
-            eprintln!("Cursor hooks.json: RTK hook already present");
+            eprintln!("Cursor hooks.json: ContextCrawler hook already present");
         }
         return Ok(false);
     }
@@ -2162,7 +2167,7 @@ fn remove_cursor_hooks(verbose: u8) -> Result<Vec<String>> {
                     removed.push("Cursor hooks.json: removed RTK entry".to_string());
 
                     if verbose > 0 {
-                        eprintln!("Removed RTK hook from Cursor hooks.json");
+                        eprintln!("Removed ContextCrawler hook from Cursor hooks.json");
                     }
                 }
             }
@@ -2282,11 +2287,11 @@ fn show_claude_config() -> Result<()> {
         println!("[--] Hook: not found");
     }
 
-    // Check RTK.md
+    // Check the deployed instruction file
     if rtk_md_path.exists() {
-        println!("[ok] RTK.md: {} (slim mode)", rtk_md_path.display());
+        println!("[ok] {}: {} (slim mode)", RTK_MD, rtk_md_path.display());
     } else {
-        println!("[--] RTK.md: not found");
+        println!("[--] {}: not found", RTK_MD);
     }
 
     // Check hook integrity (only relevant for legacy script hooks)
@@ -2296,7 +2301,7 @@ fn show_claude_config() -> Result<()> {
                 println!("[ok] Integrity: hook hash verified");
             }
             Ok(integrity::IntegrityStatus::Tampered { .. }) => {
-                println!("[FAIL] Integrity: hook modified outside contextcrawler init (run: rtk verify)");
+                println!("[FAIL] Integrity: hook modified outside contextcrawler init (run: contextcrawler verify)");
             }
             Ok(integrity::IntegrityStatus::NoBaseline) => {
                 println!("[warn] Integrity: no baseline hash (run: contextcrawler init -g to establish)");
@@ -2315,13 +2320,16 @@ fn show_claude_config() -> Result<()> {
     if global_claude_md.exists() {
         let content = fs::read_to_string(&global_claude_md)?;
         if content.contains(RTK_MD_REF) {
-            println!("[ok] Global (~/.claude/CLAUDE.md): @RTK.md reference");
+            println!(
+                "[ok] Global (~/.claude/CLAUDE.md): {} reference",
+                RTK_MD_REF
+            );
         } else if content.contains(RTK_BLOCK_START) {
             println!(
                 "[warn] Global (~/.claude/CLAUDE.md): old RTK block (run: contextcrawler init -g to migrate)"
             );
         } else {
-            println!("[--] Global (~/.claude/CLAUDE.md): exists but rtk not configured");
+            println!("[--] Global (~/.claude/CLAUDE.md): exists but contextcrawler not configured");
         }
     } else {
         println!("[--] Global (~/.claude/CLAUDE.md): not found");
@@ -2330,10 +2338,10 @@ fn show_claude_config() -> Result<()> {
     // Check local CLAUDE.md
     if local_claude_md.exists() {
         let content = fs::read_to_string(&local_claude_md)?;
-        if content.contains("rtk") {
-            println!("[ok] Local (./CLAUDE.md): rtk enabled");
+        if content.contains("contextcrawler") || content.contains("rtk") {
+            println!("[ok] Local (./CLAUDE.md): contextcrawler enabled");
         } else {
-            println!("[--] Local (./CLAUDE.md): exists but rtk not configured");
+            println!("[--] Local (./CLAUDE.md): exists but contextcrawler not configured");
         }
     } else {
         println!("[--] Local (./CLAUDE.md): not found");
@@ -2345,9 +2353,9 @@ fn show_claude_config() -> Result<()> {
         if !content.trim().is_empty() {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
                 if hook_already_present(&root, CLAUDE_HOOK_COMMAND) {
-                    println!("[ok] settings.json: RTK hook configured");
+                    println!("[ok] settings.json: ContextCrawler hook configured");
                 } else {
-                    println!("[warn] settings.json: exists but RTK hook not configured");
+                    println!("[warn] settings.json: exists but ContextCrawler hook not configured");
                     println!("    Run: contextcrawler init -g --auto-patch");
                 }
             } else {
@@ -2426,14 +2434,23 @@ fn show_claude_config() -> Result<()> {
 
     println!("\nUsage:");
     println!("  contextcrawler init              # Full injection into local CLAUDE.md");
-    println!("  contextcrawler init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
+    println!(
+        "  contextcrawler init -g           # Hook + {} + {} + settings.json (recommended)",
+        RTK_MD, RTK_MD_REF
+    );
     println!("  contextcrawler init -g --auto-patch    # Same as above but no prompt");
     println!("  contextcrawler init -g --no-patch      # Skip settings.json (manual setup)");
-    println!("  contextcrawler init -g --uninstall     # Remove all RTK artifacts");
+    println!("  contextcrawler init -g --uninstall     # Remove all ContextCrawler artifacts");
     println!("  contextcrawler init -g --claude-md     # Legacy: full injection into ~/.claude/CLAUDE.md");
-    println!("  contextcrawler init -g --hook-only     # Hook only, no RTK.md");
-    println!("  contextcrawler init --codex            # Configure local AGENTS.md + RTK.md");
-    println!("  contextcrawler init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
+    println!("  contextcrawler init -g --hook-only     # Hook only, no {}", RTK_MD);
+    println!(
+        "  contextcrawler init --codex            # Configure local AGENTS.md + {}",
+        RTK_MD
+    );
+    println!(
+        "  contextcrawler init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/{} (or ~/.codex/)",
+        RTK_MD
+    );
     println!("  contextcrawler init -g --opencode      # OpenCode plugin only");
     println!("  contextcrawler init -g --agent cursor  # Install Cursor Agent hooks");
 
@@ -2448,50 +2465,56 @@ fn show_codex_config() -> Result<()> {
     let local_agents_md = PathBuf::from(AGENTS_MD);
     let local_rtk_md = PathBuf::from(RTK_MD);
 
-    println!("rtk Configuration (Codex CLI):\n");
+    println!("ContextCrawler Configuration (Codex CLI):\n");
 
     if global_rtk_md.exists() {
-        println!("[ok] Global RTK.md: {}", global_rtk_md.display());
+        println!("[ok] Global {}: {}", RTK_MD, global_rtk_md.display());
     } else {
-        println!("[--] Global RTK.md: not found");
+        println!("[--] Global {}: not found", RTK_MD);
     }
 
     if global_agents_md.exists() {
         let content = fs::read_to_string(&global_agents_md)?;
         if has_rtk_reference(&content, &[RTK_MD_REF, global_rtk_md_ref.as_str()]) {
-            println!("[ok] Global AGENTS.md: RTK.md reference");
+            println!("[ok] Global AGENTS.md: {} reference", RTK_MD_REF);
         } else if content.contains(RTK_BLOCK_START) {
-            println!("[!!] Global AGENTS.md: old inline RTK block");
+            println!("[!!] Global AGENTS.md: old inline ContextCrawler block");
         } else {
-            println!("[--] Global AGENTS.md: exists but rtk not configured");
+            println!("[--] Global AGENTS.md: exists but contextcrawler not configured");
         }
     } else {
         println!("[--] Global AGENTS.md: not found");
     }
 
     if local_rtk_md.exists() {
-        println!("[ok] Local RTK.md: {}", local_rtk_md.display());
+        println!("[ok] Local {}: {}", RTK_MD, local_rtk_md.display());
     } else {
-        println!("[--] Local RTK.md: not found");
+        println!("[--] Local {}: not found", RTK_MD);
     }
 
     if local_agents_md.exists() {
         let content = fs::read_to_string(&local_agents_md)?;
         if has_rtk_reference(&content, &[RTK_MD_REF]) {
-            println!("[ok] Local AGENTS.md: @RTK.md reference");
+            println!("[ok] Local AGENTS.md: {} reference", RTK_MD_REF);
         } else if content.contains(RTK_BLOCK_START) {
-            println!("[!!] Local AGENTS.md: old inline RTK block");
+            println!("[!!] Local AGENTS.md: old inline ContextCrawler block");
         } else {
-            println!("[--] Local AGENTS.md: exists but rtk not configured");
+            println!("[--] Local AGENTS.md: exists but contextcrawler not configured");
         }
     } else {
         println!("[--] Local AGENTS.md: not found");
     }
 
     println!("\nUsage:");
-    println!("  contextcrawler init --codex              # Configure local AGENTS.md + RTK.md");
-    println!("  contextcrawler init -g --codex           # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
-    println!("  contextcrawler init -g --codex --uninstall  # Remove global Codex RTK artifacts");
+    println!(
+        "  contextcrawler init --codex              # Configure local AGENTS.md + {}",
+        RTK_MD
+    );
+    println!(
+        "  contextcrawler init -g --codex           # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/{} (or ~/.codex/)",
+        RTK_MD
+    );
+    println!("  contextcrawler init -g --codex --uninstall  # Remove global Codex ContextCrawler artifacts");
 
     Ok(())
 }
@@ -2595,7 +2618,7 @@ fn patch_gemini_settings(
                     .is_some_and(|c| c.contains("rtk"))
             }) {
                 if verbose > 0 {
-                    eprintln!("Gemini settings.json already has RTK hook");
+                    eprintln!("Gemini settings.json already has ContextCrawler hook");
                 }
                 return Ok(());
             }
@@ -2613,7 +2636,7 @@ fn patch_gemini_settings(
     }
 
     if patch_mode == PatchMode::Ask {
-        print!("Patch {} with RTK hook? [y/N] ", settings_path.display());
+        print!("Patch {} with ContextCrawler hook? [y/N] ", settings_path.display());
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
@@ -2707,7 +2730,7 @@ fn uninstall_gemini(verbose: u8) -> Result<Vec<String>> {
                 if arr.len() < before {
                     let new_content = serde_json::to_string_pretty(&settings)?;
                     fs::write(&settings_path, new_content)?;
-                    removed.push("Gemini settings.json: removed RTK hook entry".to_string());
+                    removed.push("Gemini settings.json: removed ContextCrawler hook entry".to_string());
                 }
             }
         }
