@@ -21,7 +21,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 def _create_tarball(source_dir: Path) -> str:
-    tarball = tempfile.mktemp(suffix=".tar.gz")
+    # NamedTemporaryFile uses mkstemp under the hood — atomic O_EXCL creation
+    # of a unique filename, no TOCTOU window between name allocation and
+    # subsequent open. We close it immediately (delete=False keeps the file
+    # on disk) so `tar czf` can overwrite it with the actual archive content.
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tarball = tmp.name
     subprocess.run(
         ["tar", "czf", tarball, "-C", str(source_dir), "."],
         check=True,
