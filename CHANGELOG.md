@@ -3,6 +3,53 @@
 All notable changes to ContextCrawler are documented here. Format adapted
 from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] — 2026-05-14
+
+Security fixes from a dual Codex + Claude review of the downstream gate
+code. Five real issues, all consensus between both reviewers.
+
+### Fixed
+
+- **supply-chain: OSV severity threshold now actually applies.** Every
+  CVE was being marked `Severity::High` in the verdict loop and the
+  `osv_severity()` helper was dead code. Result: `block_severity =
+  "CRITICAL"` silently passed HIGH CVEs through the gate. `osv_query()`
+  now returns per-vuln severity and the caller compares against the
+  configured threshold.
+- **supply-chain: editable / URL / path tokens no longer exempt their
+  siblings.** `pip install -e . requests` was skipping the entire
+  command and never vetting `requests`. Pure URL/tarball installs
+  returned Allow with no findings. Now: named packages are always
+  vetted; when `allow_editable=false` and an editable token is present,
+  a new `FindingReason::UnvettableSource` is produced for manual review.
+- **supply-chain: cache path traversal guard.** Package names containing
+  `..`, backslashes, control chars, or colons now refuse to cache
+  instead of resolving to a path outside `~/.cache/contextcrawler/`.
+- **tirith: verdict parsed structurally, not by substring.** Tirith
+  responses with whitespace variations (`{"action": "block"}`) or
+  the word "block" inside a description string no longer mis-route the
+  verdict. Pretty-printed output also works.
+- **web: DOM walk depth-capped.** `extract_element_text` now bails at
+  `MAX_DOM_DEPTH = 256`, preventing stack overflow on adversarial
+  deeply-nested HTML.
+- **rewrite_cmd: legacy bash-hook path now runs the supply-chain gate.**
+  Previously only the modern `contextcrawler hook claude` path checked
+  installs; the legacy `rtk rewrite` exit-code protocol skipped it.
+  Coverage is now consistent across both hook entry points.
+
+### Added
+
+- `cache_file_rejects_traversal`, `mixed_editable_and_named_keeps_named_packages`,
+  `osv_severity_extracts_from_database_specific` regression tests.
+
+### Changed
+
+- `gain` no longer displays the literal `rtk ` prefix on every row
+  (it's identical across all entries — strip it at display time so the
+  table stays useful). DB schema unchanged.
+
+---
+
 ## [0.1.0] — 2026-05-14
 
 First public release. ContextCrawler is a downstream distribution of

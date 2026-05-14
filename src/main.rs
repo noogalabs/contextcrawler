@@ -33,7 +33,7 @@ use cmds::cloud::web_cmd;
 // (mod rtk, use rtk::*, struct Rtk*) remain to keep upstream rebases tight;
 // only user-facing surfaces change.
 const CONTEXTCRAWLER_VERSION: &str = concat!(
-    "ContextCrawler 0.1.0 (downstream of rtk ",
+    "ContextCrawler 0.1.1 (downstream of rtk ",
     env!("CARGO_PKG_VERSION"),
     ")"
 );
