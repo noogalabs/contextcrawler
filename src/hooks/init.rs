@@ -23,7 +23,7 @@ const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
 const RTK_SLIM_CODEX: &str = include_str!("../../hooks/codex/rtk-awareness.md");
 
-/// Template written by `rtk init` when no filters.toml exists yet.
+/// Template written by `contextcrawler init` when no filters.toml exists yet.
 const FILTERS_TEMPLATE: &str = r#"# Project-local RTK filters — commit this file with your repo.
 # Filters here override user-global and built-in filters.
 # Docs: https://github.com/rtk-ai/rtk#custom-filters
@@ -200,8 +200,8 @@ rtk gain                # View token savings statistics
 rtk gain --history      # View command history with savings
 rtk discover            # Analyze Claude Code sessions for missed RTK usage
 rtk proxy <cmd>         # Run command without filtering (for debugging)
-rtk init                # Add RTK instructions to CLAUDE.md
-rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
+contextcrawler init                # Add RTK instructions to CLAUDE.md
+contextcrawler init --global       # Add RTK to ~/.claude/CLAUDE.md
 ```
 
 ## Token Savings Overview
@@ -221,7 +221,7 @@ Overall average: **60-90% token reduction** on common development operations.
 <!-- /rtk-instructions -->
 "##;
 
-/// Main entry point for `rtk init`
+/// Main entry point for `contextcrawler init`
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     global: bool,
@@ -258,15 +258,15 @@ pub fn run(
 
     // Validation: Global-only features
     if install_opencode && !global {
-        anyhow::bail!("OpenCode plugin is global-only. Use: rtk init -g --opencode");
+        anyhow::bail!("OpenCode plugin is global-only. Use: contextcrawler init -g --opencode");
     }
 
     if install_cursor && !global {
-        anyhow::bail!("Cursor hooks are global-only. Use: rtk init -g --agent cursor");
+        anyhow::bail!("Cursor hooks are global-only. Use: contextcrawler init -g --agent cursor");
     }
 
     if install_windsurf && !global {
-        anyhow::bail!("Windsurf support is global-only. Use: rtk init -g --agent windsurf");
+        anyhow::bail!("Windsurf support is global-only. Use: contextcrawler init -g --agent windsurf");
     }
 
     // Windsurf-only mode
@@ -1289,9 +1289,9 @@ fn run_claude_md_mode(global: bool, verbose: u8, install_opencode: bool) -> Resu
 
                 eprintln!("    Action: Manually remove the incomplete block, then re-run:");
                 if global {
-                    eprintln!("            rtk init -g --claude-md");
+                    eprintln!("            contextcrawler init -g --claude-md");
                 } else {
-                    eprintln!("            rtk init --claude-md");
+                    eprintln!("            contextcrawler init --claude-md");
                 }
                 return Ok(());
             }
@@ -1774,7 +1774,7 @@ fn remove_rtk_block(content: &str) -> (String, bool) {
         }
 
         eprintln!("    Action: Manually remove the incomplete block, then re-run:");
-        eprintln!("            rtk init -g");
+        eprintln!("            contextcrawler init -g");
         (content.to_string(), false)
     } else {
         (content.to_string(), false)
@@ -2229,10 +2229,10 @@ fn show_claude_config() -> Result<()> {
                 println!("[ok] Integrity: hook hash verified");
             }
             Ok(integrity::IntegrityStatus::Tampered { .. }) => {
-                println!("[FAIL] Integrity: hook modified outside rtk init (run: rtk verify)");
+                println!("[FAIL] Integrity: hook modified outside contextcrawler init (run: rtk verify)");
             }
             Ok(integrity::IntegrityStatus::NoBaseline) => {
-                println!("[warn] Integrity: no baseline hash (run: rtk init -g to establish)");
+                println!("[warn] Integrity: no baseline hash (run: contextcrawler init -g to establish)");
             }
             Ok(integrity::IntegrityStatus::NotInstalled)
             | Ok(integrity::IntegrityStatus::OrphanedHash) => {
@@ -2251,7 +2251,7 @@ fn show_claude_config() -> Result<()> {
             println!("[ok] Global (~/.claude/CLAUDE.md): @RTK.md reference");
         } else if content.contains(RTK_BLOCK_START) {
             println!(
-                "[warn] Global (~/.claude/CLAUDE.md): old RTK block (run: rtk init -g to migrate)"
+                "[warn] Global (~/.claude/CLAUDE.md): old RTK block (run: contextcrawler init -g to migrate)"
             );
         } else {
             println!("[--] Global (~/.claude/CLAUDE.md): exists but rtk not configured");
@@ -2281,7 +2281,7 @@ fn show_claude_config() -> Result<()> {
                     println!("[ok] settings.json: RTK hook configured");
                 } else {
                     println!("[warn] settings.json: exists but RTK hook not configured");
-                    println!("    Run: rtk init -g --auto-patch");
+                    println!("    Run: contextcrawler init -g --auto-patch");
                 }
             } else {
                 println!("[warn] settings.json: exists but invalid JSON");
@@ -2358,17 +2358,17 @@ fn show_claude_config() -> Result<()> {
     }
 
     println!("\nUsage:");
-    println!("  rtk init              # Full injection into local CLAUDE.md");
-    println!("  rtk init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
-    println!("  rtk init -g --auto-patch    # Same as above but no prompt");
-    println!("  rtk init -g --no-patch      # Skip settings.json (manual setup)");
-    println!("  rtk init -g --uninstall     # Remove all RTK artifacts");
-    println!("  rtk init -g --claude-md     # Legacy: full injection into ~/.claude/CLAUDE.md");
-    println!("  rtk init -g --hook-only     # Hook only, no RTK.md");
-    println!("  rtk init --codex            # Configure local AGENTS.md + RTK.md");
-    println!("  rtk init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
-    println!("  rtk init -g --opencode      # OpenCode plugin only");
-    println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks");
+    println!("  contextcrawler init              # Full injection into local CLAUDE.md");
+    println!("  contextcrawler init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
+    println!("  contextcrawler init -g --auto-patch    # Same as above but no prompt");
+    println!("  contextcrawler init -g --no-patch      # Skip settings.json (manual setup)");
+    println!("  contextcrawler init -g --uninstall     # Remove all RTK artifacts");
+    println!("  contextcrawler init -g --claude-md     # Legacy: full injection into ~/.claude/CLAUDE.md");
+    println!("  contextcrawler init -g --hook-only     # Hook only, no RTK.md");
+    println!("  contextcrawler init --codex            # Configure local AGENTS.md + RTK.md");
+    println!("  contextcrawler init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
+    println!("  contextcrawler init -g --opencode      # OpenCode plugin only");
+    println!("  contextcrawler init -g --agent cursor  # Install Cursor Agent hooks");
 
     Ok(())
 }
@@ -2422,9 +2422,9 @@ fn show_codex_config() -> Result<()> {
     }
 
     println!("\nUsage:");
-    println!("  rtk init --codex              # Configure local AGENTS.md + RTK.md");
-    println!("  rtk init -g --codex           # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
-    println!("  rtk init -g --codex --uninstall  # Remove global Codex RTK artifacts");
+    println!("  contextcrawler init --codex              # Configure local AGENTS.md + RTK.md");
+    println!("  contextcrawler init -g --codex           # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
+    println!("  contextcrawler init -g --codex --uninstall  # Remove global Codex RTK artifacts");
 
     Ok(())
 }
@@ -2449,10 +2449,10 @@ fn resolve_gemini_dir() -> Result<PathBuf> {
     resolve_home_subdir(GEMINI_DIR)
 }
 
-/// Entry point for `rtk init --gemini`
+/// Entry point for `contextcrawler init --gemini`
 pub fn run_gemini(global: bool, hook_only: bool, patch_mode: PatchMode, verbose: u8) -> Result<()> {
     if !global {
-        anyhow::bail!("Gemini support is global-only. Use: rtk init -g --gemini");
+        anyhow::bail!("Gemini support is global-only. Use: contextcrawler init -g --gemini");
     }
 
     let gemini_dir = resolve_gemini_dir()?;
@@ -2696,7 +2696,7 @@ rtk proxy <cmd>       # Run raw (no filtering) but track usage
 ```
 "#;
 
-/// Entry point for `rtk init --copilot`
+/// Entry point for `contextcrawler init --copilot`
 pub fn run_copilot(verbose: u8) -> Result<()> {
     // Install in current project's .github/ directory
     let github_dir = Path::new(".github");

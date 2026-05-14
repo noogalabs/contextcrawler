@@ -33,7 +33,7 @@ use cmds::cloud::web_cmd;
 // (mod rtk, use rtk::*, struct Rtk*) remain to keep upstream rebases tight;
 // only user-facing surfaces change.
 const CONTEXTCRAWLER_VERSION: &str = concat!(
-    "ContextCrawler 0.1.1 (downstream of rtk ",
+    "ContextCrawler 0.1.2 (downstream of rtk ",
     env!("CARGO_PKG_VERSION"),
     ")"
 );
@@ -1888,13 +1888,13 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_copilot(cli.verbose)?;
             } else if agent == Some(AgentTarget::Kilocode) {
                 if global {
-                    anyhow::bail!("Kilo Code is project-scoped. Use: rtk init --agent kilocode");
+                    anyhow::bail!("Kilo Code is project-scoped. Use: contextcrawler init --agent kilocode");
                 }
                 hooks::init::run_kilocode_mode(cli.verbose)?;
             } else if agent == Some(AgentTarget::Antigravity) {
                 if global {
                     anyhow::bail!(
-                        "Antigravity is project-scoped. Use: rtk init --agent antigravity"
+                        "Antigravity is project-scoped. Use: contextcrawler init --agent antigravity"
                     );
                 }
                 hooks::init::run_antigravity_mode(cli.verbose)?;

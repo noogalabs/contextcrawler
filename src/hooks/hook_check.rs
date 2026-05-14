@@ -37,7 +37,7 @@ pub fn status() -> HookStatus {
     // Check for new binary command in settings.json first
     if binary_hook_registered(&claude_dir) {
         // If old script file still exists alongside new command, report Outdated
-        // (migration not complete — user should run `rtk init -g` to clean up)
+        // (migration not complete — user should run `contextcrawler init -g` to clean up)
         let old_hook = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
         if old_hook.exists() {
             return HookStatus::Outdated;
