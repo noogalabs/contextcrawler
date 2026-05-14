@@ -198,7 +198,8 @@ fn load_config() -> Config {
 #[derive(Debug, Clone)]
 struct ParsedInstall {
     ecosystem: Ecosystem,
-    packages: Vec<String>,
+    /// (package_name, optional_pinned_version)
+    packages: Vec<(String, Option<String>)>,
     has_editable: bool,
 }
 
@@ -235,18 +236,34 @@ lazy_static! {
 }
 
 fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
+    // Run UV before PIP so `uv pip install foo` is claimed by the UV pattern
+    // and PIP_RE matching the inner `pip install foo` substring is suppressed
+    // for that span.
+    let mut claimed: Vec<(usize, usize)> = Vec::new();
     let mut out = Vec::new();
 
-    for (re, eco) in [
+    let ordered = [
+        (&*UV_RE, Ecosystem::Pypi),
         (&*NPM_RE, Ecosystem::Npm),
         (&*PNPM_RE, Ecosystem::Npm),
         (&*YARN_RE, Ecosystem::Npm),
         (&*PIP_RE, Ecosystem::Pypi),
-        (&*UV_RE, Ecosystem::Pypi),
         (&*POETRY_RE, Ecosystem::Pypi),
         (&*PIPX_RE, Ecosystem::Pypi),
-    ] {
-        for cap in re.captures_iter(cmd) {
+    ];
+
+    for (re, eco) in ordered {
+        for m in re.find_iter(cmd) {
+            let (start, end) = (m.start(), m.end());
+            // Skip if any earlier (higher-priority) pattern already claimed this span.
+            if claimed
+                .iter()
+                .any(|(s, e)| start >= *s && start < *e)
+            {
+                continue;
+            }
+            claimed.push((start, end));
+            let cap = re.captures_at(cmd, start).unwrap();
             let arg_string = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let (pkgs, has_editable) = parse_package_args(arg_string);
             if !pkgs.is_empty() || has_editable {
@@ -261,20 +278,18 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     out
 }
 
-/// Returns (registry-package-names, saw_editable_arg).
-fn parse_package_args(s: &str) -> (Vec<String>, bool) {
+/// Returns (registry-package-names with optional pinned version, saw_editable_arg).
+fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool) {
     let mut pkgs = Vec::new();
     let mut editable = false;
     let mut tokens = s.split_whitespace().peekable();
 
     while let Some(tok) = tokens.next() {
-        // pip / uv editable
         if tok == "-e" || tok == "--editable" {
             editable = true;
-            tokens.next(); // consume the target
+            tokens.next();
             continue;
         }
-        // Skip pip/uv flags that take a value
         if matches!(
             tok,
             "-r" | "--requirement" | "-c" | "--constraint" | "-t" | "--target" | "--index-url"
@@ -282,11 +297,9 @@ fn parse_package_args(s: &str) -> (Vec<String>, bool) {
             tokens.next();
             continue;
         }
-        // Skip bare flags
         if tok.starts_with('-') {
             continue;
         }
-        // Skip path / URL / git / file installs
         if tok == "."
             || tok.starts_with(".[")
             || tok.starts_with("./")
@@ -301,42 +314,76 @@ fn parse_package_args(s: &str) -> (Vec<String>, bool) {
             continue;
         }
 
-        let bare = strip_version_spec(tok);
-        if !bare.is_empty() {
-            pkgs.push(bare);
+        let (name, version) = split_name_version(tok);
+        if !name.is_empty() {
+            pkgs.push((name, version));
         }
     }
 
     (pkgs, editable)
 }
 
-fn strip_version_spec(s: &str) -> String {
+/// Split a token like `requests==2.20.0`, `@types/node@22.10.0`, or `lodash`
+/// into (name, optional pinned version). Only exact pins (`==X`, `name@X`)
+/// are returned; ranges like `>=2.0` yield None for the version (we don't
+/// pin a range to query).
+fn split_name_version(s: &str) -> (String, Option<String>) {
     let stripped = s.trim_matches(|c: char| c == '"' || c == '\'');
+
     // npm scoped: @scope/name[@version]
     if let Some(rest) = stripped.strip_prefix('@') {
         if let Some(slash_idx) = rest.find('/') {
             let after_slash = &rest[slash_idx + 1..];
-            let name_end = after_slash.find('@').unwrap_or(after_slash.len());
-            return format!("@{}/{}", &rest[..slash_idx], &after_slash[..name_end]);
+            if let Some(at_idx) = after_slash.find('@') {
+                let name = format!("@{}/{}", &rest[..slash_idx], &after_slash[..at_idx]);
+                let ver = after_slash[at_idx + 1..].to_string();
+                let ver = if ver.is_empty() { None } else { Some(ver) };
+                return (name, ver);
+            }
+            return (format!("@{}/{}", &rest[..slash_idx], after_slash), None);
         }
-        return format!("@{}", rest);
+        return (format!("@{}", rest), None);
     }
-    // pip-style separators
-    for sep in ["==", ">=", "<=", "~=", "!=", ">", "<"] {
+    // pip exact pin
+    if let Some(idx) = stripped.find("==") {
+        return (
+            stripped[..idx].to_string(),
+            Some(stripped[idx + 2..].to_string()),
+        );
+    }
+    // pip range specifiers — drop the spec, leave version None
+    for sep in [">=", "<=", "~=", "!=", ">", "<"] {
         if let Some(idx) = stripped.find(sep) {
-            return stripped[..idx].to_string();
+            return (stripped[..idx].to_string(), None);
         }
     }
     // npm: name@version
     if let Some(idx) = stripped.find('@') {
-        return stripped[..idx].to_string();
+        return (
+            stripped[..idx].to_string(),
+            Some(stripped[idx + 1..].to_string()),
+        );
     }
-    stripped.to_string()
+    (stripped.to_string(), None)
 }
 
 // ---------------------------------------------------------------------------
 // HTTP queries
 // ---------------------------------------------------------------------------
+
+/// 64 MB cap. npm's `/<pkg>` for popular packages (e.g. `@types/node`) can
+/// run ~30 MB. ureq's `into_string()` caps at 10 MB which fails them.
+const HTTP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_body(resp: ureq::Response) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(HTTP_MAX_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read body: {}", e))?;
+    Ok(buf)
+}
 
 fn http_get_json(url: &str) -> Result<Value, String> {
     let resp = ureq::get(url)
@@ -344,10 +391,8 @@ fn http_get_json(url: &str) -> Result<Value, String> {
         .timeout(StdDuration::from_secs(8))
         .call()
         .map_err(|e| format!("HTTP {}: {}", url, e))?;
-    let body = resp
-        .into_string()
-        .map_err(|e| format!("read body: {}", e))?;
-    serde_json::from_str(&body).map_err(|e| e.to_string())
+    let buf = read_body(resp)?;
+    serde_json::from_slice(&buf).map_err(|e| e.to_string())
 }
 
 fn http_post_json(url: &str, body: &Value) -> Result<Value, String> {
@@ -357,36 +402,69 @@ fn http_post_json(url: &str, body: &Value) -> Result<Value, String> {
         .timeout(StdDuration::from_secs(8))
         .send_string(&body.to_string())
         .map_err(|e| format!("HTTP {}: {}", url, e))?;
-    let s = resp
-        .into_string()
-        .map_err(|e| format!("read body: {}", e))?;
-    serde_json::from_str(&s).map_err(|e| e.to_string())
+    let buf = read_body(resp)?;
+    serde_json::from_slice(&buf).map_err(|e| e.to_string())
 }
 
-/// Returns (latest_version, publish_time) or Err with reason.
-fn npm_latest(pkg: &str) -> Result<(String, DateTime<Utc>), String> {
-    if let Some(cached) = cache_get(Ecosystem::Npm, pkg) {
+/// Resolve (version, publish_time) for the package. If `pinned` is Some, use
+/// that version; otherwise resolve and use the registry's `latest`.
+/// Cache keys include the version so pinned-and-unpinned don't collide.
+fn npm_metadata(pkg: &str, pinned: Option<&str>) -> Result<(String, DateTime<Utc>), String> {
+    let cache_key = format!("{}@{}", pkg, pinned.unwrap_or("__latest__"));
+    if let Some(cached) = cache_get(Ecosystem::Npm, &cache_key) {
         return Ok(cached);
     }
+    // Always query the full /<pkg> doc since per-version endpoints don't
+    // expose publish times.
     let url = format!("https://registry.npmjs.org/{}", urlencoding(pkg));
     let v = http_get_json(&url)?;
-    let latest = v
-        .pointer("/dist-tags/latest")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| "no dist-tags/latest".to_string())?
-        .to_string();
+    let resolved = match pinned {
+        Some(ver) => ver.to_string(),
+        None => v
+            .pointer("/dist-tags/latest")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "no dist-tags/latest".to_string())?
+            .to_string(),
+    };
     let ts = v
-        .pointer(&format!("/time/{}", latest))
+        .pointer(&format!("/time/{}", resolved))
         .and_then(|x| x.as_str())
-        .ok_or_else(|| "no publish time".to_string())?;
+        .ok_or_else(|| format!("no publish time for version {}", resolved))?;
     let publish = parse_iso8601(ts)?;
-    cache_put(Ecosystem::Npm, pkg, &latest, &publish);
-    Ok((latest, publish))
+    cache_put(Ecosystem::Npm, &cache_key, &resolved, &publish);
+    Ok((resolved, publish))
 }
 
-fn pypi_latest(pkg: &str) -> Result<(String, DateTime<Utc>), String> {
-    if let Some(cached) = cache_get(Ecosystem::Pypi, pkg) {
+fn pypi_metadata(pkg: &str, pinned: Option<&str>) -> Result<(String, DateTime<Utc>), String> {
+    let cache_key = format!("{}@{}", pkg, pinned.unwrap_or("__latest__"));
+    if let Some(cached) = cache_get(Ecosystem::Pypi, &cache_key) {
         return Ok(cached);
+    }
+    // When pinned, use the version-specific endpoint (smaller response).
+    // Otherwise hit the package endpoint to discover `info.version` and the
+    // release files.
+    if let Some(ver) = pinned {
+        let url = format!(
+            "https://pypi.org/pypi/{}/{}/json",
+            urlencoding(pkg),
+            urlencoding(ver)
+        );
+        let v = http_get_json(&url)?;
+        let urls = v
+            .get("urls")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| "no urls in pypi response".to_string())?;
+        let first = urls
+            .first()
+            .ok_or_else(|| "empty urls list".to_string())?;
+        let ts = first
+            .get("upload_time_iso_8601")
+            .or_else(|| first.get("upload_time"))
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "no upload_time".to_string())?;
+        let publish = parse_iso8601(ts)?;
+        cache_put(Ecosystem::Pypi, &cache_key, ver, &publish);
+        return Ok((ver.to_string(), publish));
     }
     let url = format!("https://pypi.org/pypi/{}/json", urlencoding(pkg));
     let v = http_get_json(&url)?;
@@ -406,7 +484,7 @@ fn pypi_latest(pkg: &str) -> Result<(String, DateTime<Utc>), String> {
         .and_then(|x| x.as_str())
         .ok_or_else(|| "no upload_time".to_string())?;
     let publish = parse_iso8601(ts)?;
-    cache_put(Ecosystem::Pypi, pkg, &latest, &publish);
+    cache_put(Ecosystem::Pypi, &cache_key, &latest, &publish);
     Ok((latest, publish))
 }
 
@@ -565,8 +643,14 @@ pub fn check(cmd: &str) -> Verdict {
         }
         let block_threshold = Severity::parse(&eco_cfg.block_severity).unwrap_or(Severity::High);
 
-        for pkg in install.packages {
-            // Overrides first
+        // Dedupe within an install: pip install foo bar foo -> check foo once.
+        let mut seen = std::collections::HashSet::<(String, Option<String>)>::new();
+        for (pkg, pinned) in install.packages {
+            let key = (pkg.clone(), pinned.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+
             if matches_override(&pkg, &config.overrides.always_allow) {
                 continue;
             }
@@ -584,10 +668,10 @@ pub fn check(cmd: &str) -> Verdict {
                 continue;
             }
 
-            // Age check
+            // Age check against (resolved or pinned) version
             let registry_result = match install.ecosystem {
-                Ecosystem::Npm => npm_latest(&pkg),
-                Ecosystem::Pypi => pypi_latest(&pkg),
+                Ecosystem::Npm => npm_metadata(&pkg, pinned.as_deref()),
+                Ecosystem::Pypi => pypi_metadata(&pkg, pinned.as_deref()),
             };
             let (version, publish) = match registry_result {
                 Ok(v) => v,
@@ -612,11 +696,9 @@ pub fn check(cmd: &str) -> Verdict {
                 });
             }
 
-            // CVE check (the version we resolved above)
+            // CVE check against the specific resolved/pinned version
             if let Ok(vulns) = osv_query(install.ecosystem, &pkg, &version) {
                 for (id, summary) in vulns {
-                    // We don't yet have per-vuln severity from osv_query's signature.
-                    // For now: any reported vuln is treated as HIGH; downgrade further later.
                     let sev = Severity::High;
                     if sev >= block_threshold {
                         findings.push(Finding {
@@ -735,26 +817,41 @@ pub fn render(verdict: &Verdict) -> String {
 mod tests {
     use super::*;
 
+    fn names(install: &ParsedInstall) -> Vec<&str> {
+        install.packages.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
     #[test]
     fn detect_npm_install() {
         let v = detect_installs("npm install lodash express");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].ecosystem, Ecosystem::Npm);
-        assert_eq!(v[0].packages, vec!["lodash", "express"]);
+        assert_eq!(names(&v[0]), vec!["lodash", "express"]);
     }
 
     #[test]
-    fn detect_pip_install() {
+    fn detect_pip_install_with_pin() {
         let v = detect_installs("pip install requests==2.31.0 numpy");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
-        assert_eq!(v[0].packages, vec!["requests", "numpy"]);
+        assert_eq!(v[0].packages[0].0, "requests");
+        assert_eq!(v[0].packages[0].1.as_deref(), Some("2.31.0"));
+        assert_eq!(v[0].packages[1].0, "numpy");
+        assert_eq!(v[0].packages[1].1, None);
     }
 
     #[test]
     fn detect_compound_install() {
         let v = detect_installs("cd foo && npm install x && pip install y");
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn uv_does_not_double_match_via_pip() {
+        // `uv pip install foo` must match the UV pattern once, NOT also
+        // the bare PIP pattern on the inner `pip install foo` substring.
+        let v = detect_installs("uv pip install requests");
+        assert_eq!(v.len(), 1, "expected exactly one detection, got {}", v.len());
     }
 
     #[test]
@@ -772,16 +869,26 @@ mod tests {
     }
 
     #[test]
-    fn npm_scoped_pkg_with_version() {
-        assert_eq!(strip_version_spec("@types/node@22.10.0"), "@types/node");
-        assert_eq!(strip_version_spec("@types/node"), "@types/node");
+    fn npm_scoped_pkg_with_version_preserved() {
+        let (n, v) = split_name_version("@types/node@22.10.0");
+        assert_eq!(n, "@types/node");
+        assert_eq!(v.as_deref(), Some("22.10.0"));
+        let (n, v) = split_name_version("@types/node");
+        assert_eq!(n, "@types/node");
+        assert_eq!(v, None);
     }
 
     #[test]
     fn pip_version_specifiers() {
-        assert_eq!(strip_version_spec("requests==2.31.0"), "requests");
-        assert_eq!(strip_version_spec("requests>=2.0"), "requests");
-        assert_eq!(strip_version_spec("requests~=2.0"), "requests");
+        assert_eq!(split_name_version("requests==2.31.0").0, "requests");
+        assert_eq!(
+            split_name_version("requests==2.31.0").1.as_deref(),
+            Some("2.31.0")
+        );
+        assert_eq!(split_name_version("requests>=2.0").0, "requests");
+        assert_eq!(split_name_version("requests>=2.0").1, None);
+        assert_eq!(split_name_version("requests~=2.0").0, "requests");
+        assert_eq!(split_name_version("requests~=2.0").1, None);
     }
 
     #[test]
@@ -802,7 +909,7 @@ mod tests {
     fn skip_flag_args() {
         let v = detect_installs("pip install -r requirements.txt foo");
         // -r and requirements.txt should both be skipped; only `foo` remains
-        assert_eq!(v[0].packages, vec!["foo"]);
+        assert_eq!(names(&v[0]), vec!["foo"]);
     }
 
     #[test]
