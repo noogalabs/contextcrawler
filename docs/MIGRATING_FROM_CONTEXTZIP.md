@@ -94,7 +94,7 @@ rm -f ~/.claude/RTK.md
 ```sh
 git clone https://github.com/thehoff/contextcrawler.git
 cd contextcrawler
-git checkout v0.1.1          # pin to the latest tagged release
+git checkout v0.1.2          # pin to the latest tagged release
 cargo build --release
 cp target/release/contextcrawler ~/.local/bin/contextcrawler
 ```
@@ -102,7 +102,7 @@ cp target/release/contextcrawler ~/.local/bin/contextcrawler
 Or, if you prefer the one-liner:
 
 ```sh
-cargo install --git https://github.com/thehoff/contextcrawler --tag v0.1.1 --locked
+cargo install --git https://github.com/thehoff/contextcrawler --tag v0.1.2 --locked
 ```
 
 Bump the tag for newer releases — see

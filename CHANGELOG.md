@@ -3,6 +3,71 @@
 All notable changes to ContextCrawler are documented here. Format adapted
 from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2] — 2026-05-14
+
+The first release where `contextcrawler init -g` actually wires up a
+working hook on a fresh install. Anyone who tagged-installed v0.1.0 or
+v0.1.1 should upgrade.
+
+### Fixed (critical)
+
+- **Hook command was hardcoded to `rtk hook claude`.** Every `init -g`
+  since the binary rename was writing a settings.json entry that called
+  a non-existent `rtk` binary. The hook fired, the binary wasn't there,
+  the bash hook gracefully degraded — Claude Code received raw,
+  un-filtered command output. ContextCrawler was effectively a no-op
+  on every install. Now writes `contextcrawler hook claude` (and
+  `contextcrawler hook cursor` / `gemini` / `copilot` for the other
+  agents). Install-time matchers recognize the legacy command string
+  so existing broken entries get migrated cleanly on next `init -g`.
+
+### Fixed (security)
+
+- **Session compactor path traversal** (`resolve_session_path`). A bare
+  session id like `../foo` was joined under each project directory and
+  the resulting candidate was opened if it resolved to a file. Now
+  rejects ids containing `/`, `\`, or `..`. Full paths still work via
+  the existing `is_file()` short-circuit.
+- **Supply-chain cooldown bypass on future-dated publishes.** The age
+  check guarded against impossible future dates with `age > -1d`, but
+  packages "published" up to 24h ahead of now passed both bounds and
+  skated through entirely. Now clamps negative ages to zero before the
+  comparison — future dates are treated as just-published.
+
+### Fixed (UX — broken instruction strings)
+
+- Every `[rtk] No hook installed — run \`rtk init -g\`` warning, every
+  integrity-check error message, every codex/gemini/copilot install
+  hint, every "rtk trust" / "rtk discover" / "rtk learn" tip now reads
+  `contextcrawler` so pasted commands actually work.
+- `~/.claude/RTK.md` and `@RTK.md` reference renamed to
+  `CONTEXTCRAWLER.md` and `@CONTEXTCRAWLER.md`. Auto-migration
+  (`cleanup_legacy_rtk_md`) removes legacy files + references on first
+  install with v0.1.2.
+- `gain` table no longer prefixes every row with the redundant `rtk `
+  string (DB unchanged, strip happens at display time).
+
+### Fixed (small)
+
+- Compiler warning in `core/utils.rs` (unused variable on non-Windows
+  release builds).
+- CodeQL `py/insecure-temporary-file` in benchmark helper — switched
+  `tempfile.mktemp` to `NamedTemporaryFile`.
+- CodeQL `rust/cleartext-logging` false-positive in trust list defused
+  via variable rename. Two related alerts on the same site dismissed in
+  the GitHub Security UI.
+
+### Docs
+
+- README + MIGRATING: new pre-install callout warning users who
+  previously ran upstream `rtk` or `jee599/contextzip` to clean out
+  stale hook entries from agent configs — otherwise the v0.1.2 binary
+  takes over and the orphaned entries point at non-existent paths.
+- README install switched from `--branch develop` to `--tag v0.1.2` by
+  default; bleeding-edge `--branch develop` kept as a separate opt-in.
+
+---
+
 ## [0.1.1] — 2026-05-14
 
 Security fixes from a dual Codex + Claude review of the downstream gate
