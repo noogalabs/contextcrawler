@@ -3,6 +3,30 @@
 All notable changes to ContextCrawler are documented here. Format adapted
 from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.4] — 2026-05-15
+
+Mop-up release covering two surfaces v0.1.3 didn't touch.
+
+### Fixed
+
+- **`contextcrawler discover` output still printed RTK.** Banner, stats
+  line, empty-state hint, section header, column header, and per-row
+  "Equivalent" cells all said `RTK …` / `rtk git`. Fixed by widening the
+  scope of the `display_rtk` helper from the rewrite path to the
+  discover report path (made `pub`, applied at the print site in
+  `src/discover/report.rs`). Internal `rtk_cmd: "rtk X"` rule literals
+  in `rules.rs` are still intentionally unchanged — kept as internal
+  lookup keys aligned with upstream rtk. (#7)
+
+### Documented
+
+- Added a design-intent comment to `process_claude_payload` clarifying
+  that the Tirith and supply-chain gates only fire on the
+  `PermissionVerdict::Allow` path. Future investigators won't repeat
+  the false alarm of "fresh probes don't appear in `downgrades.jsonl`"
+  — by design, the gate is a safety net for the auto-allow path only,
+  not a universal filter. (#7)
+
 ## [0.1.3] — 2026-05-14
 
 Polish release. Empirically surfaced via fresh-install devel-testing on
