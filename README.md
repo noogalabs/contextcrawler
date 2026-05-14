@@ -4,6 +4,15 @@
 
 # ContextCrawler
 
+> [!WARNING]
+> **Active development. Might work, might not. Use at your own risk.**
+>
+> This is a fast-moving downstream fork by one person. Before depending on
+> it: build it yourself, test it against your own workflow, read the diff
+> on top of upstream rtk, and run the code through your favourite LLM for
+> a second opinion (why not). **Don't trust me — verify.** Bug reports
+> welcome; expectations of stability shouldn't be.
+
 A downstream distribution of [rtk-ai/rtk](https://github.com/rtk-ai/rtk)
 that brings the [jee599/contextzip](https://github.com/jee599/contextzip)
 feature set forward to current rtk and stitches in
