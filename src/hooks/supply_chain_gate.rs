@@ -718,10 +718,12 @@ pub fn check(cmd: &str) -> Verdict {
                     continue;
                 }
             };
-            let age = Utc::now() - publish;
-            if age < ChronoDuration::days(eco_cfg.cooldown_days as i64)
-                && age > ChronoDuration::days(-1)
-            {
+            // Clamp negative ages (registry/publisher clock skew, or a
+            // genuinely future-dated entry) to zero so they always fall
+            // below the cooldown threshold instead of skating past both
+            // bounds of the old `> -1d` guard.
+            let age = (Utc::now() - publish).max(ChronoDuration::zero());
+            if age < ChronoDuration::days(eco_cfg.cooldown_days as i64) {
                 findings.push(Finding {
                     package: pkg.clone(),
                     ecosystem: install.ecosystem.as_str().to_string(),

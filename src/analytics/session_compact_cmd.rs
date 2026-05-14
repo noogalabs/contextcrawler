@@ -235,6 +235,18 @@ fn resolve_session_path(target: &str) -> Result<PathBuf> {
         return Ok(direct);
     }
 
+    // When `target` is a bare session id (i.e. not a direct file path) we
+    // join it under each project dir as `<dir>/<target>.jsonl`. Reject ids
+    // that contain path separators or `..` components — otherwise an id
+    // like `../foo` would resolve out of $CLAUDE_PROJECTS_DIR.
+    if target.contains('/') || target.contains('\\') || target.contains("..") {
+        bail!(
+            "Invalid session id `{}`: must be a bare id (no path separators or `..`). \
+             To target a file outside the projects root, pass the full path.",
+            target
+        );
+    }
+
     let root = projects_root()?;
     let mut hits: Vec<PathBuf> = Vec::new();
     for project_dir in std::fs::read_dir(&root).with_context(|| {
