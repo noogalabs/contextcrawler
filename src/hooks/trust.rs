@@ -89,13 +89,11 @@ fn canonical_key(filter_path: &Path) -> Result<String> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Check if a project-local filter file is trusted.
-///
-/// Priority: env var > hash match > untrusted.
-/// All errors are soft — if anything fails, returns Untrusted (fail-secure).
-pub fn check_trust(filter_path: &Path) -> Result<TrustStatus> {
-    // Fast path: env var override for CI pipelines only.
-    // Requires a known CI env var to be set to prevent .envrc injection attacks.
+/// Env-var override shared by check_trust and check_trust_bytes.
+/// Returns Some(EnvOverride) when `RTK_TRUST_PROJECT_FILTERS=1` AND a
+/// recognized CI env var is set. None otherwise (caller proceeds to the
+/// real hash check).
+fn env_override_status() -> Option<TrustStatus> {
     if std::env::var("RTK_TRUST_PROJECT_FILTERS").as_deref() == Ok("1") {
         let in_ci = std::env::var("CI").is_ok()
             || std::env::var("GITHUB_ACTIONS").is_ok()
@@ -103,11 +101,69 @@ pub fn check_trust(filter_path: &Path) -> Result<TrustStatus> {
             || std::env::var("JENKINS_URL").is_ok()
             || std::env::var("BUILDKITE").is_ok();
         if in_ci {
-            return Ok(TrustStatus::EnvOverride);
+            return Some(TrustStatus::EnvOverride);
         }
         eprintln!(
             "[rtk] WARNING: RTK_TRUST_PROJECT_FILTERS=1 ignored (CI environment not detected)"
         );
+    }
+    None
+}
+
+/// Check if the given bytes (already read from `filter_path`) are trusted.
+///
+/// TOCTOU-safe variant: the caller reads the file ONCE, passes the bytes
+/// here, and parses the same in-memory buffer if trust passes. The hash
+/// is computed against `bytes`, not by reopening the path — so a swap
+/// between hash and parse is impossible.
+///
+/// Priority: env var > hash match > untrusted.
+/// All errors are soft — if anything fails, returns Untrusted (fail-secure).
+pub fn check_trust_bytes(filter_path: &Path, bytes: &[u8]) -> Result<TrustStatus> {
+    if let Some(s) = env_override_status() {
+        return Ok(s);
+    }
+
+    let key = canonical_key(filter_path)?;
+    let store = match read_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[rtk] WARNING: trust store unreadable ({}), treating all filters as untrusted",
+                e
+            );
+            TrustStore::default()
+        }
+    };
+
+    let entry = match store.trusted.get(&key) {
+        Some(e) => e,
+        None => return Ok(TrustStatus::Untrusted),
+    };
+
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let actual_hash = format!("{:x}", h.finalize());
+
+    if actual_hash == entry.sha256 {
+        Ok(TrustStatus::Trusted)
+    } else {
+        Ok(TrustStatus::ContentChanged {
+            expected: entry.sha256.clone(),
+            actual: actual_hash,
+        })
+    }
+}
+
+/// Check if a filter file is trusted by path (two-open form).
+///
+/// **Prefer `check_trust_bytes` for new load paths** — this form has a
+/// TOCTOU window between the hash and any subsequent parse. Retained
+/// for callers that don't need to parse the file (e.g. `rtk verify`).
+pub fn check_trust(filter_path: &Path) -> Result<TrustStatus> {
+    if let Some(s) = env_override_status() {
+        return Ok(s);
     }
 
     let key = canonical_key(filter_path)?;
