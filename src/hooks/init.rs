@@ -1064,141 +1064,40 @@ fn run_default_mode(
     // 6. Generate user-global filters template (~/.config/rtk/filters.toml)
     generate_global_filters_template(verbose)?;
 
-    // 7. Chain Tirith shell-hook install (fail-open if binary is missing).
-    install_tirith_shell_hook(verbose);
+    // 7. Report Tirith gate status (detect only — no shell config touched).
+    report_tirith_status();
+    let _ = verbose;
 
     println!(); // Final newline
 
     Ok(())
 }
 
-// ===== contextzip-downstream: chain Tirith shell-hook install =====
-// `contextcrawler init -g` is the documented one-shot install path.
-// Tirith's shell hook used to be a separate manual step (eval line in
-// shell rc); chain it here so users get defense-in-depth coverage out
-// of the box. Fail-open semantics — if `tirith` isn't on PATH, print a
-// hint and continue; ContextCrawler's auto-rewrite path keeps working.
+// ===== contextzip-downstream: report Tirith gate status =====
+// The Tirith integration is wired into the Claude Code rewrite gate at
+// `hooks/tirith_gate.rs` — `tirith check` is invoked as a subprocess at
+// the auto-allow boundary inside ContextCrawler. No interactive-shell
+// integration is involved; we deliberately do not modify the user's
+// `.bashrc`/`.zshrc`/etc. The earlier shell-rc-append behavior was
+// reverted because the goal is agent-mediated gating only — the user's
+// own interactive shell should be untouched.
 
-const TIRITH_SENTINEL_START: &str = "# ===== ContextCrawler: Tirith integration (start) =====";
-const TIRITH_SENTINEL_END: &str = "# ===== ContextCrawler: Tirith integration (end) =====";
-
-/// Resolve the user's interactive shell from `$SHELL`, basename only.
-/// Defaults to `bash` so a missing/unparseable `$SHELL` doesn't crash init.
-fn detect_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .and_then(|s| {
-            std::path::Path::new(&s)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "bash".to_string())
-}
-
-/// Map a shell name to the rc file we should append the Tirith eval line to.
-/// Returns `None` for shells we don't know how to write to safely.
-fn shell_rc_path(shell: &str) -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    match shell {
-        "bash" => Some(home.join(".bashrc")),
-        "zsh" => Some(home.join(".zshrc")),
-        "fish" => Some(home.join(".config").join("fish").join("config.fish")),
-        _ => None,
-    }
-}
-
-/// True if the rc file already contains a ContextCrawler-managed Tirith block.
-/// Used for idempotent re-runs of `contextcrawler init -g`.
-fn rc_has_tirith_sentinel(rc_contents: &str) -> bool {
-    rc_contents.contains(TIRITH_SENTINEL_START)
-}
-
-/// Build the rc-file block to append. Wrapped in sentinel markers so we
-/// can detect/remove it on re-install or uninstall.
-fn build_tirith_block(shell: &str) -> String {
-    format!(
-        "\n{start}\n# Installed by `contextcrawler init -g`. Wraps the Tirith URL-security\n# gate around your interactive shell commands. Remove this block (between\n# the start/end sentinels) to disable.\neval \"$(tirith init --shell {shell})\"\n{end}\n",
-        start = TIRITH_SENTINEL_START,
-        end = TIRITH_SENTINEL_END,
-        shell = shell,
-    )
-}
-
-/// Fail-open Tirith shell-hook installer. Called from `run_default_mode`.
-/// Never returns an error: any I/O or detection failure prints a warning
-/// (verbose only) and falls back to ContextCrawler-only auto-rewrite.
-fn install_tirith_shell_hook(verbose: u8) {
-    use std::io::Write;
-
-    if which::which("tirith").is_err() {
-        println!();
-        println!("  Tirith shell hook: SKIPPED (binary not on PATH — fail-open)");
-        println!("    Install with:  cargo install tirith");
-        println!("    Then re-run:   contextcrawler init -g");
-        return;
-    }
-
-    let shell = detect_shell();
-    let rc_path = match shell_rc_path(&shell) {
-        Some(p) => p,
-        None => {
-            println!();
-            println!(
-                "  Tirith shell hook: SKIPPED (unsupported shell '{shell}' — fail-open)"
-            );
-            return;
-        }
-    };
-
-    let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
-    if rc_has_tirith_sentinel(&existing) {
-        println!();
+/// Report whether the Tirith gate will be armed after `init -g` finishes.
+/// Detect only — never modifies anything outside `~/.claude/`.
+fn report_tirith_status() {
+    println!();
+    if which::which("tirith").is_ok() {
         println!(
-            "  Tirith shell hook: already present in {}",
-            rc_path.display()
+            "  Tirith gate: ARMED — Claude Code rewrites pass through `tirith check`"
         );
-        return;
-    }
-
-    if let Some(parent) = rc_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            if verbose > 0 {
-                eprintln!(
-                    "  [warn] Failed to create {} for Tirith hook: {e}",
-                    parent.display()
-                );
-            }
-            return;
-        }
-    }
-
-    let block = build_tirith_block(&shell);
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc_path)
-        .and_then(|mut f| f.write_all(block.as_bytes()));
-
-    match result {
-        Ok(()) => {
-            println!();
-            println!(
-                "  Tirith shell hook: appended to {} (restart your shell to activate)",
-                rc_path.display()
-            );
-        }
-        Err(e) => {
-            if verbose > 0 {
-                eprintln!(
-                    "  [warn] Failed to append Tirith hook to {}: {e}",
-                    rc_path.display()
-                );
-            }
-        }
+        println!("               before auto-allow (subprocess invocation only).");
+    } else {
+        println!("  Tirith gate: fail-open (binary not on PATH)");
+        println!("    Optional URL-security defense-in-depth:");
+        println!("      cargo install tirith");
+        println!("    No shell config is modified by ContextCrawler either way.");
     }
 }
-
 // ===== end contextzip-downstream =====
 
 /// Migrate old hook script to new binary command.
@@ -4185,60 +4084,18 @@ mod tests {
         );
     }
 
-    // ===== contextzip-downstream: Tirith chain tests =====
+    // ===== contextzip-downstream: Tirith gate tests =====
+    // Earlier helpers (shell_rc_path, build_tirith_block, etc.) were
+    // removed when the design changed from "modify the user's shell rc"
+    // to "detect-and-report only". The remaining contract is just:
+    // report_tirith_status() must not panic regardless of whether
+    // `tirith` is on PATH.
 
     #[test]
-    fn test_shell_rc_path_known_shells() {
-        let home = dirs::home_dir().expect("test environment has a home dir");
-        assert_eq!(shell_rc_path("bash"), Some(home.join(".bashrc")));
-        assert_eq!(shell_rc_path("zsh"), Some(home.join(".zshrc")));
-        assert_eq!(
-            shell_rc_path("fish"),
-            Some(home.join(".config").join("fish").join("config.fish"))
-        );
-    }
-
-    #[test]
-    fn test_shell_rc_path_unsupported_shell_is_none() {
-        assert_eq!(shell_rc_path("nu"), None);
-        assert_eq!(shell_rc_path("ksh"), None);
-        assert_eq!(shell_rc_path(""), None);
-    }
-
-    #[test]
-    fn test_detect_shell_never_returns_empty() {
-        // `$SHELL` is environment-dependent; this just guards the contract
-        // that we always return something for downstream `shell_rc_path`.
-        let shell = detect_shell();
-        assert!(!shell.is_empty());
-    }
-
-    #[test]
-    fn test_rc_has_tirith_sentinel_detects_managed_block() {
-        let with_block = format!(
-            "export PATH=...\n{TIRITH_SENTINEL_START}\neval \"$(tirith init --shell bash)\"\n{TIRITH_SENTINEL_END}\n"
-        );
-        assert!(rc_has_tirith_sentinel(&with_block));
-    }
-
-    #[test]
-    fn test_rc_has_tirith_sentinel_ignores_unrelated_content() {
-        let plain = "export PATH=...\n# my own tirith reference\neval \"$(tirith init --shell bash)\"\n";
-        assert!(
-            !rc_has_tirith_sentinel(plain),
-            "non-sentinel mention of tirith should NOT count as installed"
-        );
-    }
-
-    #[test]
-    fn test_build_tirith_block_round_trips_through_sentinel_check() {
-        let block = build_tirith_block("zsh");
-        assert!(block.contains(TIRITH_SENTINEL_START));
-        assert!(block.contains(TIRITH_SENTINEL_END));
-        assert!(block.contains("eval \"$(tirith init --shell zsh)\""));
-        assert!(
-            rc_has_tirith_sentinel(&block),
-            "freshly-built block must be detected as installed on re-run"
-        );
+    fn test_report_tirith_status_never_panics() {
+        // Smoke-test the only public surface that remains. The function
+        // prints to stdout and reads PATH; both are environment-dependent
+        // and the test just verifies we don't blow up either way.
+        super::report_tirith_status();
     }
 }
