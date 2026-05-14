@@ -1,5 +1,113 @@
 # Changelog
 
+All notable changes to ContextCrawler are documented here. Format adapted
+from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.1.0] — 2026-05-14
+
+First public release. ContextCrawler is a downstream distribution of
+[rtk-ai/rtk](https://github.com/rtk-ai/rtk) (v0.39.0) that brings the
+[jee599/contextzip](https://github.com/jee599/contextzip) feature set
+forward — `contextzip` is based on rtk 0.30.1 (9 minor versions behind
+upstream) and inherits a number of issues that have since been fixed in
+upstream rtk.
+
+### One binary
+
+- **`contextcrawler`** — single canonical CLI. `--version` reads
+  `contextcrawler ContextCrawler 0.1.0 (downstream of rtk 0.39.0)`.
+- Cargo package renamed from `rtk` to `contextcrawler`. Source-level
+  `rtk` identifiers retained (mod / use / struct names) to keep upstream
+  rebase friction minimal.
+
+### Added (over jee599/contextzip 0.2.0 / rtk 0.30.1 baseline)
+
+- 9 minor versions of upstream rtk improvements: lexer-based compound-command
+  splitter, permission-verdict system (deny / ask / allow / default with
+  least-privilege default), new per-language modules (vitest, playwright,
+  prisma, rake, rspec, rubocop, ...), additional agent hook integrations
+  (codex, cursor, copilot VS Code, opencode, hermes, kilocode, antigravity,
+  windsurf), and 60+ TOML filter configs.
+- `contextcrawler web <url>` — fetch a URL with curl and extract main
+  content from HTML responses via `scraper`, stripping nav / ads / scripts.
+  ~86% byte savings on real pages (e.g., rust-lang.org homepage:
+  18,686 → 2,513 bytes).
+- Multi-language stacktrace compression (Node.js, Python, Rust, Go, Java)
+  as a post-processor in `core/runner.rs`. Detects framework frames and
+  drops them, keeping user-code frames only.
+- Tirith pre-execution gate at the auto-allow rewrite boundary. When
+  [`tirith`](https://tirith.sh) is installed, every rewrite that would
+  receive `permissionDecision: "allow"` is first run past `tirith check`.
+  Block-level findings downgrade the verdict to *Ask* so the user reviews
+  the original command. Wired into both the legacy `rewrite` path and the
+  modern `contextcrawler hook claude` path so coverage is consistent.
+  Default fail-open; set `CONTEXTZIP_TIRITH_REQUIRED=1` for fail-closed.
+- `contextcrawler security` subcommand. Surfaces Tirith audit stats, gate
+  mode, and shell-hook configuration status. Text and JSON output.
+- `contextcrawler security --log` tails ContextCrawler's local gate-
+  downgrade log (`$XDG_DATA_HOME/contextcrawler/downgrades.jsonl`). Each
+  downgrade records timestamp, command, reason, and the full Tirith JSON
+  evidence when available (rule ID, severity, evidence, MITRE references,
+  timings).
+- `contextcrawler sessions` subcommand group for Claude Code session-JSONL
+  compaction:
+  - `contextcrawler sessions compact <id|path>` — write a `.compressed`
+    sidecar (also accepts `--all-sessions` for batch mode and `--dry-run`)
+  - `contextcrawler sessions apply <id>` — promote the sidecar to live
+  - `contextcrawler sessions expand <id>` — roll back via `.bak`
+  - `$CLAUDE_PROJECTS_DIR` env override for non-default session locations
+- Sentinel-block discipline: every downstream addition to upstream-owned
+  files lives between `// ===== contextzip-downstream =====` marker pairs.
+  Reduces rebase conflict surface when upstream rtk moves.
+
+### Changed
+
+- Full rename: Cargo package `rtk` → `contextcrawler`. Binary, package
+  name, and clap `name = ...` all match. Source-level `rtk` module/use/
+  struct identifiers retained for upstream rebase compatibility.
+- Hook scripts (`hooks/claude/rtk-rewrite.sh`,
+  `hooks/cursor/rtk-rewrite.sh`, `hooks/opencode/rtk.ts`) updated to call
+  `contextcrawler` instead of `rtk`. Filenames are kept (upstream-owned
+  paths) to minimize rebase friction.
+- Upstream version-guard logic in the hook scripts replaced with a comment
+  — the guard parsed `rtk <ver>` output, which doesn't match
+  ContextCrawler's banner format. ContextCrawler always ships against a
+  recent rtk core so the guard isn't load-bearing.
+- SPDX-License-Identifier headers added to all downstream-introduced
+  source files with explicit upstream attribution.
+
+### Removed
+
+- `build_cmd` generic build-error grouper (was at
+  `jee599/contextzip/src/build_cmd.rs`). Subsumed by rtk 0.39's per-language
+  modules: `cmds/js/tsc_cmd.rs`, `cmds/rust/cargo_cmd.rs`,
+  `cmds/python/mypy_cmd.rs`, `cmds/js/lint_cmd.rs`. See
+  [`notes/decision-skip-build_cmd.md`](notes/decision-skip-build_cmd.md).
+- Telemetry scaffolding. ContextCrawler does not phone home.
+- Self-update path. Update via `cargo install` or rebuild from source.
+- Standalone `contextcrawler-session` crate (formerly under
+  `session-compactor/`). Its functionality is now folded into the main
+  binary as `contextcrawler sessions {compact|apply|expand}`.
+
+### Attribution
+
+- Upstream base: [rtk-ai/rtk](https://github.com/rtk-ai/rtk) v0.39.0,
+  Apache-2.0 (per `LICENSE`) / MIT (per `Cargo.toml`).
+- Compactor + stacktrace + HTML modules originated in
+  [jee599/contextzip](https://github.com/jee599/contextzip), MIT. Each
+  carried-over file has a per-file SPDX header citing the upstream.
+- [Tirith](https://github.com/sheeki03/tirith), AGPL-3.0, invoked via
+  subprocess only — no statically linked AGPL code.
+
+---
+
+## Inherited upstream rtk-ai/rtk history below
+
+_The entries below originate from upstream rtk-ai/rtk and predate the_
+_ContextCrawler downstream. Preserved for attribution and context._
+
+# Changelog
+
 All notable changes to rtk (Rust Token Killer) will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
