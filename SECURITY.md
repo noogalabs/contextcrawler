@@ -107,6 +107,28 @@ Out of scope:
 
 ---
 
+## Terminal escape sequence stripping
+
+`strip_ansi` in `src/core/utils.rs` removes the full set of terminal
+escape sequences before output flows into LLM context:
+
+- CSI (`ESC [ ... letter`) and DEC private modes (`ESC [ ? ... letter`)
+- OSC (`ESC ] ... ST`) including window titles, palette changes,
+  notifications
+- OSC 8 hyperlinks — visible text is preserved, the URL payload is
+  dropped (a hyperlink is a smuggling channel for instructions or
+  exfil URLs)
+- DCS, SOS, PM, APC (`ESC P|X|^|_ ... ESC \`)
+- Standalone Fe/Fp/Fs escapes used by some pagers
+
+Anything in those payloads counts as untrusted input and must not reach
+the model. Coverage is tested against fixtures with mixed CSI/OSC/DCS
+and explicit "OSC URL must not leak" assertions.
+
+Tracked by [GHSA-wjx4-ffxm-fxxp](https://github.com/thehoff/contextcrawler/security/advisories/GHSA-wjx4-ffxm-fxxp).
+
+---
+
 ## Acknowledgements
 
 We will credit security researchers in the published advisory and the
