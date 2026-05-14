@@ -12,7 +12,8 @@ use crate::hooks::constants::{
 
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND,
-    GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, LEGACY_CLAUDE_HOOK_COMMAND,
+    LEGACY_CURSOR_HOOK_COMMAND, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 
@@ -54,11 +55,52 @@ schema_version = 1
 # max_lines = 40
 "#;
 
-const RTK_MD: &str = "RTK.md";
+// ContextCrawler renamed the deployed instruction file from `RTK.md` to
+// `CONTEXTCRAWLER.md`. The internal constant identifiers (`RTK_MD`,
+// `RTK_MD_REF`) keep their old names so sentinel-block diffs against
+// upstream rtk stay narrow.
+const RTK_MD: &str = "CONTEXTCRAWLER.md";
 const CLAUDE_MD: &str = "CLAUDE.md";
 const AGENTS_MD: &str = "AGENTS.md";
-const RTK_MD_REF: &str = "@RTK.md";
+const RTK_MD_REF: &str = "@CONTEXTCRAWLER.md";
 const GEMINI_MD: &str = "GEMINI.md";
+
+// Legacy filenames carried by users who previously ran upstream `rtk` or
+// an earlier ContextCrawler. The install path cleans these up so the
+// agent doesn't end up loading both files.
+const LEGACY_RTK_MD: &str = "RTK.md";
+const LEGACY_RTK_MD_REF: &str = "@RTK.md";
+
+/// Best-effort: remove any legacy `RTK.md` file and `@RTK.md` reference
+/// from the home dir's `CLAUDE.md`. Called before installing the new
+/// `CONTEXTCRAWLER.md` to keep the agent from loading both.
+fn cleanup_legacy_rtk_md(home_dir: &std::path::Path, verbose: u8) {
+    let legacy = home_dir.join(LEGACY_RTK_MD);
+    if legacy.exists() {
+        if std::fs::remove_file(&legacy).is_ok() && verbose > 0 {
+            eprintln!("Removed legacy {}", legacy.display());
+        }
+    }
+    let claude_md = home_dir.join(CLAUDE_MD);
+    if let Ok(content) = std::fs::read_to_string(&claude_md) {
+        if content.contains(LEGACY_RTK_MD_REF) {
+            let cleaned: String = content
+                .lines()
+                .filter(|line| !line.trim().starts_with(LEGACY_RTK_MD_REF))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Preserve trailing newline if the original had one.
+            let cleaned = if content.ends_with('\n') && !cleaned.ends_with('\n') {
+                format!("{}\n", cleaned)
+            } else {
+                cleaned
+            };
+            if std::fs::write(&claude_md, cleaned).is_ok() && verbose > 0 {
+                eprintln!("Removed legacy {} reference from {}", LEGACY_RTK_MD_REF, claude_md.display());
+            }
+        }
+    }
+}
 
 const RTK_BLOCK_START: &str = "<!-- rtk-instructions";
 const RTK_BLOCK_END: &str = "<!-- /rtk-instructions -->";
@@ -485,7 +527,10 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
             for hook in hooks_array {
                 if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
                     // Match both legacy script path and new binary command
-                    if command.contains(REWRITE_HOOK_FILE) || command == CLAUDE_HOOK_COMMAND {
+                    if command.contains(REWRITE_HOOK_FILE)
+                        || command == CLAUDE_HOOK_COMMAND
+                        || command == LEGACY_CLAUDE_HOOK_COMMAND
+                    {
                         return false;
                     }
                 }
@@ -928,7 +973,10 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            cmd == hook_command || cmd == CLAUDE_HOOK_COMMAND || cmd.contains(REWRITE_HOOK_FILE)
+            cmd == hook_command
+                || cmd == CLAUDE_HOOK_COMMAND
+                || cmd == LEGACY_CLAUDE_HOOK_COMMAND
+                || cmd.contains(REWRITE_HOOK_FILE)
         })
 }
 
@@ -947,6 +995,12 @@ fn run_default_mode(
     }
 
     let claude_dir = resolve_claude_dir()?;
+
+    // 0. Clean up any legacy `RTK.md` + `@RTK.md` reference from a
+    // previous upstream-rtk or pre-rename ContextCrawler install. Avoids
+    // the agent loading both files after the rename.
+    cleanup_legacy_rtk_md(&claude_dir, verbose);
+
     let rtk_md_path = claude_dir.join(RTK_MD);
     let claude_md_path = claude_dir.join(CLAUDE_MD);
 
@@ -1184,6 +1238,11 @@ fn run_hook_only_mode(
         eprintln!("[warn] Warning: --hook-only only makes sense with --global");
         eprintln!("    For local projects, use default mode or --claude-md");
         return Ok(());
+    }
+
+    // Clean up legacy RTK.md from earlier ContextCrawler / upstream rtk installs.
+    if let Ok(claude_dir) = resolve_claude_dir() {
+        cleanup_legacy_rtk_md(&claude_dir, verbose);
     }
 
     // Migrate old hook script if present
@@ -1629,17 +1688,17 @@ fn patch_claude_md(path: &Path, verbose: u8) -> Result<bool> {
         return Ok(migrated);
     }
 
-    // Add @RTK.md
+    // Add @CONTEXTCRAWLER.md
     let new_content = if content.is_empty() {
-        "@RTK.md\n".to_string()
+        format!("{}\n", RTK_MD_REF)
     } else {
-        format!("{}\n\n@RTK.md\n", content.trim())
+        format!("{}\n\n{}\n", content.trim(), RTK_MD_REF)
     };
 
     fs::write(path, new_content)?;
 
     if verbose > 0 {
-        eprintln!("Added @RTK.md reference to CLAUDE.md");
+        eprintln!("Added {} reference to CLAUDE.md", RTK_MD_REF);
     }
 
     Ok(migrated)
@@ -1978,7 +2037,11 @@ fn cursor_hook_already_present(root: &serde_json::Value) -> bool {
         entry
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_FILE) || cmd == CURSOR_HOOK_COMMAND)
+            .is_some_and(|cmd| {
+                cmd.contains(REWRITE_HOOK_FILE)
+                    || cmd == CURSOR_HOOK_COMMAND
+                    || cmd == LEGACY_CURSOR_HOOK_COMMAND
+            })
     })
 }
 
@@ -2127,7 +2190,11 @@ fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
         !entry
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_FILE) || cmd == CURSOR_HOOK_COMMAND)
+            .is_some_and(|cmd| {
+                cmd.contains(REWRITE_HOOK_FILE)
+                    || cmd == CURSOR_HOOK_COMMAND
+                    || cmd == LEGACY_CURSOR_HOOK_COMMAND
+            })
     });
 
     pre_tool_use.len() < original_len
@@ -2440,9 +2507,9 @@ fn run_opencode_only_mode(verbose: u8) -> Result<()> {
 
 // ─── Gemini CLI support ───────────────────────────────────────────
 
-/// Gemini hook wrapper script — delegates to `rtk hook gemini`
+/// Gemini hook wrapper script — delegates to `contextcrawler hook gemini`
 const GEMINI_HOOK_SCRIPT: &str = r#"#!/bin/bash
-exec rtk hook gemini
+exec contextcrawler hook gemini
 "#;
 
 fn resolve_gemini_dir() -> Result<PathBuf> {
@@ -2660,7 +2727,7 @@ const COPILOT_HOOK_JSON: &str = r#"{
     "PreToolUse": [
       {
         "type": "command",
-        "command": "rtk hook copilot",
+        "command": "contextcrawler hook copilot",
         "cwd": ".",
         "timeout": 5
       }
@@ -2834,7 +2901,7 @@ mod tests {
     #[test]
     fn test_default_mode_creates_rtk_md() {
         let temp = TempDir::new().unwrap();
-        let rtk_md_path = temp.path().join("RTK.md");
+        let rtk_md_path = temp.path().join(RTK_MD);
 
         fs::write(&rtk_md_path, RTK_SLIM).unwrap();
         assert!(rtk_md_path.exists());
@@ -2902,10 +2969,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let claude_md = temp.path().join("CLAUDE.md");
 
-        fs::write(&claude_md, "# My stuff\n\n@RTK.md\n").unwrap();
+        fs::write(&claude_md, format!("# My stuff\n\n{}\n", RTK_MD_REF)).unwrap();
 
         let content = fs::read_to_string(&claude_md).unwrap();
-        let count = content.matches("@RTK.md").count();
+        let count = content.matches(RTK_MD_REF).count();
         assert_eq!(count, 1);
     }
 
@@ -2922,7 +2989,7 @@ mod tests {
         assert!(!second_added);
 
         let content = fs::read_to_string(&agents_md).unwrap();
-        assert_eq!(content.matches("@RTK.md").count(), 1);
+        assert_eq!(content.matches(RTK_MD_REF).count(), 1);
     }
 
     #[test]
@@ -3034,7 +3101,7 @@ mod tests {
 
         assert!(added);
         let content = fs::read_to_string(&agents_md).unwrap();
-        assert_eq!(content, "@RTK.md\n");
+        assert_eq!(content, format!("{}\n", RTK_MD_REF));
     }
 
     #[test]
@@ -3055,7 +3122,7 @@ mod tests {
         assert!(added);
         let content = fs::read_to_string(&agents_md).unwrap();
         assert!(!content.contains("old"));
-        assert_eq!(content.matches("@RTK.md").count(), 1);
+        assert_eq!(content.matches(RTK_MD_REF).count(), 1);
     }
 
     #[test]
@@ -3095,9 +3162,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let codex_dir = temp.path();
         let agents_md = codex_dir.join("AGENTS.md");
-        let rtk_md = codex_dir.join("RTK.md");
+        let rtk_md = codex_dir.join(RTK_MD);
 
-        fs::write(&agents_md, "# Team rules\n\n@RTK.md\n").unwrap();
+        fs::write(&agents_md, format!("# Team rules\n\n{}\n", RTK_MD_REF)).unwrap();
         fs::write(&rtk_md, "codex config").unwrap();
 
         let removed_first = uninstall_codex_at(codex_dir, 0).unwrap();
@@ -3108,7 +3175,7 @@ mod tests {
         assert!(!rtk_md.exists());
 
         let content = fs::read_to_string(&agents_md).unwrap();
-        assert!(!content.contains("@RTK.md"));
+        assert!(!content.contains(RTK_MD_REF));
         assert!(content.contains("# Team rules"));
     }
 
@@ -3117,7 +3184,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let codex_dir = temp.path();
         let agents_md = codex_dir.join("AGENTS.md");
-        let rtk_md = codex_dir.join("RTK.md");
+        let rtk_md = codex_dir.join(RTK_MD);
         let absolute_ref = codex_rtk_md_ref(codex_dir);
 
         fs::write(&agents_md, format!("# Team rules\n\n{}\n", absolute_ref)).unwrap();
@@ -3136,7 +3203,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let codex_dir = temp.path();
         let agents_md = codex_dir.join("AGENTS.md");
-        let rtk_md = codex_dir.join("RTK.md");
+        let rtk_md = codex_dir.join(RTK_MD);
 
         fs::write(
             &agents_md,
@@ -3909,15 +3976,15 @@ mod tests {
 
     #[test]
     fn test_uninstall_handles_both_artifacts() {
-        let content = format!("# Config\n\n@RTK.md\n\n{}\n\nMore stuff", RTK_INSTRUCTIONS);
+        let content = format!("# Config\n\n{}\n\n{}\n\nMore stuff", RTK_MD_REF, RTK_INSTRUCTIONS);
 
         let after_at_removal: String = content
             .lines()
-            .filter(|line| !line.trim().starts_with("@RTK.md"))
+            .filter(|line| !line.trim().starts_with(RTK_MD_REF))
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(!after_at_removal.contains("@RTK.md"));
+        assert!(!after_at_removal.contains(RTK_MD_REF));
         assert!(after_at_removal.contains(RTK_BLOCK_START));
 
         let (final_content, did_remove) = remove_rtk_block(&after_at_removal);
