@@ -179,6 +179,53 @@ Tracked by [GHSA-wjx4-ffxm-fxxp](https://github.com/thehoff/contextcrawler/secur
 
 ---
 
+## Credential scrubbing in the tracking database
+
+`contextcrawler` keeps a SQLite log of commands it has handled
+(`tracking.db`, 90-day retention by default) so it can report token
+savings via `gain --history`. Without scrubbing, that log would
+preserve credentials passed on the command line and `gain --history`
+would feed them back into agent context on every read.
+
+`scrub_secrets` runs at the INSERT boundary in `src/core/tracking.rs`
+and redacts:
+
+- Credential-bearing flags: `--password`, `--token`, `--api-key`,
+  `--secret`, `--access-key`, `--auth-token`, `--client-secret`
+  (with either `=value` or space-separated value forms; underscore and
+  hyphen variants both match; single- and double-quoted values with
+  embedded spaces are also covered).
+- `mysql -p<password>` (inline, no space) — only applied when the
+  first token is `mysql`, `mysqldump`, `mysqladmin`, `mariadb`, or
+  one of the mariadb-* variants (including `.exe` on Windows). Other
+  tools that use `-p` for unrelated purposes (`curl -p3000`,
+  `ssh -p2222`, `git log -p`) are not rewritten.
+- HTTP `Authorization: Bearer|Basic|Token|ApiKey <value>` headers,
+  including those passed via curl `-H`.
+- URL-embedded credentials: `scheme://user:password@host`.
+- AWS access key IDs (`AKIA…`, `ASIA…`).
+- GitHub tokens: classic / OAuth / user-to-server / server / refresh
+  PATs (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`) and fine-grained PATs
+  (`github_pat_…`).
+- Slack tokens (`xox[abprs]-…`).
+
+False positives on benign command shapes were checked: plain `git
+status`, `cargo test --lib`, `psql -h … -U …` and similar pass through
+unchanged.
+
+Known limitation: the scrubber operates on the post-`args.join(" ")`
+string, which is lossy. A wrapper like `env mysql -p…` has `env` as
+the first token and the mysql `-p` gating won't fire. A Windows path
+with embedded spaces splits awkwardly before basename lookup. In both
+cases the scrubber falls back to its non-mysql-scoped patterns, which
+still catch flag-style secrets but miss the mysql `-p` shortcut. The
+shell-exec-boundary branch refuses to spawn exec wrappers in the
+err / test / summary subcommands, which limits exposure on that path.
+
+Tracked by [GHSA-2cwv-rr7c-2p4c](https://github.com/thehoff/contextcrawler/security/advisories/GHSA-2cwv-rr7c-2p4c).
+
+---
+
 ## Acknowledgements
 
 We will credit security researchers in the published advisory and the
