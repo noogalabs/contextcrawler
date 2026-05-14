@@ -127,6 +127,8 @@ fn is_mysql_command(cmd: &str) -> bool {
             | "mysqldump.exe"
             | "mysqladmin.exe"
             | "mariadb.exe"
+            | "mariadb-dump.exe"
+            | "mariadb-admin.exe"
     )
 }
 
