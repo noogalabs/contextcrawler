@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="ContextCrawler — Princess Donut says: Dammit Claude!" width="480">
+</p>
+
 # ContextCrawler
 
 A downstream distribution of [rtk-ai/rtk](https://github.com/rtk-ai/rtk)
