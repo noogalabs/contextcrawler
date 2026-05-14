@@ -122,9 +122,6 @@ flowchart TB
 
 </details>
 
-The Features table above already enumerates every subcommand; a
-feature-surface fan-out diagram would just repeat it.
-
 ## Install
 
 ```sh
