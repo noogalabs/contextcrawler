@@ -8,9 +8,8 @@ from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 First public release. ContextCrawler is a downstream distribution of
 [rtk-ai/rtk](https://github.com/rtk-ai/rtk) (v0.39.0) that brings the
 [jee599/contextzip](https://github.com/jee599/contextzip) feature set
-forward — `contextzip` is based on rtk 0.30.1 (9 minor versions behind
-upstream) and inherits a number of issues that have since been fixed in
-upstream rtk.
+forward to a current rtk base, plus an opt-in Tirith defense-in-depth
+gate and an in-tree supply-chain pre-install gate.
 
 ### One binary
 
@@ -41,14 +40,20 @@ upstream rtk.
   Block-level findings downgrade the verdict to *Ask* so the user reviews
   the original command. Wired into both the legacy `rewrite` path and the
   modern `contextcrawler hook claude` path so coverage is consistent.
-  Default fail-open; set `CONTEXTZIP_TIRITH_REQUIRED=1` for fail-closed.
+  Default fail-open; set `CONTEXTCRAWLER_TIRITH_REQUIRED=1` for fail-closed.
 - `contextcrawler security` subcommand. Surfaces Tirith audit stats, gate
   mode, and shell-hook configuration status. Text and JSON output.
-- `contextcrawler security --log` tails ContextCrawler's local gate-
-  downgrade log (`$XDG_DATA_HOME/contextcrawler/downgrades.jsonl`). Each
-  downgrade records timestamp, command, reason, and the full Tirith JSON
-  evidence when available (rule ID, severity, evidence, MITRE references,
-  timings).
+- `contextcrawler security log` subcommand. Merged gate-activity log
+  (Tirith downgrades + supply-chain events) sorted by timestamp.
+  `--limit N`, `--json`, and `--histogram` for at-a-glance bucketed
+  counts by `(source, category)` with proportional bars.
+- `contextcrawler supply-chain check '<cmd>'` — pre-install age and
+  OSV CVE inspection for `npm` / `pnpm` / `yarn` and `pip` / `uv` /
+  `poetry` / `pipx` install commands. Wired into the auto-allow path
+  so block reasons (age below cooldown, known CVE) downgrade to *Ask*.
+  Honors pinned versions; 24h disk cache at
+  `~/.cache/contextcrawler/supply-chain/`. Opt-in via
+  `~/.config/contextcrawler/supply-chain.toml`.
 - `contextcrawler sessions` subcommand group for Claude Code session-JSONL
   compaction:
   - `contextcrawler sessions compact <id|path>` — write a `.compressed`
@@ -81,8 +86,7 @@ upstream rtk.
 - `build_cmd` generic build-error grouper (was at
   `jee599/contextzip/src/build_cmd.rs`). Subsumed by rtk 0.39's per-language
   modules: `cmds/js/tsc_cmd.rs`, `cmds/rust/cargo_cmd.rs`,
-  `cmds/python/mypy_cmd.rs`, `cmds/js/lint_cmd.rs`. See
-  [`notes/decision-skip-build_cmd.md`](notes/decision-skip-build_cmd.md).
+  `cmds/python/mypy_cmd.rs`, `cmds/js/lint_cmd.rs`.
 - Telemetry scaffolding. ContextCrawler does not phone home.
 - Self-update path. Update via `cargo install` or rebuild from source.
 - Standalone `contextcrawler-session` crate (formerly under
