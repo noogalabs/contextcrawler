@@ -183,7 +183,7 @@ pub fn run(_verbose: u8) -> Result<()> {
         0.0
     };
     println!("Average adoption: {:.0}%", avg_adoption);
-    println!("Tip: Run `rtk discover` to find missed RTK opportunities");
+    println!("Tip: Run `contextcrawler discover` to find missed opportunities");
 
     Ok(())
 }

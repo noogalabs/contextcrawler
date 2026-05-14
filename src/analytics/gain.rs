@@ -135,7 +135,7 @@ pub fn run(
             hook_check::HookStatus::Missing => {
                 eprintln!(
                     "{}",
-                    "[warn] No hook installed — run `rtk init -g` for automatic token savings"
+                    "[warn] No hook installed — run `contextcrawler init -g` for automatic token savings"
                         .yellow()
                 );
                 eprintln!();
@@ -143,7 +143,7 @@ pub fn run(
             hook_check::HookStatus::Outdated => {
                 eprintln!(
                     "{}",
-                    "[warn] Hook outdated — run `rtk init -g` to update".yellow()
+                    "[warn] Hook outdated — run `contextcrawler init -g` to update".yellow()
                 );
                 eprintln!();
             }
@@ -686,7 +686,7 @@ fn check_rtk_disabled_bypass() -> Option<String> {
     let pct = (bypassed as f64 / total_bash as f64) * 100.0;
     if pct > 10.0 {
         Some(format!(
-            "[warn] {} commands ({:.0}%) used RTK_DISABLED=1 unnecessarily — run `rtk discover` for details",
+            "[warn] {} commands ({:.0}%) used RTK_DISABLED=1 unnecessarily — run `contextcrawler discover` for details",
             bypassed, pct
         ))
     } else {

@@ -97,9 +97,9 @@ fn check_and_warn() -> Option<()> {
     let warning = match status() {
         HookStatus::Ok => return Some(()),
         HookStatus::Missing => {
-            "[rtk] /!\\ No hook installed — run `rtk init -g` for automatic token savings"
+            "[contextcrawler] /!\\ No hook installed — run `contextcrawler init -g` for automatic token savings"
         }
-        HookStatus::Outdated => "[rtk] /!\\ Hook outdated — run `rtk init -g` to update",
+        HookStatus::Outdated => "[contextcrawler] /!\\ Hook outdated — run `contextcrawler init -g` to update",
     };
 
     // Rate limit: warn once per day

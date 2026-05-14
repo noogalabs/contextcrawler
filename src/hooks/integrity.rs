@@ -216,8 +216,8 @@ pub fn run_verify(verbose: u8) -> Result<()> {
                 return Ok(());
             }
         }
-        println!("SKIP  RTK hook not installed");
-        println!("      Run `rtk init -g` to install.");
+        println!("SKIP  ContextCrawler hook not installed");
+        println!("      Run `contextcrawler init -g` to install.");
         return Ok(());
     }
 
@@ -234,25 +234,25 @@ pub fn run_verify(verbose: u8) -> Result<()> {
             eprintln!("  Expected: {}", expected);
             eprintln!("  Actual:   {}", actual);
             eprintln!();
-            eprintln!("  The hook file has been modified outside of `rtk init`.");
+            eprintln!("  The hook file has been modified outside of `contextcrawler init`.");
             eprintln!("  This could indicate tampering or a manual edit.");
             eprintln!();
-            eprintln!("  To restore: rtk init -g --auto-patch");
+            eprintln!("  To restore: contextcrawler init -g --auto-patch");
             eprintln!("  To inspect: cat {}", hook_path.display());
             std::process::exit(1);
         }
         IntegrityStatus::NoBaseline => {
             println!("WARN  no baseline hash found");
             println!("      Hook exists but was installed before integrity checks.");
-            println!("      Run `rtk init -g` to establish baseline.");
+            println!("      Run `contextcrawler init -g` to establish baseline.");
         }
         IntegrityStatus::NotInstalled => {
-            println!("SKIP  RTK hook not installed");
-            println!("      Run `rtk init -g` to install.");
+            println!("SKIP  ContextCrawler hook not installed");
+            println!("      Run `contextcrawler init -g` to install.");
         }
         IntegrityStatus::OrphanedHash => {
             eprintln!("WARN  hash file exists but hook is missing");
-            eprintln!("      Run `rtk init -g` to reinstall.");
+            eprintln!("      Run `contextcrawler init -g` to reinstall.");
         }
     }
 
@@ -308,7 +308,7 @@ pub fn runtime_check() -> Result<()> {
         }
         IntegrityStatus::OrphanedHash => {
             eprintln!("rtk: warning: hash file exists but hook is missing");
-            eprintln!("  Run `rtk init -g` to reinstall.");
+            eprintln!("  Run `contextcrawler init -g` to reinstall.");
             // Don't block — hook is gone, nothing to exploit
         }
     }

@@ -2187,12 +2187,12 @@ fn show_claude_config() -> Result<()> {
                 );
             } else if !is_thin_delegator {
                 println!(
-                    "[warn] Hook: {} (outdated — run `rtk init -g` to upgrade to native binary)",
+                    "[warn] Hook: {} (outdated — run `contextcrawler init -g` to upgrade to native binary)",
                     hook_path.display()
                 );
             } else if is_executable && has_guards {
                 println!(
-                    "[warn] Hook: {} (legacy script v{} — run `rtk init -g` to upgrade)",
+                    "[warn] Hook: {} (legacy script v{} — run `contextcrawler init -g` to upgrade)",
                     hook_path.display(),
                     hook_version
                 );
@@ -2207,7 +2207,7 @@ fn show_claude_config() -> Result<()> {
         #[cfg(not(unix))]
         {
             println!(
-                "[warn] Hook: {} (legacy script — run `rtk init -g` to upgrade)",
+                "[warn] Hook: {} (legacy script — run `contextcrawler init -g` to upgrade)",
                 hook_path.display()
             );
         }
@@ -2340,7 +2340,7 @@ fn show_claude_config() -> Result<()> {
                     );
                 } else {
                     println!(
-                        "[warn] Cursor hook: {} (legacy script — run `rtk init -g --agent cursor` to upgrade)",
+                        "[warn] Cursor hook: {} (legacy script — run `contextcrawler init -g --agent cursor` to upgrade)",
                         cursor_hook.display()
                     );
                 }
@@ -2348,7 +2348,7 @@ fn show_claude_config() -> Result<()> {
 
             #[cfg(not(unix))]
             {
-                println!("[warn] Cursor hook: {} (legacy script — run `rtk init -g --agent cursor` to upgrade)", cursor_hook.display());
+                println!("[warn] Cursor hook: {} (legacy script — run `contextcrawler init -g --agent cursor` to upgrade)", cursor_hook.display());
             }
         } else {
             println!("[--] Cursor hook: not found");

@@ -206,11 +206,11 @@ impl TomlFilterRegistry {
                 }
                 crate::hooks::trust::TrustStatus::Untrusted => {
                     eprintln!("[rtk] WARNING: untrusted project filters (.rtk/filters.toml)");
-                    eprintln!("[rtk] Filters NOT applied. Run `rtk trust` to review and enable.");
+                    eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
                 }
                 crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
                     eprintln!("[rtk] WARNING: .rtk/filters.toml changed since trusted.");
-                    eprintln!("[rtk] Filters NOT applied. Run `rtk trust` to re-review.");
+                    eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to re-review.");
                 }
             }
         }
