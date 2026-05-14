@@ -53,14 +53,17 @@ use std::time::Instant;
 pub fn scrub_secrets(cmd: &str) -> String {
     use lazy_static::lazy_static;
     lazy_static! {
-        // `--password VALUE` / `--password=VALUE`, also --token, --api-key,
-        // --secret, --access-key, --auth-token. Captures the flag form so we
-        // can reproduce it in the redaction.
+        // `--password VALUE` / `--password=VALUE`, plus --token, --api-key,
+        // --secret, --access-key, --auth-token, --client-secret. The VALUE
+        // alternation handles quoted forms so secrets with embedded spaces
+        // ("pass word") don't leak the tail past the first space — Codex
+        // review of the original \S+-only form caught that.
         static ref FLAG_VALUE: Regex = Regex::new(
-            r"(?i)(--(?:password|token|api[-_]?key|secret|access[-_]?key|auth[-_]?token|client[-_]?secret))(=|\s+)(\S+)"
+            r#"(?i)(--(?:password|token|api[-_]?key|secret|access[-_]?key|auth[-_]?token|client[-_]?secret))(=|\s+)("[^"]*"|'[^']*'|\S+)"#
         ).unwrap();
-        // mysql-style -pPASSWORD (no space) and -W (postgres password is interactive,
-        // so we only catch -p<token> with a non-empty value to avoid false hits).
+        // mysql-style -pPASSWORD (no space). Only meaningful for mysql /
+        // mariadb invocations — gated by is_mysql_command below to avoid
+        // false positives on flags like `curl -p3000` (Codex review).
         static ref MYSQL_P: Regex = Regex::new(r"(\s|^)-p(\S+)").unwrap();
         // `-H 'Authorization: <scheme> <token>'` (curl). Match both single and
         // double-quoted forms, and the unquoted equivalent.
@@ -73,22 +76,42 @@ pub fn scrub_secrets(cmd: &str) -> String {
         ).unwrap();
         // AWS access key id (AKIA / ASIA prefix, 20 chars total).
         static ref AWS_KEY: Regex = Regex::new(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b").unwrap();
-        // GitHub personal access tokens and app tokens.
+        // GitHub tokens: classic PATs / OAuth / user-to-server / server /
+        // refresh, plus fine-grained PATs (`github_pat_…`). Codex review of
+        // the original regex caught that fine-grained PATs slipped through.
         static ref GH_TOKEN: Regex = Regex::new(
-            r"\b(gh[pousr])_[A-Za-z0-9]{36,}\b"
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]+)\b"
         ).unwrap();
         // Slack tokens (xox[abprs]-...).
         static ref SLACK_TOKEN: Regex = Regex::new(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b").unwrap();
     }
 
     let s = FLAG_VALUE.replace_all(cmd, "$1$2<REDACTED>");
-    let s = MYSQL_P.replace_all(&s, "$1-p<REDACTED>");
     let s = AUTH_HEADER.replace_all(&s, "$1<REDACTED>");
     let s = URL_USERPASS.replace_all(&s, "$1$2:<REDACTED>@");
     let s = AWS_KEY.replace_all(&s, "<REDACTED-AWS-KEY>");
     let s = GH_TOKEN.replace_all(&s, "<REDACTED-GH-TOKEN>");
     let s = SLACK_TOKEN.replace_all(&s, "<REDACTED-SLACK-TOKEN>");
+    let s: std::borrow::Cow<str> = if is_mysql_command(&s) {
+        MYSQL_P.replace_all(&s, "$1-p<REDACTED>")
+    } else {
+        s
+    };
     s.to_string()
+}
+
+/// Detect whether a command line invokes mysql/mariadb so we can apply the
+/// `-p<password>` rewrite without corrupting unrelated tools that use `-p`.
+fn is_mysql_command(cmd: &str) -> bool {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let basename = std::path::Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first);
+    matches!(
+        basename,
+        "mysql" | "mysqldump" | "mysqladmin" | "mariadb" | "mariadb-dump" | "mariadb-admin"
+    )
 }
 
 fn current_project_path_string() -> String {
@@ -1567,6 +1590,57 @@ mod tests {
             "psql -h localhost -U readonly mydb",
         ] {
             assert_eq!(scrub_secrets(safe), safe, "false-positive on {safe}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_quoted_password_with_embedded_spaces() {
+        // Codex review of 7b344b5: original \S+-only form only redacted the
+        // first non-whitespace chunk, so a quoted secret with spaces leaked
+        // its tail. The double-/single-quoted alternation now covers it.
+        let out = scrub_secrets(r#"foo --password="pass word with spaces" bar"#);
+        assert!(
+            !out.contains("pass word with spaces"),
+            "quoted password leaked: {out}"
+        );
+        let out = scrub_secrets(r#"foo --token 'tok en with spaces' bar"#);
+        assert!(!out.contains("tok en with spaces"), "single-quoted leaked: {out}");
+    }
+
+    #[test]
+    fn scrub_redacts_github_fine_grained_pat() {
+        // Fine-grained PATs use the github_pat_ prefix and contain underscores.
+        let pat = "github_pat_11AAAAAAA0_ZAYZbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf";
+        let out = scrub_secrets(&format!("git push https://{pat}@github.com/u/r"));
+        assert!(!out.contains(pat), "fine-grained PAT leaked: {out}");
+        assert!(out.contains("<REDACTED-GH-TOKEN>"), "got: {out}");
+    }
+
+    #[test]
+    fn scrub_does_not_clobber_curl_dash_p_port() {
+        // Codex review of 7b344b5: original MYSQL_P regex was unscoped, so
+        // `curl -p3000` and similar got rewritten to `-p<REDACTED>` and
+        // corrupted the stored command. Now gated by is_mysql_command.
+        for safe in [
+            "curl -p3000 https://localhost",
+            "ssh -p2222 user@host",
+            "rsync -pvz src/ dst/",
+            "git log -p HEAD",
+        ] {
+            assert_eq!(scrub_secrets(safe), safe, "false positive on {safe}");
+        }
+    }
+
+    #[test]
+    fn scrub_still_redacts_mysql_dash_p() {
+        for cmd in [
+            "mysql -uadmin -phunter2 -hdb.local",
+            "mysqldump -uroot -psecret mydb",
+            "mariadb -pVALUE -hdb",
+            "/usr/bin/mysql -pVALUE",
+        ] {
+            let out = scrub_secrets(cmd);
+            assert!(out.contains("-p<REDACTED>"), "{cmd}: {out}");
         }
     }
 

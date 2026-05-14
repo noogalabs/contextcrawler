@@ -121,14 +121,20 @@ and redacts:
 - Credential-bearing flags: `--password`, `--token`, `--api-key`,
   `--secret`, `--access-key`, `--auth-token`, `--client-secret`
   (with either `=value` or space-separated value forms; underscore and
-  hyphen variants both match).
-- `mysql -p<password>` (inline, no space).
+  hyphen variants both match; single- and double-quoted values with
+  embedded spaces are also covered).
+- `mysql -p<password>` (inline, no space) — only applied when the
+  first token is `mysql`, `mysqldump`, `mysqladmin`, `mariadb`, or
+  one of the mariadb-* variants. Other tools that use `-p` for
+  unrelated purposes (`curl -p3000`, `ssh -p2222`, `git log -p`) are
+  not rewritten.
 - HTTP `Authorization: Bearer|Basic|Token|ApiKey <value>` headers,
   including those passed via curl `-H`.
 - URL-embedded credentials: `scheme://user:password@host`.
 - AWS access key IDs (`AKIA…`, `ASIA…`).
-- GitHub personal / OAuth / server / refresh tokens
-  (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`).
+- GitHub tokens: classic / OAuth / user-to-server / server / refresh
+  PATs (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`) and fine-grained PATs
+  (`github_pat_…`).
 - Slack tokens (`xox[abprs]-…`).
 
 False positives on benign command shapes were checked: plain `git
