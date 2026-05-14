@@ -478,7 +478,7 @@ pub fn rewrite_command(cmd: &str, excluded: &[String]) -> Option<String> {
 /// rewrite-output fragment) for the user-facing binary name. Internal
 /// classification/lookup logic keeps using `rtk` for upstream-rebase friction;
 /// only the strings that escape to user-visible hook output go through here.
-fn display_rtk(s: &str) -> String {
+pub fn display_rtk(s: &str) -> String {
     if let Some(rest) = s.strip_prefix("rtk ") {
         format!("contextcrawler {rest}")
     } else if s == "rtk" {

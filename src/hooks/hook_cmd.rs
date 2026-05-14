@@ -346,6 +346,12 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         //   2. Supply-chain — npm/PyPI package age + OSV.dev CVE check
         // Either gate blocking causes us to omit permissionDecision so
         // Claude Code's normal review prompt fires for the original command.
+        //
+        // Gates intentionally only fire on the auto-allow path. If `verdict`
+        // is anything but `Allow`, Claude Code is already going to prompt the
+        // user for review — there's no auto-execution to gate, so the safety
+        // net is unnecessary. As a side effect this means `downgrades.jsonl`
+        // only records events for explicitly-allowlisted command shapes.
         let tirith_verdict = super::tirith_gate::check(cmd);
         let tirith_block = super::tirith_gate::should_downgrade(&tirith_verdict);
 
