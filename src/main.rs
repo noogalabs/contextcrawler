@@ -227,6 +227,10 @@ enum Commands {
 
     /// Run command and show only errors/warnings
     Err {
+        /// Opt into sh -c semantics (pipes, redirects, chains).
+        /// Off by default — agent-rewritten input never reaches a shell silently.
+        #[arg(long)]
+        shell: bool,
         /// Command to run
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -234,6 +238,10 @@ enum Commands {
 
     /// Run tests and show only failures
     Test {
+        /// Opt into sh -c semantics (pipes, redirects, chains).
+        /// Off by default — agent-rewritten input never reaches a shell silently.
+        #[arg(long)]
+        shell: bool,
         /// Test command (e.g. cargo test)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -309,6 +317,10 @@ enum Commands {
 
     /// Run command and show heuristic summary
     Summary {
+        /// Opt into sh -c semantics (pipes, redirects, chains).
+        /// Off by default — agent-rewritten input never reaches a shell silently.
+        #[arg(long)]
+        shell: bool,
         /// Command to run and summarize
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -1717,14 +1729,14 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Err { command } => {
+        Commands::Err { shell, command } => {
             let cmd = command.join(" ");
-            runner::run_err(&cmd, cli.verbose)?
+            runner::run_err(&cmd, shell, cli.verbose)?
         }
 
-        Commands::Test { command } => {
+        Commands::Test { shell, command } => {
             let cmd = command.join(" ");
-            runner::run_test(&cmd, cli.verbose)?
+            runner::run_test(&cmd, shell, cli.verbose)?
         }
 
         Commands::Json {
@@ -1838,9 +1850,9 @@ fn run_cli() -> Result<i32> {
             KubectlCommands::Other(args) => container::run_kubectl_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Summary { command } => {
+        Commands::Summary { shell, command } => {
             let cmd = command.join(" ");
-            summary::run(&cmd, cli.verbose)?
+            summary::run(&cmd, shell, cli.verbose)?
         }
 
         Commands::Grep {

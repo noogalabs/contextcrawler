@@ -107,6 +107,47 @@ Out of scope:
 
 ---
 
+## Trust boundary for command-string subcommands
+
+`contextcrawler err`, `contextcrawler test`, and `contextcrawler summary`
+accept a free-form command string (`trailing_var_arg`). By default this
+string is **parsed as argv and executed without a shell**:
+
+- Shell metacharacters (`|`, `;`, `&`, `<`, `>`, backtick, `$`, newline)
+  cause the command to be rejected outright.
+- The first token must not be:
+  - a shell binary — `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`,
+    `tcsh`, `csh`, `ash`, with their `.exe` Windows variants; `cmd`,
+    `cmd.exe`, `powershell`, `powershell.exe`, `pwsh`, `pwsh.exe`; or
+    multi-tool shells `busybox`, `toybox`;
+  - an exec wrapper that replaces the process image with `arg[1+]` —
+    `env`, `nice`, `nohup`, `time`, `timeout`, `gtimeout`, `ionice`,
+    `chroot`, `setpriv`, `unshare`, `taskset`, `stdbuf`, `script`,
+    `xargs`, `watch`, `sudo`, `doas`, plus the setuid launchers `su`,
+    `runuser`, `pkexec`. Without this, an agent could bypass the
+    shell guard via `env sh -c '<payload>'` or `sudo bash -c …`.
+
+  Match is basename-only and case-insensitive (so `/usr/bin/bash` and
+  `BASH.EXE` both trip). Tradeoff: a legitimate binary coincidentally
+  named `sh` / `bash` / `env` / etc. cannot be invoked through these
+  subcommands in argv mode. Use `--shell` if you have such a case;
+  document it in your project's setup.
+
+This guards against a prompt-injection → shell-injection chain where an
+agent rewrites a user's `cargo test` into something like
+`cargo test; <payload>`. In the default mode that string never reaches
+`sh -c` and the agent gets a clear error instead of a silently widened
+command.
+
+Users who want pipes, redirects, or chained commands must pass
+`--shell` explicitly. That opt-in restores the original `sh -c`
+semantics and is the documented trust boundary: agent-rewritten input
+should not carry `--shell`.
+
+Tracked by [GHSA-3mmh-86cm-g6w4](https://github.com/thehoff/contextcrawler/security/advisories/GHSA-3mmh-86cm-g6w4).
+
+---
+
 ## Acknowledgements
 
 We will credit security researchers in the published advisory and the

