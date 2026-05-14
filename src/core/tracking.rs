@@ -55,11 +55,12 @@ pub fn scrub_secrets(cmd: &str) -> String {
     lazy_static! {
         // `--password VALUE` / `--password=VALUE`, plus --token, --api-key,
         // --secret, --access-key, --auth-token, --client-secret. The VALUE
-        // alternation handles quoted forms so secrets with embedded spaces
-        // ("pass word") don't leak the tail past the first space — Codex
-        // review of the original \S+-only form caught that.
+        // alternation is escape-aware so shell-escaped quotes inside the
+        // value (`--password="pa\"ss word"`) don't terminate the match
+        // early and leak the tail — Codex re-review caught the non-escape-
+        // aware version.
         static ref FLAG_VALUE: Regex = Regex::new(
-            r#"(?i)(--(?:password|token|api[-_]?key|secret|access[-_]?key|auth[-_]?token|client[-_]?secret))(=|\s+)("[^"]*"|'[^']*'|\S+)"#
+            r#"(?i)(--(?:password|token|api[-_]?key|secret|access[-_]?key|auth[-_]?token|client[-_]?secret))(=|\s+)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)"#
         ).unwrap();
         // mysql-style -pPASSWORD (no space). Only meaningful for mysql /
         // mariadb invocations — gated by is_mysql_command below to avoid
@@ -102,6 +103,12 @@ pub fn scrub_secrets(cmd: &str) -> String {
 
 /// Detect whether a command line invokes mysql/mariadb so we can apply the
 /// `-p<password>` rewrite without corrupting unrelated tools that use `-p`.
+///
+/// Limitation: a wrapper like `env mysql -p…` or `sudo mysql -p…` has `env`
+/// or `sudo` as the first token, so the scrubber will not apply. The
+/// shell-exec-boundary branch refuses to spawn these wrappers in the err /
+/// test / summary subcommands; outside those paths the limitation is
+/// accepted and documented in SECURITY.md.
 fn is_mysql_command(cmd: &str) -> bool {
     let first = cmd.split_whitespace().next().unwrap_or("");
     let basename = std::path::Path::new(first)
@@ -109,8 +116,17 @@ fn is_mysql_command(cmd: &str) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or(first);
     matches!(
-        basename,
-        "mysql" | "mysqldump" | "mysqladmin" | "mariadb" | "mariadb-dump" | "mariadb-admin"
+        basename.to_ascii_lowercase().as_str(),
+        "mysql"
+            | "mysqldump"
+            | "mysqladmin"
+            | "mariadb"
+            | "mariadb-dump"
+            | "mariadb-admin"
+            | "mysql.exe"
+            | "mysqldump.exe"
+            | "mysqladmin.exe"
+            | "mariadb.exe"
     )
 }
 
@@ -1638,10 +1654,36 @@ mod tests {
             "mysqldump -uroot -psecret mydb",
             "mariadb -pVALUE -hdb",
             "/usr/bin/mysql -pVALUE",
+            // Windows variants — Codex re-review caught these gaps.
+            "mysql.exe -pVALUE",
+            "MYSQL -pVALUE",
+            // Note: a Windows path with embedded spaces (e.g.
+            // `C:\Program Files\MySQL\mysql.exe`) splits on whitespace
+            // before basename lookup. After `args.join(" ")` the
+            // structure is lost; this is the same lossy-join limitation
+            // documented for exec wrappers (e.g. `env mysql -p…`).
         ] {
             let out = scrub_secrets(cmd);
             assert!(out.contains("-p<REDACTED>"), "{cmd}: {out}");
         }
+    }
+
+    #[test]
+    fn scrub_handles_escape_in_quoted_password() {
+        // Codex re-review of a8bf02c: original "[^"]*" stopped at the first
+        // closing quote, so `--password="pa\"ss word"` only matched
+        // `--password="pa\"` and left `ss word"` raw. The escape-aware
+        // alternation now lets `\\.` consume `\"` inside the quoted run.
+        let out = scrub_secrets(r#"foo --password="pa\"ss word" bar"#);
+        assert!(
+            !out.contains("ss word"),
+            "escape-aware quoted password leaked tail: {out}"
+        );
+        let out = scrub_secrets(r#"foo --token='it\'s a secret value' bar"#);
+        assert!(
+            !out.contains("s a secret value"),
+            "escape-aware single-quoted token leaked tail: {out}"
+        );
     }
 
     #[test]
