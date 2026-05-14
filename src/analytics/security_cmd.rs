@@ -34,11 +34,8 @@ struct AuditActions {
     allow: u64,
 }
 
-pub fn run(format: &str, log: bool, log_limit: usize, _verbose: u8) -> Result<()> {
-    if log {
-        return print_downgrade_log(format, log_limit);
-    }
-
+/// Show the Tirith integration dashboard. Entry point for `contextcrawler security`.
+pub fn run_dashboard(format: &str, _verbose: u8) -> Result<()> {
     let tirith_bin = resolve_tirith_bin();
 
     match (tirith_bin.as_deref(), format) {
@@ -65,64 +62,299 @@ pub fn run(format: &str, log: bool, log_limit: usize, _verbose: u8) -> Result<()
     Ok(())
 }
 
-fn print_downgrade_log(format: &str, limit: usize) -> Result<()> {
-    let path = dirs::data_local_dir()
-        .map(|d| d.join("contextcrawler").join("downgrades.jsonl"));
+// ---------------------------------------------------------------------------
+// Unified gate-activity log: merges Tirith downgrades and supply-chain events
+// from two JSONL files into one timestamped stream.
+// ---------------------------------------------------------------------------
 
-    let Some(path) = path else {
-        if format == "json" {
-            println!(r#"{{"log": [], "reason": "no_data_local_dir"}}"#);
-        } else {
-            println!("No data directory available — cannot locate downgrade log.");
-        }
-        return Ok(());
-    };
+#[derive(Debug)]
+enum LogEvent {
+    Tirith {
+        ts: String,
+        reason: String,
+        cmd: String,
+        findings: Vec<(String, String, String)>, // (severity, rule_id, title)
+    },
+    SupplyChain {
+        ts: String,
+        verdict: String,
+        cmd: String,
+        findings: Vec<SupplyChainFinding>,
+    },
+}
 
-    if !path.exists() {
-        if format == "json" {
-            println!(r#"{{"log": [], "path": "{}"}}"#, path.display());
-        } else {
-            println!("ContextCrawler Gate Downgrade Log");
-            println!("{}", "═".repeat(60));
-            println!();
-            println!("  No downgrades logged yet at:");
-            println!("    {}", path.display());
-            println!();
-            println!("  The Tirith gate has not downgraded any auto-allow rewrite");
-            println!("  since this binary was installed.");
+#[derive(Debug)]
+struct SupplyChainFinding {
+    package: String,
+    ecosystem: String,
+    severity: String,
+    detail: String,
+}
+
+impl LogEvent {
+    fn timestamp(&self) -> &str {
+        match self {
+            LogEvent::Tirith { ts, .. } => ts,
+            LogEvent::SupplyChain { ts, .. } => ts,
         }
-        return Ok(());
+    }
+}
+
+/// Entry point for `contextcrawler security log`.
+pub fn run_log(format: &str, limit: usize, _verbose: u8) -> Result<()> {
+    let dir = dirs::data_local_dir()
+        .map(|d| d.join("contextcrawler"))
+        .ok_or_else(|| anyhow::anyhow!("could not resolve data_local_dir"))?;
+
+    let tirith_path = dir.join("downgrades.jsonl");
+    let sc_path = dir.join("supply_chain.jsonl");
+
+    let mut events: Vec<LogEvent> = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(&tirith_path) {
+        for line in content.lines() {
+            if let Some(ev) = parse_tirith_line(line) {
+                events.push(ev);
+            }
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(&sc_path) {
+        for line in content.lines() {
+            if let Some(ev) = parse_supply_chain_line(line) {
+                events.push(ev);
+            }
+        }
     }
 
-    let content = std::fs::read_to_string(&path)?;
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
+    // Sort by timestamp ascending (oldest first), then take the tail.
+    events.sort_by(|a, b| a.timestamp().cmp(b.timestamp()));
+    let total = events.len();
     let start = total.saturating_sub(limit);
-    let tail = &lines[start..];
+    let tail = &events[start..];
 
     match format {
-        "json" => {
-            print!("{{\"path\":\"{}\",\"total\":{},\"showing\":{},\"log\":[",
-                path.display(), total, tail.len());
-            for (i, line) in tail.iter().enumerate() {
-                if i > 0 { print!(","); }
-                print!("{}", line);
-            }
-            println!("]}}");
+        "json" => render_log_json(&dir, total, tail),
+        _ => render_log_human(&dir, total, tail),
+    }
+    Ok(())
+}
+
+fn parse_tirith_line(line: &str) -> Option<LogEvent> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ts = v.get("ts")?.as_str()?.to_string();
+    let reason = v.get("reason")?.as_str()?.to_string();
+    let cmd = v.get("cmd")?.as_str()?.to_string();
+    let mut findings = Vec::new();
+    if let Some(arr) = v.pointer("/tirith/findings").and_then(|x| x.as_array()) {
+        for f in arr {
+            let sev = f.get("severity").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+            let rule = f.get("rule_id").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+            let title = f.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            findings.push((sev, rule, title));
         }
-        _ => {
-            println!("ContextCrawler Gate Downgrade Log");
-            println!("{}", "═".repeat(60));
-            println!("  Location:  {}", path.display());
-            println!("  Total:     {} downgrade events", total);
-            println!("  Showing:   last {} (use --log-limit to change)", tail.len());
-            println!();
-            for line in tail {
-                println!("  {}", line);
+    }
+    Some(LogEvent::Tirith {
+        ts,
+        reason,
+        cmd,
+        findings,
+    })
+}
+
+fn parse_supply_chain_line(line: &str) -> Option<LogEvent> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ts = v.get("ts")?.as_str()?.to_string();
+    let verdict = v.get("verdict")?.as_str()?.to_string();
+    let cmd = v.get("cmd")?.as_str()?.to_string();
+    let mut findings = Vec::new();
+    if let Some(arr) = v.get("findings").and_then(|x| x.as_array()) {
+        for f in arr {
+            let package = f.get("package").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+            let ecosystem = f.get("ecosystem").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+            let severity = f
+                .get("severity")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
+                .to_uppercase();
+            let detail = if let Some(reason) = f.get("reason") {
+                if let Some(kind) = reason.get("kind").and_then(|x| x.as_str()) {
+                    match kind {
+                        "RecentRelease" => {
+                            let age = reason
+                                .get("age_days")
+                                .and_then(|x| x.as_f64())
+                                .unwrap_or(0.0);
+                            let cd = reason
+                                .get("cooldown_days")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0);
+                            let ver = reason
+                                .get("version")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("?");
+                            format!("@{} published {:.2}d ago (cooldown {}d)", ver, age, cd)
+                        }
+                        "KnownVulnerability" => {
+                            let id = reason.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+                            let summary = reason
+                                .get("summary")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("");
+                            format!("CVE {} — {}", id, summary)
+                        }
+                        _ => kind.to_string(),
+                    }
+                } else {
+                    "(unknown reason)".to_string()
+                }
+            } else {
+                "(no reason)".to_string()
+            };
+            findings.push(SupplyChainFinding {
+                package,
+                ecosystem,
+                severity,
+                detail,
+            });
+        }
+    }
+    Some(LogEvent::SupplyChain {
+        ts,
+        verdict,
+        cmd,
+        findings,
+    })
+}
+
+fn render_log_human(dir: &std::path::Path, total: usize, tail: &[LogEvent]) {
+    println!("ContextCrawler Gate Activity Log");
+    println!("{}", "═".repeat(60));
+    println!("  Sources:");
+    println!("    {}", dir.join("downgrades.jsonl").display());
+    println!("    {}", dir.join("supply_chain.jsonl").display());
+    println!("  Total events: {}", total);
+    println!("  Showing:      last {} (use --limit to change)", tail.len());
+    println!();
+    if tail.is_empty() {
+        println!("  No gate activity yet. Enable the gates and run a few commands.");
+        return;
+    }
+    for ev in tail {
+        match ev {
+            LogEvent::Tirith {
+                ts,
+                reason,
+                cmd,
+                findings,
+            } => {
+                println!("[{}]  TIRITH  ({})", ts, reason);
+                println!("  cmd: {}", truncate(cmd, 100));
+                if findings.is_empty() {
+                    println!("  (no findings recorded)");
+                } else {
+                    println!("  findings ({}):", findings.len());
+                    for (sev, rule, title) in findings.iter().take(5) {
+                        println!("    {:<8} {:<25} — {}", sev, rule, truncate(title, 60));
+                    }
+                    if findings.len() > 5 {
+                        println!("    ... +{} more", findings.len() - 5);
+                    }
+                }
+                println!();
+            }
+            LogEvent::SupplyChain {
+                ts,
+                verdict,
+                cmd,
+                findings,
+            } => {
+                println!("[{}]  SUPPLY-CHAIN  ({})", ts, verdict.to_uppercase());
+                println!("  cmd: {}", truncate(cmd, 100));
+                if findings.is_empty() {
+                    // Skip/allow events have no findings; just show the verdict.
+                } else {
+                    println!("  findings ({}):", findings.len());
+                    for f in findings.iter().take(8) {
+                        println!(
+                            "    {:<8} {} [{}]  {}",
+                            f.severity,
+                            truncate(&f.package, 24),
+                            f.ecosystem,
+                            truncate(&f.detail, 70)
+                        );
+                    }
+                    if findings.len() > 8 {
+                        println!("    ... +{} more", findings.len() - 8);
+                    }
+                }
+                println!();
             }
         }
     }
-    Ok(())
+}
+
+fn render_log_json(dir: &std::path::Path, total: usize, tail: &[LogEvent]) {
+    let arr: Vec<serde_json::Value> = tail
+        .iter()
+        .map(|ev| match ev {
+            LogEvent::Tirith {
+                ts,
+                reason,
+                cmd,
+                findings,
+            } => {
+                serde_json::json!({
+                    "source": "tirith",
+                    "ts": ts,
+                    "reason": reason,
+                    "cmd": cmd,
+                    "findings": findings.iter().map(|(s, r, t)| serde_json::json!({
+                        "severity": s,
+                        "rule_id": r,
+                        "title": t,
+                    })).collect::<Vec<_>>(),
+                })
+            }
+            LogEvent::SupplyChain {
+                ts,
+                verdict,
+                cmd,
+                findings,
+            } => {
+                serde_json::json!({
+                    "source": "supply-chain",
+                    "ts": ts,
+                    "verdict": verdict,
+                    "cmd": cmd,
+                    "findings": findings.iter().map(|f| serde_json::json!({
+                        "severity": f.severity,
+                        "package": f.package,
+                        "ecosystem": f.ecosystem,
+                        "detail": f.detail,
+                    })).collect::<Vec<_>>(),
+                })
+            }
+        })
+        .collect();
+    let body = serde_json::json!({
+        "sources": {
+            "tirith": dir.join("downgrades.jsonl").display().to_string(),
+            "supply_chain": dir.join("supply_chain.jsonl").display().to_string(),
+        },
+        "total": total,
+        "showing": tail.len(),
+        "events": arr,
+    });
+    println!("{}", body);
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn resolve_tirith_bin() -> Option<String> {

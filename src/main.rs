@@ -780,16 +780,11 @@ enum Commands {
     /// Security report — Tirith audit stats, gate status, and detection rule
     /// breakdown. Surfaces what Tirith caught while protecting your shell.
     Security {
-        /// Output format: text (default) or json
-        #[arg(short, long, default_value = "text")]
-        format: String,
-        /// Show recent ContextCrawler gate-downgrade events from the local log
-        /// (commands where the Tirith gate downgraded an auto-allow rewrite).
+        #[command(subcommand)]
+        command: Option<SecurityCommands>,
+        /// Emit JSON instead of human-readable text (top-level dashboard only).
         #[arg(long)]
-        log: bool,
-        /// Number of recent log entries to show with --log (default: 20)
-        #[arg(long, default_value_t = 20)]
-        log_limit: usize,
+        json: bool,
     },
 
     /// Manage Claude Code session JSONL logs — compact / apply / expand.
@@ -806,6 +801,21 @@ enum Commands {
     },
     // ===== contextzip-downstream variants end =====
 }
+
+// ===== contextzip-downstream: Security subcommand group =====
+#[derive(Debug, Subcommand)]
+enum SecurityCommands {
+    /// Tail the local gate-activity log (Tirith downgrades + supply-chain events).
+    Log {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        /// Maximum number of recent events to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+// ===== end contextzip-downstream Security =====
 
 // ===== contextzip-downstream: SupplyChain subcommand group =====
 #[derive(Debug, Subcommand)]
@@ -2505,12 +2515,17 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Security {
-            format,
-            log,
-            log_limit,
-        } => {
-            analytics::security_cmd::run(&format, log, log_limit, cli.verbose)?;
+        Commands::Security { command, json } => {
+            match command {
+                None => {
+                    let fmt = if json { "json" } else { "text" };
+                    analytics::security_cmd::run_dashboard(fmt, cli.verbose)?;
+                }
+                Some(SecurityCommands::Log { json, limit }) => {
+                    let fmt = if json { "json" } else { "text" };
+                    analytics::security_cmd::run_log(fmt, limit, cli.verbose)?;
+                }
+            }
             0
         }
 
