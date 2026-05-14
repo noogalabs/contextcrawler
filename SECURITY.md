@@ -123,8 +123,9 @@ string is **parsed as argv and executed without a shell**:
   - an exec wrapper that replaces the process image with `arg[1+]` —
     `env`, `nice`, `nohup`, `time`, `timeout`, `gtimeout`, `ionice`,
     `chroot`, `setpriv`, `unshare`, `taskset`, `stdbuf`, `script`,
-    `xargs`, `watch`, `sudo`, `doas`. Without this, an agent could
-    bypass the shell guard via `env sh -c '<payload>'`.
+    `xargs`, `watch`, `sudo`, `doas`, plus the setuid launchers `su`,
+    `runuser`, `pkexec`. Without this, an agent could bypass the
+    shell guard via `env sh -c '<payload>'` or `sudo bash -c …`.
 
   Match is basename-only and case-insensitive (so `/usr/bin/bash` and
   `BASH.EXE` both trip). Tradeoff: a legitimate binary coincidentally

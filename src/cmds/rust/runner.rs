@@ -124,15 +124,19 @@ const SHELL_BINARIES: &[&str] = &[
     // POSIX / interactive shells
     "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "ash",
     "sh.exe", "bash.exe", "zsh.exe", "dash.exe", "ksh.exe", "fish.exe",
+    "tcsh.exe", "csh.exe", "ash.exe",
     // Windows shells
     "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
     // Embedded multi-tool shells
     "busybox", "busybox.exe", "toybox",
     // Exec wrappers — replace the process image with arg[1+], reintroducing
-    // the attack surface this guard exists to prevent.
+    // the attack surface this guard exists to prevent. Includes setuid
+    // launchers (su / runuser / pkexec) that exec arbitrary commands after
+    // privilege change.
     "env", "nice", "nohup", "time", "timeout", "gtimeout",
     "ionice", "chroot", "setpriv", "unshare", "taskset", "stdbuf",
     "script", "xargs", "watch", "sudo", "doas",
+    "su", "runuser", "pkexec",
 ];
 
 fn contains_shell_metachars(command: &str) -> Option<char> {
@@ -483,6 +487,31 @@ mod tests {
             "sudo", "doas", "busybox", "toybox",
         ] {
             let err = build_command(&format!("{wrapper} echo hi"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{wrapper}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_remaining_unix_shell_exe_variants() {
+        // Codex pass 3: tcsh.exe, csh.exe, ash.exe were missing.
+        for shell in ["tcsh.exe", "csh.exe", "ash.exe"] {
+            let err = build_command(&format!("{shell} -c true"), false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to spawn shell binary"),
+                "{shell}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_mode_rejects_setuid_launchers() {
+        // Codex pass 3: su / runuser / pkexec exec arbitrary commands
+        // after privilege change. Same threat class as sudo / doas.
+        for wrapper in ["su", "runuser", "pkexec"] {
+            let err = build_command(&format!("{wrapper} -c whoami"), false).unwrap_err();
             assert!(
                 err.to_string().contains("refusing to spawn shell binary"),
                 "{wrapper}: {err}"
