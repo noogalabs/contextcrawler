@@ -245,16 +245,37 @@ flowchart TB
 
 ## Install
 
-```sh
-git clone https://github.com/thehoff/contextcrawler.git contextzip
-cd contextzip
-cargo build --release --manifest-path rtk-fork/Cargo.toml
-cp rtk-fork/target/release/contextcrawler ~/.local/bin/contextcrawler
+Requires a Rust toolchain (`rustup`, stable channel). There are no
+pre-built binaries — single-maintainer fork, build it yourself.
 
+**One-liner with `cargo install`:**
+
+```sh
+cargo install --git https://github.com/thehoff/contextcrawler --branch develop --locked
+```
+
+This drops `contextcrawler` into `~/.cargo/bin/`. Make sure that's on
+your `PATH`.
+
+**Or clone and build (recommended if you want to read the diff first):**
+
+```sh
+git clone https://github.com/thehoff/contextcrawler.git
+cd contextcrawler
+cargo build --release
+cp target/release/contextcrawler ~/.local/bin/contextcrawler
+```
+
+**Wire up the agent hook:**
+
+```sh
 # Hook into Claude Code (and other agents — see `contextcrawler init --help`)
 contextcrawler init -g
+```
 
-# Optional: defense-in-depth gate
+**Optional defense-in-depth gate:**
+
+```sh
 # ContextCrawler shells out to `tirith` directly, so the binary on PATH
 # is all the gate needs — no shell hook required.
 cargo install tirith
@@ -263,12 +284,31 @@ cargo install tirith
 # eval "$(tirith init --shell zsh)"   # or bash / fish
 ```
 
+**Optional supply-chain gate** (opt-in):
+
+```sh
+mkdir -p ~/.config/contextcrawler
+cat > ~/.config/contextcrawler/supply-chain.toml <<'EOF'
+[supply_chain]
+enabled = true
+
+[npm]
+cooldown_days  = 3
+block_severity = "HIGH"
+
+[pypi]
+cooldown_days   = 3
+block_severity  = "HIGH"
+allow_editable  = true
+EOF
+```
+
 ## License
 
 The downstream parts of this repository are MIT.
 
-- Upstream rtk-fork content remains under its original license terms (see
-  `rtk-fork/LICENSE`). Note that upstream rtk's repo is internally
+- Upstream rtk content remains under its original license terms (see
+  the root `LICENSE`). Note that upstream rtk's repo is internally
   inconsistent (`LICENSE` says Apache-2.0; `Cargo.toml` says MIT). We
   preserve those upstream files as-is.
 - Source files we add or carry over carry per-file SPDX-License-Identifier

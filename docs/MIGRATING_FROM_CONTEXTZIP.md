@@ -81,10 +81,16 @@ rm -f ~/.claude/hooks/.contextzip-hook.sha256
 ### 2. Build ContextCrawler
 
 ```sh
-git clone https://github.com/thehoff/contextcrawler.git contextzip
-cd contextzip
-cargo build --release --manifest-path rtk-fork/Cargo.toml
-cp rtk-fork/target/release/contextcrawler ~/.local/bin/contextcrawler
+git clone https://github.com/thehoff/contextcrawler.git
+cd contextcrawler
+cargo build --release
+cp target/release/contextcrawler ~/.local/bin/contextcrawler
+```
+
+Or, if you prefer the one-liner:
+
+```sh
+cargo install --git https://github.com/thehoff/contextcrawler --branch develop --locked
 ```
 
 ### 3. Install the hook
