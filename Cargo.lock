@@ -241,6 +241,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "contextcrawler"
+version = "0.39.0"
+dependencies = [
+ "anyhow",
+ "automod",
+ "chrono",
+ "clap",
+ "colored",
+ "dirs",
+ "flate2",
+ "getrandom 0.4.2",
+ "ignore",
+ "lazy_static",
+ "libc",
+ "quick-xml",
+ "regex",
+ "rusqlite",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "ureq",
+ "walkdir",
+ "which",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1212,35 +1241,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rtk"
-version = "0.39.0"
-dependencies = [
- "anyhow",
- "automod",
- "chrono",
- "clap",
- "colored",
- "dirs",
- "flate2",
- "getrandom 0.4.2",
- "ignore",
- "lazy_static",
- "libc",
- "quick-xml",
- "regex",
- "rusqlite",
- "scraper",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "toml",
- "ureq",
- "walkdir",
- "which",
 ]
 
 [[package]]

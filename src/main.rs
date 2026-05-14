@@ -29,15 +29,15 @@ use cmds::system::{
 // touches the import section.
 use cmds::cloud::web_cmd;
 
-// Banner-only rebrand: this is a ContextCrawler distribution of upstream rtk.
-// Surfaces only in --version / --about output; binary name, package name,
-// and source identifiers are unchanged for clean rebases against upstream.
+// Full rebrand: binary is `contextcrawler`. Source-level `rtk` identifiers
+// (mod rtk, use rtk::*, struct Rtk*) remain to keep upstream rebases tight;
+// only user-facing surfaces change.
 const CONTEXTCRAWLER_VERSION: &str = concat!(
     "ContextCrawler 0.1.0 (downstream of rtk ",
     env!("CARGO_PKG_VERSION"),
     ")"
 );
-const CONTEXTCRAWLER_LONG_ABOUT: &str = "ContextCrawler — a downstream distribution of rtk-ai/rtk (https://github.com/rtk-ai/rtk) with added Claude Code session compaction, multi-language stacktrace compression, HTML content extraction, and a Tirith pre-execution security gate. Invoke as `rtk` (binary name is preserved for hook-script compatibility).";
+const CONTEXTCRAWLER_LONG_ABOUT: &str = "ContextCrawler — a downstream distribution of rtk-ai/rtk (https://github.com/rtk-ai/rtk) with added Claude Code session compaction, multi-language stacktrace compression, HTML content extraction, and a Tirith pre-execution security gate.";
 // ===== contextzip-downstream imports end =====
 
 use anyhow::{Context, Result};
@@ -65,10 +65,11 @@ pub enum AgentTarget {
 
 #[derive(Parser)]
 #[command(
-    name = "rtk",
-    // contextzip-downstream: override version + long_about for branding
+    // contextzip-downstream: full rename to contextcrawler. Source-level
+    // 'rtk' identifiers remain; only user-facing surfaces change.
+    name = "contextcrawler",
     version = CONTEXTCRAWLER_VERSION,
-    about = "Rust Token Killer - Minimize LLM token consumption",
+    about = "ContextCrawler - Minimize LLM token consumption (downstream of rtk-ai/rtk)",
     long_about = CONTEXTCRAWLER_LONG_ABOUT,
 )]
 struct Cli {
@@ -790,8 +791,43 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         log_limit: usize,
     },
+
+    /// Manage Claude Code session JSONL logs — compact / apply / expand.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommands,
+    },
     // ===== contextzip-downstream variants end =====
 }
+
+// ===== contextzip-downstream: Sessions subcommand group =====
+#[derive(Debug, Subcommand)]
+enum SessionsCommands {
+    /// Write a sidecar `<session>.jsonl.compressed` next to the original.
+    /// Rollback is `rm <sidecar>`.
+    Compact {
+        /// Session id (looked up under $CLAUDE_PROJECTS_DIR or ~/.claude/projects)
+        /// or full path to a .jsonl file. Optional with --all-sessions.
+        #[arg(required_unless_present = "all_sessions")]
+        target: Option<String>,
+        /// Print stats without writing the sidecar.
+        #[arg(long)]
+        dry_run: bool,
+        /// Compact every session under the projects root.
+        #[arg(long = "all-sessions")]
+        all_sessions: bool,
+    },
+    /// Promote `<session>.jsonl.compressed` to `<session>.jsonl`.
+    /// Original is backed up to `<session>.jsonl.bak`.
+    Apply {
+        target: String,
+    },
+    /// Roll back an `apply` by restoring `<session>.jsonl.bak`.
+    Expand {
+        target: String,
+    },
+}
+// ===== end contextzip-downstream Sessions =====
 
 #[derive(Debug, Subcommand)]
 enum HookCommands {
@@ -2453,6 +2489,28 @@ fn run_cli() -> Result<i32> {
             log_limit,
         } => {
             analytics::security_cmd::run(&format, log, log_limit, cli.verbose)?;
+            0
+        }
+
+        Commands::Sessions { command } => {
+            match command {
+                SessionsCommands::Compact {
+                    target,
+                    dry_run,
+                    all_sessions,
+                } => analytics::session_compact_cmd::run_compact(
+                    target.as_deref(),
+                    dry_run,
+                    all_sessions,
+                    cli.verbose,
+                )?,
+                SessionsCommands::Apply { target } => {
+                    analytics::session_compact_cmd::run_apply(&target, cli.verbose)?
+                }
+                SessionsCommands::Expand { target } => {
+                    analytics::session_compact_cmd::run_expand(&target, cli.verbose)?
+                }
+            }
             0
         }
         // ===== contextzip-downstream match arms end =====

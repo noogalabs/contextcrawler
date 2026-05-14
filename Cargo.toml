@@ -1,5 +1,8 @@
 [package]
-name = "rtk"
+# contextzip-downstream: package renamed for ContextCrawler distribution.
+# The source-level module/use/struct identifiers still use 'rtk' — this only
+# changes the cargo target binary name. Single binary, single mental model.
+name = "contextcrawler"
 version = "0.39.0"
 edition = "2021"
 authors = ["Patrick Szymkowiak"]
@@ -62,10 +65,10 @@ extended-description = "rtk filters and compresses command outputs before they r
 section = "utility"
 priority = "optional"
 assets = [
-    ["target/release/rtk", "usr/bin/", "755"],
+    ["target/release/contextcrawler", "usr/bin/", "755"],
 ]
 # cargo-generate-rpm configuration
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/rtk", dest = "/usr/bin/rtk", mode = "755" },
+    { source = "target/release/contextcrawler", dest = "/usr/bin/contextcrawler", mode = "755" },
 ]
