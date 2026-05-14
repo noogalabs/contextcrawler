@@ -107,6 +107,29 @@ Out of scope:
 
 ---
 
+## Trust boundary for command-string subcommands
+
+`contextcrawler err`, `contextcrawler test`, and `contextcrawler summary`
+accept a free-form command string (`trailing_var_arg`). By default this
+string is **parsed as argv and executed without a shell**: shell
+metacharacters (`|`, `;`, `&`, `<`, `>`, backtick, `$`, newline) cause the
+command to be rejected.
+
+This guards against a prompt-injection → shell-injection chain where an
+agent rewrites a user's `cargo test` into something like
+`cargo test; <payload>`. In the default mode that string never reaches
+`sh -c` and the agent gets a clear error instead of a silently widened
+command.
+
+Users who want pipes, redirects, or chained commands must pass
+`--shell` explicitly. That opt-in restores the original `sh -c`
+semantics and is the documented trust boundary: agent-rewritten input
+should not carry `--shell`.
+
+Tracked by [GHSA-3mmh-86cm-g6w4](https://github.com/thehoff/contextcrawler/security/advisories/GHSA-3mmh-86cm-g6w4).
+
+---
+
 ## Acknowledgements
 
 We will credit security researchers in the published advisory and the

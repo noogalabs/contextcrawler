@@ -7,23 +7,48 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::process::Command;
 
+// See cmds/rust/runner.rs: argv mode rejects shell metacharacters so
+// agent-rewritten input cannot smuggle pipes/redirects/chains into the child.
+const SHELL_METACHARS: &[char] = &['|', ';', '&', '<', '>', '`', '$', '\n'];
+
+fn build_command(command: &str, use_shell: bool) -> Result<Command> {
+    if use_shell {
+        let cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.args(["/C", command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", command]);
+            c
+        };
+        return Ok(cmd);
+    }
+    if let Some(meta) = command.chars().find(|c| SHELL_METACHARS.contains(c)) {
+        anyhow::bail!(
+            "command contains shell metacharacter '{}'; pass --shell to opt into sh -c semantics",
+            meta
+        );
+    }
+    let tokens = shlex::split(command)
+        .ok_or_else(|| anyhow::anyhow!("command has unbalanced quotes"))?;
+    let (bin, rest) = tokens
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("command is empty"))?;
+    let mut c = Command::new(bin);
+    c.args(rest);
+    Ok(c)
+}
+
 /// Run a command and provide a heuristic summary
-pub fn run(command: &str, verbose: u8) -> Result<i32> {
+pub fn run(command: &str, use_shell: bool, verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
         eprintln!("Running and summarizing: {}", command);
     }
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
+    let mut cmd = build_command(command, use_shell)?;
     let result = exec_capture(&mut cmd).context("Failed to execute command")?;
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
