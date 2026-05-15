@@ -1,0 +1,97 @@
+# cargo-deny configuration for ContextCrawler.
+#
+# Run with: cargo deny check
+# Or just one section: cargo deny check advisories
+#
+# Config format reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Audit the platforms we actually ship to. macOS dev, Linux prod/CI,
+# Windows binaries via CI.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+
+# ─── Security advisories ─────────────────────────────────────────────
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+
+# Known accepted exceptions. Each entry is scoped to a specific crate so
+# the ignore doesn't silently cover unrelated crates that pick up the
+# same advisory in future.
+ignore = [
+    # RUSTSEC-2025-0057 — currently fires only for fxhash 0.2.1 (transitive
+    # via contextcrawler -> scraper -> selectors -> fxhash). Used only by
+    # the web-extract path. No active CVE. Re-evaluate when selectors
+    # upgrades. cargo-deny 0.19 doesn't accept crate-scoping on advisory
+    # ignores, so this entry is global by advisory ID. If a future advisory
+    # database release reassigns this ID to a different crate, audit the
+    # delta — the comment in BASELINE.md tracks the expected scope.
+    { id = "RUSTSEC-2025-0057", reason = "Unmaintained fxhash 0.2.1, transitive via scraper. No active CVE. Tracked in docs/quality/BASELINE.md." },
+]
+
+# ─── Licenses ────────────────────────────────────────────────────────
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",      # unicode-ident (older)
+    "Unicode-3.0",           # unicode-ident (newer)
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",   # webpki-roots (transitive via ureq + rustls)
+]
+confidence-threshold = 0.93
+
+# Per-crate license overrides (when crate's stated license differs from
+# detected). Add with caution.
+[[licenses.exceptions]]
+# Example placeholder — populate as needed:
+# allow = ["..."]
+# crate = "..."
+name = "ring"
+allow = ["MIT", "ISC", "Apache-2.0"]  # ring is a mix; well-understood
+
+# ─── Sources ─────────────────────────────────────────────────────────
+
+[sources]
+# All deps must come from crates.io. Git deps or alt registries require
+# an explicit override below.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ─── Duplicate dependency policy ─────────────────────────────────────
+
+[bans]
+multiple-versions = "warn"
+# Wildcard deps are usually a mistake (= "*" pins to anything).
+wildcards = "deny"
+# Highlight any duplicate at depth 1 — top-level dupes are the worst.
+highlight = "all"
+
+# Crates we never want to see in the tree, even transitively.
+deny = [
+    # Add deny entries here as we find them, e.g.:
+    # { crate = "openssl", reason = "use rustls instead" },
+]
+
+# Crates we explicitly allow to appear in multiple versions (e.g. during
+# an in-progress upgrade). Empty by default; document additions.
+skip = []
+skip-tree = []
