@@ -58,11 +58,12 @@ let output = Command::new(&bin)
     .output();
 ```
 
-`Command::output()` has **no timeout**. If `tirith` hangs (deadlocks on
-a malformed input, blocked DNS, spinning loop in a buggy rule), the
-caller's `permissionDecision: allow` hook blocks indefinitely. The
-host agent's PreToolUse handler will time out from the agent side
-eventually, but during that interval the agent UI is frozen waiting.
+`Command::output()` has **no timeout**. If `tirith` hangs (deadlocks
+on a malformed input, blocked DNS, spinning loop in a buggy rule),
+the caller's `permissionDecision: allow` hook blocks indefinitely.
+The host agent's PreToolUse handler will time out from the agent
+side eventually, but during that interval the agent UI is frozen
+waiting.
 
 The supply-chain gate (`supply_chain_gate.rs`) sets an 8s timeout on
 its HTTP calls. The tirith gate should match.
@@ -103,10 +104,10 @@ let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 malicious or compromised tirith binary could emit gigabytes and OOM
 us. Real risk is low (tirith is a trusted tool), but cheap defence.
 
-**Recommendation:** When switching to the spawn+timeout pattern above,
-read piped stdout via `.take(MAX_BYTES).read_to_end()` like the
-supply-chain gate does (`HTTP_MAX_BYTES = 64 MB` — 1–4 MB is plenty
-for a tirith verdict JSON).
+**Recommendation:** When switching to the spawn+timeout pattern
+above, read piped stdout via `.take(MAX_BYTES).read_to_end()` like
+the supply-chain gate does (`HTTP_MAX_BYTES = 64 MB` — 1–4 MB is
+plenty for a tirith verdict JSON).
 
 ### F-03: Fallback binary path enables silent override (INFO)
 
@@ -122,20 +123,20 @@ let bin = if which::which("tirith").is_ok() {
 ```
 
 If `tirith` is not on `$PATH` but `~/.cargo/bin/tirith` exists,
-that's used. An attacker who can write to `~/.cargo/bin/` can install
-a fake `tirith` that always returns `{"action":"allow"}` and the gate
-silently degrades to no-op.
+that's used. An attacker who can write to `~/.cargo/bin/` can
+install a fake `tirith` that always returns `{"action":"allow"}` and
+the gate silently degrades to no-op.
 
 This is a "compromised local account" scenario which sits **outside
-our documented threat model** — once your `~/.cargo/bin/` is writable
-by hostile code, all bets are off (they can also replace
+our documented threat model** — once your `~/.cargo/bin/` is
+writable by hostile code, all bets are off (they can also replace
 `contextcrawler` itself). But the integrity-check pattern used for
 the agent rewrite hook (SHA-256 pinning in `hooks/integrity.rs`)
 isn't applied to tirith.
 
 **Recommendation:** Document the trust assumption in
-`docs/security/THREAT_MODEL.md` (currently mentions hook integrity but
-not tirith binary integrity). Optionally: pin a SHA-256 of the
+`docs/security/THREAT_MODEL.md` (currently mentions hook integrity
+but not tirith binary integrity). Optionally: pin a SHA-256 of the
 expected tirith binary at `init` time and verify on every check.
 Adds operational friction — tirith updates would need re-pinning.
 Probably not worth it for a defence-in-depth gate, but call it out.
@@ -157,17 +158,17 @@ format!(
 `tirith_json` is inserted as-is into the line. If tirith produces
 malformed JSON, our `downgrades.jsonl` becomes one corrupt line
 (downstream JSON parsers will fail on that line and skip it). If
-tirith produces correctly-formed JSON with embedded newlines (pretty-
-printed), the JSONL format breaks (a single tirith record spans
-multiple lines).
+tirith produces correctly-formed JSON with embedded newlines
+(pretty-printed), the JSONL format breaks (a single tirith record
+spans multiple lines).
 
-Real impact: garbled `gain --history` / `security log` output, not a
-security issue. But: a malicious tirith with literal newlines inside
-its JSON output could inject a fake-looking log line.
+Real impact: garbled `gain --history` / `security log` output, not
+a security issue. But: a malicious tirith with literal newlines
+inside its JSON output could inject a fake-looking log line.
 
 **Recommendation:** Re-parse-and-re-serialize the tirith JSON in
-`log_downgrade` before embedding, or strip newlines from `json` before
-formatting. `serde_json::to_string(&serde_json::from_str(&json)?)`
+`log_downgrade` before embedding, or strip newlines from `json`
+before formatting. `serde_json::to_string(&serde_json::from_str(&json)?)`
 gives a canonical single-line form.
 
 ### F-05: stdin / stderr unhandled (INFO)
@@ -182,12 +183,12 @@ stdin in `--non-interactive` mode — but explicit `Stdio::null()` is
 defence in depth.
 
 Stderr is also inherited, so a verbose Tirith would print to the
-hook's stderr (= the agent's tool-call stderr buffer). Visible to the
-user, fine.
+hook's stderr (= the agent's tool-call stderr buffer). Visible to
+the user, fine.
 
 **Recommendation:** `.stdin(Stdio::null())` and capture `stderr`
-explicitly for the downgrade log (handy when diagnosing Tirith errors
-inside `gain --history`).
+explicitly for the downgrade log (handy when diagnosing Tirith
+errors inside `gain --history`).
 
 ## Test coverage
 
