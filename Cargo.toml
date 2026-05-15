@@ -5,6 +5,10 @@
 name = "contextcrawler"
 version = "0.39.0"
 edition = "2021"
+# Minimum supported Rust: 1.80 for std::net::Ipv6Addr::to_ipv4_mapped()
+# used in the SSRF block check, plus IpAddr::is_private stabilization.
+# Older toolchains will fail to compile.
+rust-version = "1.80"
 authors = ["Patrick Szymkowiak"]
 description = "ContextCrawler — downstream of rtk-ai/rtk: CLI proxy that compresses command output for LLM agents, with the contextzip session compactor and an opt-in Tirith defense-in-depth gate"
 license = "MIT"

@@ -1504,6 +1504,23 @@ fn web_ssrf_block_reason(ip: &std::net::IpAddr) -> Option<&'static str> {
             if o[0] == 100 && (64..=127).contains(&o[1]) {
                 return Some("carrier-grade NAT (100.64.0.0/10)");
             }
+            // 0.0.0.0/8 — "this network" reserved range. is_unspecified
+            // catches only 0.0.0.0 exactly; the rest of /8 (0.0.0.1 .. 0.255.255.255)
+            // is also blocked here. Codex review of the initial SSRF block flagged
+            // this as missing.
+            if o[0] == 0 {
+                return Some("\"this network\" reserved 0.0.0.0/8");
+            }
+            // 198.18.0.0/15 — RFC 2544 benchmark range. Unlikely legitimate target;
+            // historically used in network testing and pen-test labs.
+            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+                return Some("benchmark range 198.18.0.0/15 (RFC 2544)");
+            }
+            // 240.0.0.0/4 — future-use / experimental. No legitimate routable target
+            // exists in this range as of 2026.
+            if o[0] >= 240 && o[0] < 255 {
+                return Some("future-use 240.0.0.0/4 (RFC 1112)");
+            }
             // Reserved / benchmark / documentation ranges. Not strictly
             // SSRF-dangerous but unlikely to be a legitimate fetch target.
             if v4.is_documentation() || v4.is_broadcast() {
@@ -2605,8 +2622,11 @@ fn run_cli() -> Result<i32> {
             let host = parsed
                 .host_str()
                 .ok_or_else(|| anyhow::anyhow!("contextcrawler web: URL has no host"))?;
-            // Resolve host → IPs. Use port 80 as a placeholder for resolve;
-            // we only care about the IP, not the port.
+            // Resolve host → IPs. Port 80 is a placeholder for the resolver
+            // API (ToSocketAddrs requires (host, port)); we discard it and
+            // keep only the IPs since the policy decision is IP-only.
+            // The actual fetch port comes from the URL's own port or scheme
+            // default (parsed.port_or_known_default()).
             use std::net::ToSocketAddrs;
             let resolved: Vec<std::net::IpAddr> = (host, 80u16)
                 .to_socket_addrs()
@@ -2625,6 +2645,23 @@ fn run_cli() -> Result<i32> {
                     );
                 }
             }
+            // DNS-rebinding defence (Codex review): pin the validated IPs
+            // into curl via --resolve so curl uses *our* lookup result,
+            // not a fresh re-resolution that an attacker with a low TTL
+            // could swap to a private IP between our check and the fetch.
+            //
+            // Pin both 80 and 443 since the URL may use either; also pin
+            // the URL's own port if explicit. curl's --resolve takes
+            // host:port:ip[,ip,...].
+            let pin_port = parsed.port_or_known_default().unwrap_or(443);
+            let ip_list = resolved
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let resolve_pin = format!("{}:{}:{}", host, pin_port, ip_list);
+            let resolve_pin_80 = format!("{}:80:{}", host, ip_list);
+            let resolve_pin_443 = format!("{}:443:{}", host, ip_list);
 
             let timer = core::tracking::TimedExecution::start();
             let mut cmd = core::utils::resolved_command("curl");
@@ -2648,6 +2685,17 @@ fn run_cli() -> Result<i32> {
                 // chain. Codex review of the original commit flagged this.
                 "--max-redirs",
                 "10",
+                // Pin our validated IPs for this host:port (closes the
+                // DNS-rebinding window between our resolution and curl's).
+                // Pin 80 and 443 to cover http→https upgrade redirects to
+                // the same host. The URL's own port is also pinned in
+                // case it's non-default.
+                "--resolve",
+                &resolve_pin_80,
+                "--resolve",
+                &resolve_pin_443,
+                "--resolve",
+                &resolve_pin,
                 "--",
                 &url,
             ]);
@@ -2903,6 +2951,34 @@ mod tests {
         assert!(web_ssrf_block_reason(&ip).is_some());
         let ip = "::ffff:169.254.169.254".parse::<IpAddr>().unwrap();
         assert!(web_ssrf_block_reason(&ip).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_this_network_0_0_0_0_8() {
+        // Codex review follow-up: 0.0.0.0/8 is "this network" reserved.
+        // is_unspecified() only catches 0.0.0.0 exactly; the rest of /8
+        // must also be blocked.
+        assert!(web_ssrf_block_reason(&v4(0, 1, 2, 3)).is_some());
+        assert!(web_ssrf_block_reason(&v4(0, 255, 255, 254)).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_benchmark_198_18_0_0_15() {
+        // RFC 2544 benchmark range.
+        assert!(web_ssrf_block_reason(&v4(198, 18, 0, 1)).is_some());
+        assert!(web_ssrf_block_reason(&v4(198, 19, 255, 254)).is_some());
+        // 198.17 and 198.20 are outside the range — allowed.
+        assert!(web_ssrf_block_reason(&v4(198, 17, 0, 1)).is_none());
+        assert!(web_ssrf_block_reason(&v4(198, 20, 0, 1)).is_none());
+    }
+
+    #[test]
+    fn ssrf_blocks_future_use_240_0_0_0_4() {
+        // 240/4 — reserved for future use; no routable target as of 2026.
+        assert!(web_ssrf_block_reason(&v4(240, 0, 0, 1)).is_some());
+        assert!(web_ssrf_block_reason(&v4(250, 1, 2, 3)).is_some());
+        // 255.255.255.255 is broadcast, also blocked (different reason).
+        assert!(web_ssrf_block_reason(&v4(255, 255, 255, 255)).is_some());
     }
 
     #[test]
