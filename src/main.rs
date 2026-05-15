@@ -667,10 +667,19 @@ enum Commands {
         /// List all trusted projects
         #[arg(long)]
         list: bool,
+        /// Trust the user-global filter (~/.config/rtk/filters.toml) instead
+        /// of the project-local one. Both files are SHA-256 pinned and
+        /// require re-review on content change.
+        #[arg(long, conflicts_with = "list")]
+        global: bool,
     },
 
     /// Revoke trust for project-local TOML filters
-    Untrust,
+    Untrust {
+        /// Revoke trust for the user-global filter instead.
+        #[arg(long)]
+        global: bool,
+    },
 
     /// Verify hook integrity and run TOML filter inline tests
     Verify {
@@ -2482,13 +2491,13 @@ fn run_cli() -> Result<i32> {
             core::utils::exit_code_from_status(&status, &cmd_name)
         }
 
-        Commands::Trust { list } => {
-            hooks::trust::run_trust(list)?;
+        Commands::Trust { list, global } => {
+            hooks::trust::run_trust(list, global)?;
             0
         }
 
-        Commands::Untrust => {
-            hooks::trust::run_untrust()?;
+        Commands::Untrust { global } => {
+            hooks::trust::run_untrust(global)?;
             0
         }
 

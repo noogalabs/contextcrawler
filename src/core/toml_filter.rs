@@ -188,40 +188,85 @@ impl TomlFilterRegistry {
     fn load() -> Self {
         let mut filters = Vec::new();
 
-        // Priority 1: project-local .rtk/filters.toml (trust-gated)
+        // Priority 1: project-local .rtk/filters.toml (trust-gated).
+        // TOCTOU-safe: read once, hash the in-memory buffer, parse the same
+        // buffer if trust passes. Avoids the swap-between-hash-and-parse
+        // window the two-open form left.
         let project_filter_path = std::path::Path::new(".rtk/filters.toml");
         if project_filter_path.exists() {
-            let trust_status = crate::hooks::trust::check_trust(project_filter_path)
-                .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
+            if let Ok(bytes) = std::fs::read(project_filter_path) {
+                let trust_status =
+                    crate::hooks::trust::check_trust_bytes(project_filter_path, &bytes)
+                        .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
 
-            match trust_status {
-                crate::hooks::trust::TrustStatus::Trusted
-                | crate::hooks::trust::TrustStatus::EnvOverride => {
-                    if let Ok(content) = std::fs::read_to_string(project_filter_path) {
+                match trust_status {
+                    crate::hooks::trust::TrustStatus::Trusted
+                    | crate::hooks::trust::TrustStatus::EnvOverride => {
+                        let content = String::from_utf8_lossy(&bytes);
                         match Self::parse_and_compile(&content, "project") {
                             Ok(f) => filters.extend(f),
                             Err(e) => eprintln!("[rtk] warning: .rtk/filters.toml: {}", e),
                         }
                     }
-                }
-                crate::hooks::trust::TrustStatus::Untrusted => {
-                    eprintln!("[rtk] WARNING: untrusted project filters (.rtk/filters.toml)");
-                    eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
-                }
-                crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
-                    eprintln!("[rtk] WARNING: .rtk/filters.toml changed since trusted.");
-                    eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to re-review.");
+                    crate::hooks::trust::TrustStatus::Untrusted => {
+                        eprintln!("[rtk] WARNING: untrusted project filters (.rtk/filters.toml)");
+                        eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
+                    }
+                    crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
+                        eprintln!("[rtk] WARNING: .rtk/filters.toml changed since trusted.");
+                        eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to re-review.");
+                    }
                 }
             }
         }
 
-        // Priority 2: user-global ~/.config/rtk/filters.toml
+        // Priority 2: user-global ~/.config/rtk/filters.toml (trust-gated).
+        //
+        // Closes GHSA-2026-CC-001 / audit finding H-3 from the 2026-05-15
+        // session. Without this gate, malware that wrote a hostile
+        // `match_output` rule to the global filter file could silently
+        // rewrite any command's output — including security scanner findings
+        // — before the agent saw it. Same trust model as project-local
+        // filters: SHA-256 pinned, content change auto-revokes, CI env-var
+        // override available.
         if let Some(config_dir) = dirs::config_dir() {
             let global_path = config_dir.join(RTK_DATA_DIR).join(FILTERS_TOML);
-            if let Ok(content) = std::fs::read_to_string(&global_path) {
-                match Self::parse_and_compile(&content, "user-global") {
-                    Ok(f) => filters.extend(f),
-                    Err(e) => eprintln!("[rtk] warning: {}: {}", global_path.display(), e),
+            if global_path.exists() {
+                if let Ok(bytes) = std::fs::read(&global_path) {
+                    let trust_status =
+                        crate::hooks::trust::check_trust_bytes(&global_path, &bytes)
+                            .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
+
+                    match trust_status {
+                        crate::hooks::trust::TrustStatus::Trusted
+                        | crate::hooks::trust::TrustStatus::EnvOverride => {
+                            let content = String::from_utf8_lossy(&bytes);
+                            match Self::parse_and_compile(&content, "user-global") {
+                                Ok(f) => filters.extend(f),
+                                Err(e) => {
+                                    eprintln!("[rtk] warning: {}: {}", global_path.display(), e)
+                                }
+                            }
+                        }
+                        crate::hooks::trust::TrustStatus::Untrusted => {
+                            eprintln!(
+                                "[rtk] WARNING: untrusted user-global filters ({})",
+                                global_path.display()
+                            );
+                            eprintln!(
+                                "[rtk] Filters NOT applied. Run `contextcrawler trust --global` to review and enable."
+                            );
+                        }
+                        crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
+                            eprintln!(
+                                "[rtk] WARNING: {} changed since trusted.",
+                                global_path.display()
+                            );
+                            eprintln!(
+                                "[rtk] Filters NOT applied. Run `contextcrawler trust --global` to re-review."
+                            );
+                        }
+                    }
                 }
             }
         }
