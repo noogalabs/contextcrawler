@@ -1458,6 +1458,77 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
     }
 }
 
+/// SSRF block list for the `contextcrawler web` command.
+///
+/// Returns `Some(reason)` if the IP is in a range we refuse to fetch from.
+/// `None` means safe to proceed.
+///
+/// Covers:
+/// - Loopback (127.0.0.0/8, ::1)
+/// - Link-local (169.254.0.0/16, fe80::/10) — includes AWS / GCP / Azure
+///   metadata service at 169.254.169.254
+/// - Azure metadata at 168.63.129.16 (not link-local, special-cased)
+/// - Private RFC1918 (10/8, 172.16/12, 192.168/16) and ULA fc00::/7
+/// - Multicast and "unspecified" (0.0.0.0, ::)
+///
+/// Initial-host only. An attacker who controls public DNS that resolves to
+/// a private IP can still slip through via `--max-redirs`. The proper fix
+/// is per-redirect-hop validation which would replace curl with a Rust
+/// HTTP client we control end-to-end — tracked in docs/ROADMAP.md.
+fn web_ssrf_block_reason(ip: &std::net::IpAddr) -> Option<&'static str> {
+    use std::net::IpAddr;
+    if ip.is_loopback() {
+        return Some("loopback address");
+    }
+    if ip.is_unspecified() {
+        return Some("unspecified address (0.0.0.0 / ::)");
+    }
+    if ip.is_multicast() {
+        return Some("multicast address");
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            // Azure IMDS lives at a non-link-local public-looking address.
+            if v4.octets() == [168, 63, 129, 16] {
+                return Some("Azure metadata service");
+            }
+            if v4.is_link_local() {
+                // 169.254.0.0/16 — includes AWS / GCP IMDS 169.254.169.254.
+                return Some("link-local address (includes cloud metadata services)");
+            }
+            if v4.is_private() {
+                return Some("private RFC1918 address");
+            }
+            // 100.64.0.0/10 — carrier-grade NAT, treat as private.
+            let o = v4.octets();
+            if o[0] == 100 && (64..=127).contains(&o[1]) {
+                return Some("carrier-grade NAT (100.64.0.0/10)");
+            }
+            // Reserved / benchmark / documentation ranges. Not strictly
+            // SSRF-dangerous but unlikely to be a legitimate fetch target.
+            if v4.is_documentation() || v4.is_broadcast() {
+                return Some("reserved address (documentation/broadcast)");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            // ULA fc00::/7
+            if v6.octets()[0] & 0xfe == 0xfc {
+                return Some("unique-local IPv6 (fc00::/7)");
+            }
+            // Link-local fe80::/10
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return Some("link-local IPv6 (fe80::/10)");
+            }
+            // IPv4-mapped IPv6 — re-check as IPv4 so we catch ::ffff:10.0.0.1
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return web_ssrf_block_reason(&IpAddr::V4(v4));
+            }
+            None
+        }
+    }
+}
+
 fn main() {
     let code = match run_cli() {
         Ok(code) => code,
@@ -2512,19 +2583,47 @@ fn run_cli() -> Result<i32> {
         // Each arm should be small (delegate to the module's run function);
         // keep all dispatch logic in the module, not inline here.
         Commands::Web { url } => {
-            // F-01: reject non-http/https schemes. curl accepts file://,
-            // ftp://, scp:// etc. — a file:// URL would silently exfiltrate
-            // local file contents into the agent's context.
+            // F-01 + F-02: full URL validation. Parse with the `url` crate
+            // (not just a prefix check), then resolve the host and reject
+            // if any resolved IP is loopback, private (RFC1918), link-local
+            // (incl. 169.254.169.254 AWS metadata), or multicast.
             //
-            // Minimal scheme check without pulling the full `url` crate.
-            // Production fix should use proper URL parsing, but a prefix
-            // check is enough to block the obvious attacks.
-            let lower = url.to_lowercase();
-            if !lower.starts_with("http://") && !lower.starts_with("https://") {
-                anyhow::bail!(
-                    "contextcrawler web: only http:// and https:// URLs are allowed (got {})",
-                    url
-                );
+            // This catches the agent-emits-private-IP-directly attack
+            // (the common case). An attacker who controls public DNS that
+            // resolves to a private IP can still slip through; that needs
+            // per-redirect-hop validation which would replace curl entirely.
+            // Tracked as residual in docs/security/MODULE_AUDIT_web_cmd.md.
+            let parsed = ::url::Url::parse(&url)
+                .with_context(|| format!("contextcrawler web: invalid URL: {}", url))?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                other => anyhow::bail!(
+                    "contextcrawler web: only http:// and https:// URLs are allowed (got scheme {})",
+                    other
+                ),
+            }
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("contextcrawler web: URL has no host"))?;
+            // Resolve host → IPs. Use port 80 as a placeholder for resolve;
+            // we only care about the IP, not the port.
+            use std::net::ToSocketAddrs;
+            let resolved: Vec<std::net::IpAddr> = (host, 80u16)
+                .to_socket_addrs()
+                .with_context(|| format!("contextcrawler web: cannot resolve host: {}", host))?
+                .map(|sa| sa.ip())
+                .collect();
+            for ip in &resolved {
+                let blocked_reason = web_ssrf_block_reason(ip);
+                if let Some(reason) = blocked_reason {
+                    anyhow::bail!(
+                        "contextcrawler web: refusing to fetch {} — host {} resolves to {} ({})",
+                        url,
+                        host,
+                        ip,
+                        reason
+                    );
+                }
             }
 
             let timer = core::tracking::TimedExecution::start();
@@ -2725,6 +2824,103 @@ fn is_operational_command(cmd: &Commands) -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // ── SSRF block list (web F-02) ──────────────────────────────────
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn ssrf_blocks_loopback_v4() {
+        assert!(web_ssrf_block_reason(&v4(127, 0, 0, 1)).is_some());
+        assert!(web_ssrf_block_reason(&v4(127, 0, 1, 2)).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_loopback_v6() {
+        assert!(web_ssrf_block_reason(&IpAddr::V6(Ipv6Addr::LOCALHOST)).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_link_local_v4_including_aws_metadata() {
+        assert!(web_ssrf_block_reason(&v4(169, 254, 169, 254)).is_some());
+        assert!(web_ssrf_block_reason(&v4(169, 254, 1, 1)).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_link_local_v6() {
+        let ip = "fe80::1".parse::<IpAddr>().unwrap();
+        assert!(web_ssrf_block_reason(&ip).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_private_rfc1918() {
+        for ip in [v4(10, 0, 0, 1), v4(172, 16, 0, 1), v4(192, 168, 1, 1)] {
+            assert!(
+                web_ssrf_block_reason(&ip).is_some(),
+                "{ip} should be blocked",
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_blocks_azure_metadata() {
+        let r = web_ssrf_block_reason(&v4(168, 63, 129, 16));
+        assert!(r.is_some());
+        assert!(r.unwrap().to_lowercase().contains("azure"));
+    }
+
+    #[test]
+    fn ssrf_blocks_carrier_grade_nat() {
+        assert!(web_ssrf_block_reason(&v4(100, 64, 0, 1)).is_some());
+        assert!(web_ssrf_block_reason(&v4(100, 127, 255, 254)).is_some());
+        // 100.63 and 100.128 are outside CGN — should NOT be blocked.
+        assert!(web_ssrf_block_reason(&v4(100, 63, 0, 1)).is_none());
+        assert!(web_ssrf_block_reason(&v4(100, 128, 0, 1)).is_none());
+    }
+
+    #[test]
+    fn ssrf_blocks_unspecified_and_multicast() {
+        assert!(web_ssrf_block_reason(&v4(0, 0, 0, 0)).is_some());
+        assert!(web_ssrf_block_reason(&v4(224, 0, 0, 1)).is_some());
+        assert!(web_ssrf_block_reason(&v4(255, 255, 255, 255)).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_ula_ipv6() {
+        let ip = "fc00::1".parse::<IpAddr>().unwrap();
+        assert!(web_ssrf_block_reason(&ip).is_some());
+        let ip = "fd00::1".parse::<IpAddr>().unwrap();
+        assert!(web_ssrf_block_reason(&ip).is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv4_mapped_v6() {
+        // ::ffff:10.0.0.1 must be rejected the same way 10.0.0.1 is.
+        let ip = "::ffff:10.0.0.1".parse::<IpAddr>().unwrap();
+        assert!(web_ssrf_block_reason(&ip).is_some());
+        let ip = "::ffff:169.254.169.254".parse::<IpAddr>().unwrap();
+        assert!(web_ssrf_block_reason(&ip).is_some());
+    }
+
+    #[test]
+    fn ssrf_allows_real_public_addresses() {
+        // Sample public IPs and IPv6. None should be blocked.
+        for ip in [
+            v4(1, 1, 1, 1),         // Cloudflare DNS
+            v4(8, 8, 8, 8),         // Google DNS
+            v4(140, 82, 121, 4),    // github.com (as of writing)
+        ] {
+            assert!(
+                web_ssrf_block_reason(&ip).is_none(),
+                "{ip} should be allowed",
+            );
+        }
+        let ip = "2606:4700:4700::1111".parse::<IpAddr>().unwrap(); // Cloudflare IPv6
+        assert!(web_ssrf_block_reason(&ip).is_none());
+    }
 
     #[test]
     fn test_git_commit_single_message() {
