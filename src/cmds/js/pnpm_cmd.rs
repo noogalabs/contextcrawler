@@ -1,6 +1,7 @@
 //! Filters pnpm output — dependency trees, install logs, outdated packages.
 
 use crate::core::stream::exec_capture;
+use crate::core::utils::strip_ansi;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
 use anyhow::{Context, Result};
@@ -300,7 +301,7 @@ fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
     let result = exec_capture(&mut cmd).context("Failed to run pnpm list")?;
 
     if !result.success() {
-        eprint!("{}", result.stderr);
+        eprint!("{}", strip_ansi(&result.stderr));
         return Ok(result.exit_code);
     }
 
@@ -405,7 +406,7 @@ fn run_install(args: &[String], verbose: u8) -> Result<i32> {
     let result = exec_capture(&mut cmd).context("Failed to run pnpm install")?;
 
     if !result.success() {
-        eprint!("{}", result.stderr);
+        eprint!("{}", strip_ansi(&result.stderr));
         return Ok(result.exit_code);
     }
 

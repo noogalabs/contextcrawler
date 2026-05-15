@@ -2,7 +2,7 @@
 
 use crate::core::runner;
 use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, resolved_command, truncate};
+use crate::core::utils::{exit_code_from_output, resolved_command, strip_ansi, truncate};
 use crate::golangci_cmd;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -143,8 +143,8 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<i32> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
 
-    print!("{}", stdout);
-    eprint!("{}", stderr);
+    print!("{}", strip_ansi(&stdout));
+    eprint!("{}", strip_ansi(&stderr));
 
     timer.track(
         &format!("go {}", subcommand),
@@ -270,7 +270,7 @@ fn run_go_tool_golangci_lint(args: &[OsString], verbose: u8) -> Result<i32> {
     println!("{}", filtered);
 
     if !stderr.trim().is_empty() && verbose > 0 {
-        eprintln!("{}", stderr.trim());
+        eprintln!("{}", strip_ansi(&stderr).trim());
     }
 
     timer.track(

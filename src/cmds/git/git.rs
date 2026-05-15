@@ -1,6 +1,7 @@
 //! Filters git output — log, status, diff, and more — keeping just the essential info.
 
 use crate::core::config;
+use crate::core::utils::strip_ansi;
 use crate::core::stream::{exec_capture, CaptureResult};
 use crate::core::tracking;
 use crate::core::utils::{exit_code_from_output, exit_code_from_status, resolved_command};
@@ -163,11 +164,11 @@ fn run_diff(
         let result = exec_capture(&mut cmd).context("Failed to run git diff")?;
 
         if !result.success() {
-            eprintln!("{}", result.stderr);
+            eprintln!("{}", strip_ansi(&result.stderr));
             return Ok(result.exit_code);
         }
 
-        println!("{}", result.stdout.trim());
+        println!("{}", strip_ansi(&result.stdout).trim());
 
         timer.track(
             &format!("git diff {}", args.join(" ")),
@@ -191,7 +192,7 @@ fn run_diff(
 
     if !result.success() {
         if !result.stderr.trim().is_empty() {
-            eprint!("{}", result.stderr);
+            eprint!("{}", strip_ansi(&result.stderr));
         }
         timer.track(
             &format!("git diff {}", args.join(" ")),
@@ -207,7 +208,7 @@ fn run_diff(
     }
 
     // Print stat summary first
-    println!("{}", result.stdout.trim());
+    println!("{}", strip_ansi(&result.stdout).trim());
 
     // Now get actual diff but compact it
     let mut diff_cmd = git_cmd(global_args);
@@ -266,13 +267,13 @@ fn run_show(
         }
         let result = exec_capture(&mut cmd).context("Failed to run git show")?;
         if !result.success() {
-            eprintln!("{}", result.stderr);
+            eprintln!("{}", strip_ansi(&result.stderr));
             return Ok(result.exit_code);
         }
         if wants_blob_show {
-            print!("{}", result.stdout);
+            print!("{}", strip_ansi(&result.stdout));
         } else {
-            println!("{}", result.stdout.trim());
+            println!("{}", strip_ansi(&result.stdout).trim());
         }
 
         timer.track(
@@ -303,10 +304,10 @@ fn run_show(
     }
     let summary_result = exec_capture(&mut summary_cmd).context("Failed to run git show")?;
     if !summary_result.success() {
-        eprintln!("{}", summary_result.stderr);
+        eprintln!("{}", strip_ansi(&summary_result.stderr));
         return Ok(summary_result.exit_code);
     }
-    println!("{}", summary_result.stdout.trim());
+    println!("{}", strip_ansi(&summary_result.stdout).trim());
 
     // Step 2: --stat summary
     let mut stat_cmd = git_cmd(global_args);
@@ -505,7 +506,7 @@ fn run_log(
     let result = exec_capture(&mut cmd).context("Failed to run git log")?;
 
     if !result.success() {
-        eprintln!("{}", result.stderr);
+        eprintln!("{}", strip_ansi(&result.stderr));
         return Ok(result.exit_code);
     }
 
@@ -907,7 +908,7 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 
         if !result.success() {
             if !result.stderr.trim().is_empty() {
-                eprint!("{}", result.stderr);
+                eprint!("{}", strip_ansi(&result.stderr));
             }
             timer.track(
                 &format!("git status {}", args.join(" ")),
@@ -919,7 +920,7 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         }
 
         if verbose > 0 || !result.stderr.is_empty() {
-            eprint!("{}", result.stderr);
+            eprint!("{}", strip_ansi(&result.stderr));
         }
 
         // Apply minimal filtering: strip ANSI, remove hints, empty lines
@@ -1025,10 +1026,10 @@ fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> 
     } else {
         eprintln!("FAILED: git add");
         if !result.stderr.trim().is_empty() {
-            eprintln!("{}", result.stderr);
+            eprintln!("{}", strip_ansi(&result.stderr));
         }
         if !result.stdout.trim().is_empty() {
-            eprintln!("{}", result.stdout);
+            eprintln!("{}", strip_ansi(&result.stdout));
         }
         return Ok(result.exit_code);
     }
@@ -1094,10 +1095,10 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         );
     } else {
         if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
+            eprint!("{}", strip_ansi(&stderr));
         }
         if !stdout.trim().is_empty() {
-            eprint!("{}", stdout);
+            eprint!("{}", strip_ansi(&stdout));
         }
         timer.track(&original_cmd, "rtk git commit", &raw_output, &raw_output);
         return Ok(exit_code);
@@ -1160,10 +1161,10 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
     } else {
         eprintln!("FAILED: git push");
         if !stderr.trim().is_empty() {
-            eprintln!("{}", stderr);
+            eprintln!("{}", strip_ansi(&stderr));
         }
         if !stdout.trim().is_empty() {
-            eprintln!("{}", stdout);
+            eprintln!("{}", strip_ansi(&stdout));
         }
         return Ok(exit_code_from_output(&output, "git push"));
     }
@@ -1245,10 +1246,10 @@ fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
     } else {
         eprintln!("FAILED: git pull");
         if !result.stderr.trim().is_empty() {
-            eprintln!("{}", result.stderr);
+            eprintln!("{}", strip_ansi(&result.stderr));
         }
         if !result.stdout.trim().is_empty() {
-            eprintln!("{}", result.stdout);
+            eprintln!("{}", strip_ansi(&result.stdout));
         }
         return Ok(result.exit_code);
     }
@@ -1326,7 +1327,7 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         } else {
             eprintln!("FAILED: git branch {}", args.join(" "));
             if !result.stderr.trim().is_empty() {
-                eprintln!("{}", result.stderr);
+                eprintln!("{}", strip_ansi(&result.stderr));
             }
             return Ok(result.exit_code);
         }
@@ -1357,10 +1358,10 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         } else {
             eprintln!("FAILED: git branch {}", args.join(" "));
             if !result.stderr.trim().is_empty() {
-                eprintln!("{}", result.stderr);
+                eprintln!("{}", strip_ansi(&result.stderr));
             }
             if !result.stdout.trim().is_empty() {
-                eprintln!("{}", result.stdout);
+                eprintln!("{}", strip_ansi(&result.stdout));
             }
             return Ok(result.exit_code);
         }
@@ -1382,7 +1383,7 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 
     if !result.success() {
         if !result.stderr.trim().is_empty() {
-            eprint!("{}", result.stderr);
+            eprint!("{}", strip_ansi(&result.stderr));
         }
         timer.track(
             &format!("git branch {}", args.join(" ")),
@@ -1482,7 +1483,7 @@ fn run_fetch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32
     if !result.success() {
         eprintln!("FAILED: git fetch");
         if !result.stderr.trim().is_empty() {
-            eprintln!("{}", result.stderr);
+            eprintln!("{}", strip_ansi(&result.stderr));
         }
         return Ok(result.exit_code);
     }
@@ -1600,7 +1601,7 @@ fn run_stash(
             } else {
                 eprintln!("FAILED: git stash {}", sub);
                 if !result.stderr.trim().is_empty() {
-                    eprintln!("{}", result.stderr);
+                    eprintln!("{}", strip_ansi(&result.stderr));
                 }
                 combined.clone()
             };
@@ -1642,7 +1643,7 @@ fn run_stash(
             } else {
                 eprintln!("FAILED: git stash {}", sub);
                 if !result.stderr.trim().is_empty() {
-                    eprintln!("{}", result.stderr);
+                    eprintln!("{}", strip_ansi(&result.stderr));
                 }
                 combined.clone()
             };
@@ -1719,7 +1720,7 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         } else {
             eprintln!("FAILED: git worktree {}", args.join(" "));
             if !result.stderr.trim().is_empty() {
-                eprintln!("{}", result.stderr);
+                eprintln!("{}", strip_ansi(&result.stderr));
             }
             return Ok(result.exit_code);
         }

@@ -1,6 +1,7 @@
 //! Shared command execution skeleton for filter modules.
 
 use anyhow::{Context, Result};
+use crate::core::utils::strip_ansi;
 use std::process::Command;
 
 use crate::core::stream::{self, FilterMode, StdinMode, StreamFilter};
@@ -80,10 +81,10 @@ pub fn run(
 
             if opts.skip_filter_on_failure && exit_code != 0 {
                 if !result.raw_stdout.trim().is_empty() {
-                    print!("{}", result.raw_stdout);
+                    print!("{}", strip_ansi(&result.raw_stdout));
                 }
                 if !result.raw_stderr.trim().is_empty() {
-                    eprint!("{}", result.raw_stderr);
+                    eprint!("{}", strip_ansi(&result.raw_stderr));
                 }
                 timer.track(&cmd_label, &format!("rtk {}", cmd_label), raw, raw);
                 return Ok(exit_code);
