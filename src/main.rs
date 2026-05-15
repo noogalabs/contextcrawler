@@ -2521,13 +2521,55 @@ fn run_cli() -> Result<i32> {
         // Each arm should be small (delegate to the module's run function);
         // keep all dispatch logic in the module, not inline here.
         Commands::Web { url } => {
+            // F-01: reject non-http/https schemes. curl accepts file://,
+            // ftp://, scp:// etc. — a file:// URL would silently exfiltrate
+            // local file contents into the agent's context.
+            //
+            // Minimal scheme check without pulling the full `url` crate.
+            // Production fix should use proper URL parsing, but a prefix
+            // check is enough to block the obvious attacks.
+            let lower = url.to_lowercase();
+            if !lower.starts_with("http://") && !lower.starts_with("https://") {
+                anyhow::bail!(
+                    "contextcrawler web: only http:// and https:// URLs are allowed (got {})",
+                    url
+                );
+            }
+
             let timer = core::tracking::TimedExecution::start();
             let mut cmd = core::utils::resolved_command("curl");
-            cmd.args(["-s", "-L", &url]);
+            // F-03: cap wall-clock at 30s so a hanging endpoint doesn't
+            //   block the agent hook.
+            // F-04: cap response size at 64 MiB so a huge response doesn't
+            //   OOM us.
+            // F-07: trailing `--` so a URL starting with a dash is treated
+            //   as data, not a curl flag (-K /etc/passwd is a real attack
+            //   vector via curl's config-file flag).
+            cmd.args([
+                "-s",
+                "-L",
+                "--max-time",
+                "30",
+                "--max-filesize",
+                "67108864",
+                // Bound redirect-chain abuse independently from the time
+                // budget. curl's default is 50; cap at 10 so an attacker
+                // can't waste the entire --max-time on a long redirect
+                // chain. Codex review of the original commit flagged this.
+                "--max-redirs",
+                "10",
+                "--",
+                &url,
+            ]);
             let output = cmd.output().context("Failed to fetch URL with curl")?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("FAILED: curl {}", stderr.trim());
+                // strip_ansi here is belt-and-suspenders against curl's
+                // rare ANSI-emitting paths reaching agent context.
+                eprintln!(
+                    "FAILED: curl {}",
+                    core::utils::strip_ansi(&stderr).trim()
+                );
                 std::process::exit(output.status.code().unwrap_or(1));
             }
             let raw = String::from_utf8_lossy(&output.stdout).to_string();
