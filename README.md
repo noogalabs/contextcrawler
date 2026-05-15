@@ -286,10 +286,14 @@ your `PATH`. Bump the `--tag` value when newer releases ship — see the
 ```sh
 git clone https://github.com/thehoff/contextcrawler.git
 cd contextcrawler
-git checkout v0.1.5          # pin to the latest tagged release
-cargo build --release
-cp target/release/contextcrawler ~/.local/bin/contextcrawler
+git checkout v0.1.5                # pin to the latest tagged release
+scripts/build-release.sh --install # strips build paths + copies to ~/.local/bin
 ```
+
+The `build-release.sh` helper sets `--remap-path-prefix` so the binary
+does not embed your `$HOME` / `$CARGO_HOME` / workspace path in panic
+backtrace metadata. Plain `cargo build --release` works too but will
+leak those paths.
 
 **Bleeding edge** (unreleased fixes on `develop`, expect churn):
 

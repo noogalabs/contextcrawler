@@ -56,6 +56,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+# Note: dependency source paths (/Users/<builder>/.cargo/registry/...) and the
+# workspace path get embedded in the release binary for panic backtraces. To
+# strip them, build via `scripts/build-release.sh` which sets RUSTFLAGS with
+# `--remap-path-prefix` for CARGO_HOME and the workspace root. `cargo` does not
+# yet allow env-var substitution inside rustflags in `.cargo/config.toml`, and
+# the cleaner `trim-paths` profile setting is still nightly-only.
 
 # cargo-deb configuration
 [package.metadata.deb]
