@@ -274,7 +274,7 @@ pre-built binaries — single-maintainer fork, build it yourself.
 **One-liner with `cargo install` (latest release):**
 
 ```sh
-cargo install --git https://github.com/thehoff/contextcrawler --tag v0.1.5 --locked
+cargo install --git https://github.com/thehoff/contextcrawler --tag v0.1.6 --locked
 ```
 
 This drops `contextcrawler` into `~/.cargo/bin/`. Make sure that's on
@@ -286,7 +286,7 @@ your `PATH`. Bump the `--tag` value when newer releases ship — see the
 ```sh
 git clone https://github.com/thehoff/contextcrawler.git
 cd contextcrawler
-git checkout v0.1.5                # pin to the latest tagged release
+git checkout v0.1.6                # pin to the latest tagged release
 scripts/build-release.sh --install # strips build paths + copies to ~/.local/bin
 ```
 
