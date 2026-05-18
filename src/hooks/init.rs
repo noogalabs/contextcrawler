@@ -464,13 +464,13 @@ fn prompt_telemetry_consent() -> Result<()> {
 
     eprintln!();
     eprintln!("--- Telemetry ---");
-    eprintln!("RTK collects anonymous usage metrics once per day to improve filters.");
+    eprintln!("ContextCrawler collects anonymous usage metrics once per day to improve filters.");
     eprintln!();
     eprintln!("  What:    command names (not arguments), token savings, OS, version");
     eprintln!("  Why:     prioritize filter development for the most-used commands");
     eprintln!("  Who:     RTK AI Labs, contact@rtk-ai.app");
-    eprintln!("  Rights:  disable anytime with `rtk telemetry disable`,");
-    eprintln!("           request erasure with `rtk telemetry forget`");
+    eprintln!("  Rights:  disable anytime with `contextcrawler telemetry disable`,");
+    eprintln!("           request erasure with `contextcrawler telemetry forget`");
     eprintln!("  Details: https://github.com/rtk-ai/rtk/blob/master/docs/TELEMETRY.md");
     eprintln!();
     eprint!("Enable anonymous telemetry? [y/N] ");
@@ -490,7 +490,7 @@ fn prompt_telemetry_consent() -> Result<()> {
     save_telemetry_consent(accepted)?;
 
     if accepted {
-        eprintln!("  Telemetry enabled. Disable anytime: rtk telemetry disable");
+        eprintln!("  Telemetry enabled. Disable anytime: contextcrawler telemetry disable");
     } else {
         eprintln!("  Telemetry disabled.");
     }
@@ -631,7 +631,7 @@ pub fn uninstall(
             let header = if dry_run {
                 "[dry-run] would uninstall RTK (Cursor):"
             } else {
-                "RTK uninstalled (Cursor):"
+                "ContextCrawler uninstalled (Cursor):"
             };
             println!("{}", header);
             for item in &cursor_removed {
@@ -641,7 +641,7 @@ pub fn uninstall(
                 println!("\nRestart Cursor to apply changes.");
             }
         } else {
-            println!("RTK Cursor support was not installed (nothing to remove)");
+            println!("ContextCrawler Cursor support was not installed (nothing to remove)");
         }
         if dry_run {
             print_dry_run_footer();
@@ -664,7 +664,7 @@ pub fn uninstall(
             let header = if dry_run {
                 "[dry-run] would uninstall RTK (Gemini):"
             } else {
-                "RTK uninstalled (Gemini):"
+                "ContextCrawler uninstalled (Gemini):"
             };
             println!("{}", header);
             for item in &removed {
@@ -674,7 +674,7 @@ pub fn uninstall(
                 println!("\nRestart Gemini CLI to apply changes.");
             }
         } else {
-            println!("RTK Gemini support was not installed (nothing to remove)");
+            println!("ContextCrawler Gemini support was not installed (nothing to remove)");
         }
         if dry_run {
             print_dry_run_footer();
@@ -811,7 +811,7 @@ pub fn uninstall(
         let header = if dry_run {
             "[dry-run] would uninstall RTK:"
         } else {
-            "RTK uninstalled:"
+            "ContextCrawler uninstalled:"
         };
         println!("{}", header);
         for item in removed {
@@ -846,7 +846,7 @@ fn uninstall_codex(global: bool, ctx: InitContext) -> Result<()> {
         let header = if dry_run {
             "[dry-run] would uninstall RTK for Codex CLI:"
         } else {
-            "RTK uninstalled for Codex CLI:"
+            "ContextCrawler uninstalled for Codex CLI:"
         };
         println!("{}", header);
         for item in removed {
@@ -1146,7 +1146,7 @@ fn run_default_mode(
         println!("  CLAUDE.md: @RTK.md reference added");
 
         if migrated {
-            println!("\n  [ok] Migrated: removed 137-line RTK block from CLAUDE.md");
+            println!("\n  [ok] Migrated: removed 137-line ContextCrawler block from CLAUDE.md");
             println!("              replaced with @RTK.md (10 lines)");
         }
     }
@@ -1484,7 +1484,7 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
     }
 
     if verbose > 0 {
-        eprintln!("Writing rtk instructions to: {}", path.display());
+        eprintln!("Writing contextcrawler instructions to: {}", path.display());
     }
 
     if path.exists() {
@@ -1618,7 +1618,7 @@ fn run_cline_mode(ctx: InitContext) -> Result<()> {
                 eprintln!("Wrote .clinerules");
             }
 
-            println!("\nRTK configured for Cline.\n");
+            println!("\nContextCrawler configured for Cline.\n");
             println!("  Rules: .clinerules (installed)");
         }
     }
@@ -1663,7 +1663,7 @@ fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
                 eprintln!("Wrote .windsurfrules");
             }
 
-            println!("\nRTK configured for Windsurf Cascade.\n");
+            println!("\nContextCrawler configured for Windsurf Cascade.\n");
             println!("  Rules: .windsurfrules (installed)");
         }
     }
@@ -1719,7 +1719,7 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
                 eprintln!("Wrote .kilocode/rules/rtk-rules.md");
             }
 
-            println!("\nRTK configured for Kilo Code.\n");
+            println!("\nContextCrawler configured for Kilo Code.\n");
             println!("  Rules: .kilocode/rules/rtk-rules.md (installed)");
         }
     }
@@ -1776,7 +1776,7 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
                 eprintln!("Wrote .agents/rules/antigravity-rtk-rules.md");
             }
 
-            println!("\nRTK configured for Google Antigravity.\n");
+            println!("\nContextCrawler configured for Google Antigravity.\n");
             println!("  Rules: .agents/rules/antigravity-rtk-rules.md (installed)");
         }
     }
@@ -1841,7 +1841,7 @@ fn run_hermes_mode_at(hermes_home: &Path, ctx: InitContext) -> Result<()> {
     if dry_run {
         print_dry_run_footer();
     } else {
-        println!("\nRTK configured for Hermes.\n");
+        println!("\nContextCrawler configured for Hermes.\n");
         println!("  Plugin: {}", plugin_dir.display());
         println!("  Config: {}", config_path.display());
         println!("  Hermes will now rewrite terminal commands through contextcrawler.");
@@ -1857,12 +1857,12 @@ pub fn uninstall_hermes(ctx: InitContext) -> Result<()> {
     let removed = uninstall_hermes_at(&hermes_home, ctx)?;
 
     if removed.is_empty() {
-        println!("RTK Hermes support was not installed (nothing to remove)");
+        println!("ContextCrawler Hermes support was not installed (nothing to remove)");
     } else {
         let header = if dry_run {
             "[dry-run] would uninstall RTK for Hermes CLI:"
         } else {
-            "RTK uninstalled for Hermes CLI:"
+            "ContextCrawler uninstalled for Hermes CLI:"
         };
         println!("{}", header);
         for item in removed {
@@ -2335,7 +2335,7 @@ fn run_codex_mode_with_paths(
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, ctx)?;
 
     if !dry_run {
-        println!("\nRTK configured for Codex CLI.\n");
+        println!("\nContextCrawler configured for Codex CLI.\n");
         println!("  RTK.md:    {}", rtk_md_path.display());
         if added_ref {
             println!("  AGENTS.md: {} reference added", rtk_md_ref);
@@ -2828,9 +2828,9 @@ fn install_cursor_hooks(ctx: InitContext) -> Result<()> {
         println!("  hooks.json: {}", hooks_json_path.display());
 
         if patched {
-            println!("  hooks.json: RTK preToolUse entry added");
+            println!("  hooks.json: ContextCrawler preToolUse entry added");
         } else {
-            println!("  hooks.json: RTK preToolUse entry already present");
+            println!("  hooks.json: ContextCrawler preToolUse entry already present");
         }
 
         println!("  Cursor reloads hooks.json automatically. Test with: git status\n");
@@ -2839,7 +2839,7 @@ fn install_cursor_hooks(ctx: InitContext) -> Result<()> {
     Ok(())
 }
 
-/// Patch ~/.cursor/hooks.json to add RTK preToolUse hook.
+/// Patch ~/.cursor/hooks.json to add ContextCrawler preToolUse hook.
 /// Returns true if the file was modified.
 fn patch_cursor_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
@@ -2896,7 +2896,7 @@ fn patch_cursor_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
     Ok(true)
 }
 
-/// Check if RTK preToolUse hook is already present in Cursor hooks.json
+/// Check if ContextCrawler preToolUse hook is already present in Cursor hooks.json
 /// Matches on legacy rtk-rewrite.sh path OR new `rtk hook cursor` command
 fn cursor_hook_already_present(root: &serde_json::Value) -> bool {
     let hooks = match root
@@ -2916,7 +2916,7 @@ fn cursor_hook_already_present(root: &serde_json::Value) -> bool {
     })
 }
 
-/// Insert RTK preToolUse entry into Cursor hooks.json
+/// Insert ContextCrawler preToolUse entry into Cursor hooks.json
 fn insert_cursor_hook_entry(root: &mut serde_json::Value) -> Result<()> {
     let root_obj = match root.as_object_mut() {
         Some(obj) => obj,
@@ -3068,7 +3068,7 @@ fn remove_cursor_hooks(ctx: InitContext) -> Result<Vec<String>> {
     Ok(removed)
 }
 
-/// Remove RTK preToolUse entry from Cursor hooks.json
+/// Remove ContextCrawler preToolUse entry from Cursor hooks.json
 /// Returns true if entry was found and removed
 /// Matches both legacy script path and new binary command
 fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
@@ -3108,7 +3108,7 @@ fn show_claude_config() -> Result<()> {
     let global_claude_md = claude_dir.join(CLAUDE_MD);
     let local_claude_md = PathBuf::from(CLAUDE_MD);
 
-    println!("rtk Configuration:\n");
+    println!("ContextCrawler Configuration:\n");
 
     // Check hook: prefer binary command detection, fall back to script file
     let settings_path = claude_dir.join(SETTINGS_JSON);
@@ -3223,7 +3223,7 @@ fn show_claude_config() -> Result<()> {
     if local_claude_md.exists() {
         let content = fs::read_to_string(&local_claude_md)?;
         if content.contains("rtk") {
-            println!("[ok] Local (./CLAUDE.md): rtk enabled");
+            println!("[ok] Local (./CLAUDE.md): ContextCrawler enabled");
         } else {
             println!("[--] Local (./CLAUDE.md): exists but ContextCrawler not configured");
         }
@@ -3402,9 +3402,11 @@ fn run_opencode_only_mode(ctx: InitContext) -> Result<()> {
 
 // ─── Gemini CLI support ───────────────────────────────────────────
 
-/// Gemini hook wrapper script — delegates to `rtk hook gemini`
+/// Gemini hook wrapper script — delegates to `contextcrawler hook gemini`.
+/// The exec target MUST match the installed binary name (`contextcrawler`),
+/// not the upstream `rtk` name. Users have only `contextcrawler` on PATH.
 const GEMINI_HOOK_SCRIPT: &str = r#"#!/bin/bash
-exec rtk hook gemini
+exec contextcrawler hook gemini
 "#;
 
 fn resolve_gemini_dir() -> Result<PathBuf> {
@@ -3673,12 +3675,15 @@ fn uninstall_gemini(ctx: InitContext) -> Result<Vec<String>> {
 
 // ── Copilot integration ─────────────────────────────────────
 
+// The `command` value MUST be `contextcrawler hook copilot`, not the
+// upstream `rtk hook copilot` — users have only `contextcrawler` on
+// PATH, and Copilot will silently fail to invoke a non-existent `rtk`.
 const COPILOT_HOOK_JSON: &str = r#"{
   "hooks": {
     "PreToolUse": [
       {
         "type": "command",
-        "command": "rtk hook copilot",
+        "command": "contextcrawler hook copilot",
         "cwd": ".",
         "timeout": 5
       }
@@ -3687,30 +3692,30 @@ const COPILOT_HOOK_JSON: &str = r#"{
 }
 "#;
 
-const COPILOT_INSTRUCTIONS: &str = r#"# RTK — Token-Optimized CLI
+const COPILOT_INSTRUCTIONS: &str = r#"# ContextCrawler — Token-Optimized CLI
 
-**rtk** is a CLI proxy that filters and compresses command outputs, saving 60-90% tokens.
+**contextcrawler** is a CLI proxy that filters and compresses command outputs, saving 60-90% tokens.
 
 ## Rule
 
-Always prefix shell commands with `rtk`:
+Always prefix shell commands with `contextcrawler`:
 
 ```bash
 # Instead of:              Use:
-git status                 rtk git status
-git log -10                rtk git log -10
-cargo test                 rtk cargo test
-docker ps                  rtk docker ps
-kubectl get pods           rtk kubectl pods
+git status                 contextcrawler git status
+git log -10                contextcrawler git log -10
+cargo test                 contextcrawler cargo test
+docker ps                  contextcrawler docker ps
+kubectl get pods           contextcrawler kubectl pods
 ```
 
 ## Meta commands (use directly)
 
 ```bash
-rtk gain              # Token savings dashboard
-rtk gain --history    # Per-command savings history
-rtk discover          # Find missed rtk opportunities
-rtk proxy <cmd>       # Run raw (no filtering) but track usage
+contextcrawler gain              # Token savings dashboard
+contextcrawler gain --history    # Per-command savings history
+contextcrawler discover          # Find missed contextcrawler opportunities
+contextcrawler proxy <cmd>       # Run raw (no filtering) but track usage
 ```
 "#;
 
