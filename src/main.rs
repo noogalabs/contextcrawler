@@ -1372,6 +1372,165 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
     }
 }
 
+/// SSRF block list for the `contextcrawler web` command.
+///
+/// Returns `Some(reason)` if the IP is in a range we refuse to fetch from.
+/// `None` means safe to proceed.
+///
+/// Covers:
+/// - Loopback (127.0.0.0/8, ::1)
+/// - Link-local (169.254.0.0/16, fe80::/10) — includes AWS / GCP / Azure
+///   metadata service at 169.254.169.254
+/// - Azure metadata at 168.63.129.16 (not link-local, special-cased)
+/// - Private RFC1918 (10/8, 172.16/12, 192.168/16) and ULA fc00::/7
+/// - Multicast and "unspecified" (0.0.0.0, ::)
+///
+/// Initial-host only. An attacker who controls public DNS that resolves to
+/// a private IP can still slip through via `--max-redirs`. The proper fix
+/// is per-redirect-hop validation which would replace curl with a Rust
+/// HTTP client we control end-to-end — tracked in docs/ROADMAP.md.
+fn web_ssrf_block_reason(ip: &std::net::IpAddr) -> Option<&'static str> {
+    use std::net::IpAddr;
+    if ip.is_loopback() {
+        return Some("loopback address");
+    }
+    if ip.is_unspecified() {
+        return Some("unspecified address (0.0.0.0 / ::)");
+    }
+    if ip.is_multicast() {
+        return Some("multicast address");
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            // Azure IMDS lives at a non-link-local public-looking address.
+            if v4.octets() == [168, 63, 129, 16] {
+                return Some("Azure metadata service");
+            }
+            if v4.is_link_local() {
+                // 169.254.0.0/16 — includes AWS / GCP IMDS 169.254.169.254.
+                return Some("link-local address (includes cloud metadata services)");
+            }
+            if v4.is_private() {
+                return Some("private RFC1918 address");
+            }
+            // 100.64.0.0/10 — carrier-grade NAT, treat as private.
+            let o = v4.octets();
+            if o[0] == 100 && (64..=127).contains(&o[1]) {
+                return Some("carrier-grade NAT (100.64.0.0/10)");
+            }
+            // 0.0.0.0/8 — "this network" reserved range. is_unspecified
+            // catches only 0.0.0.0 exactly; the rest of /8 (0.0.0.1 .. 0.255.255.255)
+            // is also blocked here. Codex review of the initial SSRF block flagged
+            // this as missing.
+            if o[0] == 0 {
+                return Some("\"this network\" reserved 0.0.0.0/8");
+            }
+            // 198.18.0.0/15 — RFC 2544 benchmark range. Unlikely legitimate target;
+            // historically used in network testing and pen-test labs.
+            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+                return Some("benchmark range 198.18.0.0/15 (RFC 2544)");
+            }
+            // 240.0.0.0/4 — future-use / experimental. No legitimate routable target
+            // exists in this range as of 2026.
+            if o[0] >= 240 && o[0] < 255 {
+                return Some("future-use 240.0.0.0/4 (RFC 1112)");
+            }
+            // Reserved / benchmark / documentation ranges. Not strictly
+            // SSRF-dangerous but unlikely to be a legitimate fetch target.
+            if v4.is_documentation() || v4.is_broadcast() {
+                return Some("reserved address (documentation/broadcast)");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            // ULA fc00::/7
+            if v6.octets()[0] & 0xfe == 0xfc {
+                return Some("unique-local IPv6 (fc00::/7)");
+            }
+            // Link-local fe80::/10
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return Some("link-local IPv6 (fe80::/10)");
+            }
+            // IPv4-mapped IPv6 — re-check as IPv4 so we catch ::ffff:10.0.0.1
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return web_ssrf_block_reason(&IpAddr::V4(v4));
+            }
+            None
+        }
+    }
+}
+
+/// Documented grep format flags that should run raw rather than go through
+/// rtk's filter. Short letters are matched anywhere inside a single-`-` bundle
+/// (e.g. `-c`, `-ci`, `-cE`). Long forms match exactly.
+fn grep_format_flag_present(args: &[String]) -> bool {
+    const LONG_FLAGS: &[&str] = &[
+        "--count",
+        "--files-with-matches",
+        "--files-without-match",
+        "--only-matching",
+        "--null",
+    ];
+    const SHORT_LETTERS: &[char] = &['c', 'L', 'o', 'Z'];
+
+    for arg in args {
+        if LONG_FLAGS.contains(&arg.as_str()) {
+            return true;
+        }
+        if arg.starts_with("--") || arg.len() < 2 || !arg.starts_with('-') {
+            continue;
+        }
+        let body = &arg[1..];
+        // Don't misread numeric/path-ish tokens like "-5" or "-3:foo".
+        if !body.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if body.chars().any(|c| SHORT_LETTERS.contains(&c)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the user's grep command through `rg` (ripgrep), bypassing clap and
+/// parse_failure tracking. We route through `rg` rather than bare `grep`
+/// because rg understands both the documented format flags (`-c`, `-L`, `-o`,
+/// `--null`, `--count`, `--files-with-matches`, etc.) AND the rtk-extra
+/// options the rtk-backed grep path accepts (`--glob`, `--type`/`-t`,
+/// `--include`). Falls back to system `grep` only if rg cannot be located.
+fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
+    let raw_command = args.join(" ");
+    let timer = core::tracking::TimedExecution::start();
+    let user_args = &args[1..];
+
+    // Prefer rg so mixed invocations like `grep -c --glob '*.rs' pat` keep
+    // working. If rg isn't on PATH, fall through to system grep.
+    let preferred = if which::which("rg").is_ok() { "rg" } else { "grep" };
+
+    let status = core::utils::resolved_command(preferred)
+        .args(user_args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) => {
+            timer.track_passthrough(
+                &raw_command,
+                &format!(
+                    "rtk grep (format-flag passthrough via {}): {}",
+                    preferred, raw_command
+                ),
+            );
+            Ok(core::utils::exit_code_from_status(&s, &raw_command))
+        }
+        Err(e) => {
+            eprintln!("[contextcrawler: {}]", e);
+            Ok(127)
+        }
+    }
+}
+
 fn main() {
     let code = match run_cli() {
         Ok(code) => code,
@@ -1404,9 +1563,114 @@ where
     }
 }
 
+
+#[cfg(test)]
+mod grep_format_flag_tests {
+    use super::grep_format_flag_present;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn short_c_triggers() {
+        assert!(grep_format_flag_present(&args(&["-c", "pattern", "file"])));
+    }
+
+    #[test]
+    fn short_L_triggers() {
+        assert!(grep_format_flag_present(&args(&["-L", "pattern", "file"])));
+    }
+
+    #[test]
+    fn short_o_triggers() {
+        assert!(grep_format_flag_present(&args(&["-o", "pattern", "file"])));
+    }
+
+    #[test]
+    fn short_Z_triggers() {
+        assert!(grep_format_flag_present(&args(&["-Z", "pattern"])));
+    }
+
+    #[test]
+    fn bundled_short_with_format_letter_triggers() {
+        assert!(grep_format_flag_present(&args(&["-ci", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&["-cE", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&["-cn", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&["-iLn", "pattern", "file"])));
+    }
+
+    #[test]
+    fn long_forms_trigger() {
+        assert!(grep_format_flag_present(&args(&["--count", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&[
+            "--files-with-matches",
+            "pattern",
+            "file"
+        ])));
+        assert!(grep_format_flag_present(&args(&[
+            "--files-without-match",
+            "pattern",
+            "file"
+        ])));
+        assert!(grep_format_flag_present(&args(&[
+            "--only-matching",
+            "pattern",
+            "file"
+        ])));
+        assert!(grep_format_flag_present(&args(&["--null", "pattern", "file"])));
+    }
+
+    #[test]
+    fn dash_l_alone_does_not_trigger() {
+        // -l is rtk's --max-len in this app; keep current behaviour.
+        assert!(!grep_format_flag_present(&args(&["-l", "80", "pattern", "file"])));
+    }
+
+    #[test]
+    fn normal_recursive_grep_does_not_trigger() {
+        assert!(!grep_format_flag_present(&args(&["-rn", "pattern", "src/"])));
+        assert!(!grep_format_flag_present(&args(&["-r", "-n", "pattern", "src/"])));
+        assert!(!grep_format_flag_present(&args(&["-i", "pattern", "file"])));
+    }
+
+    #[test]
+    fn numeric_dash_tokens_ignored() {
+        // e.g. `-5` as a context value or a stray number, not a flag bundle.
+        assert!(!grep_format_flag_present(&args(&["-5", "pattern"])));
+        assert!(!grep_format_flag_present(&args(&["-A", "3", "pattern"])));
+    }
+
+    #[test]
+    fn empty_args_ok() {
+        assert!(!grep_format_flag_present(&args(&[])));
+    }
+
+    #[test]
+    fn double_dash_unrelated_does_not_trigger() {
+        assert!(!grep_format_flag_present(&args(&["--include=*.rs", "pattern"])));
+    }
+}
+
 fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
+
+    // Pre-clap intercept: `grep` with documented format flags (-c, -L, -o, -Z and
+    // the listed long forms) routes straight to passthrough. Clap rejects these
+    // (e.g. -c is unknown) and recording a parse_failure for each one clutters
+    // the tracking DB without informing the user of anything actionable. See #13.
+    // Note: -l is intentionally NOT in this set — this app's clap claims -l for
+    // --max-len. Users wanting standard grep -l (list matching files) should use
+    // either --files-with-matches or `contextcrawler proxy grep -l ...`.
+    {
+        let raw_args: Vec<String> = std::env::args().skip(1).collect();
+        if raw_args.first().map(|s| s.as_str()) == Some("grep")
+            && grep_format_flag_present(&raw_args[1..])
+        {
+            return run_grep_format_passthrough(&raw_args);
+        }
+    }
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
