@@ -1,4 +1,4 @@
-//! Sets up RTK hooks so AI coding agents automatically route commands through RTK.
+//! Sets up ContextCrawler hooks so AI coding agents automatically route commands through ContextCrawler.
 
 use anyhow::{Context, Result};
 use std::ffi::OsString;
@@ -26,10 +26,11 @@ const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
 const RTK_SLIM_CODEX: &str = include_str!("../../hooks/codex/rtk-awareness.md");
 
-/// Template written by `rtk init` when no filters.toml exists yet.
-const FILTERS_TEMPLATE: &str = r#"# Project-local RTK filters — commit this file with your repo.
+/// Template written by `contextcrawler init` when no filters.toml exists yet.
+const FILTERS_TEMPLATE: &str = r#"# Project-local ContextCrawler filters — commit this file with your repo.
 # Filters here override user-global and built-in filters.
-# Docs: https://github.com/rtk-ai/rtk#custom-filters
+# Trust gate: run `contextcrawler trust` after editing.
+# Docs: https://github.com/thehoff/contextcrawler#custom-filters
 schema_version = 1
 
 # Example: suppress build noise from a custom tool
@@ -43,9 +44,10 @@ schema_version = 1
 "#;
 
 /// Template for user-global filters (~/.config/rtk/filters.toml).
-const FILTERS_GLOBAL_TEMPLATE: &str = r#"# User-global RTK filters — apply to all your projects.
+const FILTERS_GLOBAL_TEMPLATE: &str = r#"# User-global ContextCrawler filters — apply to all your projects.
 # Project-local .rtk/filters.toml takes precedence over these.
-# Docs: https://github.com/rtk-ai/rtk#custom-filters
+# Trust gate: run `contextcrawler trust --global` after editing.
+# Docs: https://github.com/thehoff/contextcrawler#custom-filters
 schema_version = 1
 
 # Example: suppress noise from a tool you use everywhere
@@ -101,127 +103,130 @@ fn print_dry_run_footer() {
 }
 
 // Legacy full instructions for backward compatibility (--claude-md mode)
-const RTK_INSTRUCTIONS: &str = r##"<!-- rtk-instructions v2 -->
-# RTK (Rust Token Killer) - Token-Optimized Commands
+const RTK_INSTRUCTIONS: &str = r##"<!-- rtk-instructions v3 -->
+# ContextCrawler — Token-Optimized Commands
 
 ## Golden Rule
 
-**Always prefix commands with `rtk`**. If RTK has a dedicated filter, it uses it. If not, it passes through unchanged. This means RTK is always safe to use.
+**Always prefix commands with `contextcrawler`**. If ContextCrawler has a dedicated filter, it uses it. If not, it passes through unchanged. This means ContextCrawler is always safe to use.
 
-**Important**: Even in command chains with `&&`, use `rtk`:
+**Important**: Even in command chains with `&&`, use `contextcrawler`:
 ```bash
 # ❌ Wrong
 git add . && git commit -m "msg" && git push
 
 # ✅ Correct
-rtk git add . && rtk git commit -m "msg" && rtk git push
+contextcrawler git add . && contextcrawler git commit -m "msg" && contextcrawler git push
 ```
 
-## RTK Commands by Workflow
+## ContextCrawler Commands by Workflow
 
 ### Build & Compile (80-90% savings)
 ```bash
-rtk cargo build         # Cargo build output
-rtk cargo check         # Cargo check output
-rtk cargo clippy        # Clippy warnings grouped by file (80%)
-rtk tsc                 # TypeScript errors grouped by file/code (83%)
-rtk lint                # ESLint/Biome violations grouped (84%)
-rtk prettier --check    # Files needing format only (70%)
-rtk next build          # Next.js build with route metrics (87%)
+contextcrawler cargo build         # Cargo build output
+contextcrawler cargo check         # Cargo check output
+contextcrawler cargo clippy        # Clippy warnings grouped by file (80%)
+contextcrawler tsc                 # TypeScript errors grouped by file/code (83%)
+contextcrawler lint                # ESLint/Biome violations grouped (84%)
+contextcrawler prettier --check    # Files needing format only (70%)
+contextcrawler next build          # Next.js build with route metrics (87%)
 ```
 
 ### Test (60-99% savings)
 ```bash
-rtk cargo test          # Cargo test failures only (90%)
-rtk go test             # Go test failures only (90%)
-rtk jest                # Jest failures only (99.5%)
-rtk vitest              # Vitest failures only (99.5%)
-rtk playwright test     # Playwright failures only (94%)
-rtk pytest              # Python test failures only (90%)
-rtk rake test           # Ruby test failures only (90%)
-rtk rspec               # RSpec test failures only (60%)
-rtk test <cmd>          # Generic test wrapper - failures only
+contextcrawler cargo test          # Cargo test failures only (90%)
+contextcrawler go test             # Go test failures only (90%)
+contextcrawler jest                # Jest failures only (99.5%)
+contextcrawler vitest              # Vitest failures only (99.5%)
+contextcrawler playwright test     # Playwright failures only (94%)
+contextcrawler pytest              # Python test failures only (90%)
+contextcrawler rake test           # Ruby test failures only (90%)
+contextcrawler rspec               # RSpec test failures only (60%)
+contextcrawler test <cmd>          # Generic test wrapper - failures only
 ```
 
 ### Git (59-80% savings)
 ```bash
-rtk git status          # Compact status
-rtk git log             # Compact log (works with all git flags)
-rtk git diff            # Compact diff (80%)
-rtk git show            # Compact show (80%)
-rtk git add             # Ultra-compact confirmations (59%)
-rtk git commit          # Ultra-compact confirmations (59%)
-rtk git push            # Ultra-compact confirmations
-rtk git pull            # Ultra-compact confirmations
-rtk git branch          # Compact branch list
-rtk git fetch           # Compact fetch
-rtk git stash           # Compact stash
-rtk git worktree        # Compact worktree
+contextcrawler git status          # Compact status
+contextcrawler git log             # Compact log (works with all git flags)
+contextcrawler git diff            # Compact diff (80%)
+contextcrawler git show            # Compact show (80%)
+contextcrawler git add             # Ultra-compact confirmations (59%)
+contextcrawler git commit          # Ultra-compact confirmations (59%)
+contextcrawler git push            # Ultra-compact confirmations
+contextcrawler git pull            # Ultra-compact confirmations
+contextcrawler git branch          # Compact branch list
+contextcrawler git fetch           # Compact fetch
+contextcrawler git stash           # Compact stash
+contextcrawler git worktree        # Compact worktree
 ```
 
 Note: Git passthrough works for ALL subcommands, even those not explicitly listed.
 
 ### GitHub (26-87% savings)
 ```bash
-rtk gh pr view <num>    # Compact PR view (87%)
-rtk gh pr checks        # Compact PR checks (79%)
-rtk gh run list         # Compact workflow runs (82%)
-rtk gh issue list       # Compact issue list (80%)
-rtk gh api              # Compact API responses (26%)
+contextcrawler gh pr view <num>    # Compact PR view (87%)
+contextcrawler gh pr checks        # Compact PR checks (79%)
+contextcrawler gh run list         # Compact workflow runs (82%)
+contextcrawler gh issue list       # Compact issue list (80%)
+contextcrawler gh api              # Compact API responses (26%)
 ```
 
 ### JavaScript/TypeScript Tooling (70-90% savings)
 ```bash
-rtk pnpm list           # Compact dependency tree (70%)
-rtk pnpm outdated       # Compact outdated packages (80%)
-rtk pnpm install        # Compact install output (90%)
-rtk npm run <script>    # Compact npm script output
-rtk npx <cmd>           # Compact npx command output
-rtk prisma              # Prisma without ASCII art (88%)
+contextcrawler pnpm list           # Compact dependency tree (70%)
+contextcrawler pnpm outdated       # Compact outdated packages (80%)
+contextcrawler pnpm install        # Compact install output (90%)
+contextcrawler npm run <script>    # Compact npm script output
+contextcrawler npx <cmd>           # Compact npx command output
+contextcrawler prisma              # Prisma without ASCII art (88%)
 ```
 
 ### Files & Search (60-75% savings)
 ```bash
-rtk ls <path>           # Tree format, compact (65%)
-rtk read <file>         # Code reading with filtering (60%)
-rtk grep <pattern>      # Search grouped by file (75%). Format flags (-c, -l, -L, -o, -Z) run raw.
-rtk find <pattern>      # Find grouped by directory (70%)
+contextcrawler ls <path>           # Tree format, compact (65%)
+contextcrawler read <file>         # Code reading with filtering (60%)
+contextcrawler grep <pattern>      # Search grouped by file (75%). Format flags (-c, -l, -L, -o, -Z) run raw.
+contextcrawler find <pattern>      # Find grouped by directory (70%)
 ```
 
 ### Analysis & Debug (70-90% savings)
 ```bash
-rtk err <cmd>           # Filter errors only from any command
-rtk log <file>          # Deduplicated logs with counts
-rtk json <file>         # JSON structure without values
-rtk deps                # Dependency overview
-rtk env                 # Environment variables compact
-rtk summary <cmd>       # Smart summary of command output
-rtk diff                # Ultra-compact diffs
+contextcrawler err <cmd>           # Filter errors only from any command
+contextcrawler log <file>          # Deduplicated logs with counts
+contextcrawler json <file>         # JSON structure without values
+contextcrawler deps                # Dependency overview
+contextcrawler env                 # Environment variables compact
+contextcrawler summary <cmd>       # Smart summary of command output
+contextcrawler diff                # Ultra-compact diffs
 ```
 
 ### Infrastructure (85% savings)
 ```bash
-rtk docker ps           # Compact container list
-rtk docker images       # Compact image list
-rtk docker logs <c>     # Deduplicated logs
-rtk kubectl get         # Compact resource list
-rtk kubectl logs        # Deduplicated pod logs
+contextcrawler docker ps           # Compact container list
+contextcrawler docker images       # Compact image list
+contextcrawler docker logs <c>     # Deduplicated logs
+contextcrawler kubectl get         # Compact resource list
+contextcrawler kubectl logs        # Deduplicated pod logs
 ```
 
 ### Network (65-70% savings)
 ```bash
-rtk curl <url>          # Compact HTTP responses (70%)
-rtk wget <url>          # Compact download output (65%)
+contextcrawler curl <url>          # Compact HTTP responses (70%)
+contextcrawler wget <url>          # Compact download output (65%)
+contextcrawler web <url>           # Defuddle-extracted readable HTML
 ```
 
 ### Meta Commands
 ```bash
-rtk gain                # View token savings statistics
-rtk gain --history      # View command history with savings
-rtk discover            # Analyze Claude Code sessions for missed RTK usage
-rtk proxy <cmd>         # Run command without filtering (for debugging)
-rtk init                # Add RTK instructions to CLAUDE.md
-rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
+contextcrawler gain                # View token savings statistics
+contextcrawler gain --history      # View command history with savings
+contextcrawler discover            # Analyze Claude Code sessions for missed opportunities
+contextcrawler proxy <cmd>         # Run command without filtering (for debugging)
+contextcrawler init                # Add ContextCrawler instructions to CLAUDE.md
+contextcrawler init --global       # Add ContextCrawler to ~/.claude/CLAUDE.md
+contextcrawler trust               # Trust project-local TOML filters
+contextcrawler trust --global      # Trust user-global TOML filters
 ```
 
 ## Token Savings Overview
@@ -235,13 +240,13 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 | Package Managers | pnpm, npm, npx | 70-90% |
 | Files | ls, read, grep, find | 60-75% |
 | Infrastructure | docker, kubectl | 85% |
-| Network | curl, wget | 65-70% |
+| Network | curl, wget, web | 65-70% |
 
 Overall average: **60-90% token reduction** on common development operations.
 <!-- /rtk-instructions -->
 "##;
 
-/// Main entry point for `rtk init`
+/// Main entry point for `contextcrawler init`
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     global: bool,
@@ -278,15 +283,15 @@ pub fn run(
     } else {
         // Validation: Global-only features
         if install_opencode && !global {
-            anyhow::bail!("OpenCode plugin is global-only. Use: rtk init -g --opencode");
+            anyhow::bail!("OpenCode plugin is global-only. Use: contextcrawler init -g --opencode");
         }
 
         if install_cursor && !global {
-            anyhow::bail!("Cursor hooks are global-only. Use: rtk init -g --agent cursor");
+            anyhow::bail!("Cursor hooks are global-only. Use: contextcrawler init -g --agent cursor");
         }
 
         if install_windsurf && !global {
-            anyhow::bail!("Windsurf support is global-only. Use: rtk init -g --agent windsurf");
+            anyhow::bail!("Windsurf support is global-only. Use: contextcrawler init -g --agent windsurf");
         }
 
         if install_windsurf {
@@ -542,7 +547,7 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
     pre_tool_use_array.len() < original_len
 }
 
-/// Remove RTK hook from settings.json file
+/// Remove ContextCrawler hook from settings.json file
 /// Backs up before modification, returns true if hook was found and removed
 fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
@@ -571,7 +576,7 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
     if removed {
         if dry_run {
             println!(
-                "[dry-run] would remove RTK hook entry from {}",
+                "[dry-run] would remove ContextCrawler hook entry from {}",
                 settings_path.display()
             );
             if verbose > 0 {
@@ -593,7 +598,7 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
         atomic_write(&settings_path, &serialized)?;
 
         if verbose > 0 {
-            eprintln!("Removed RTK hook from settings.json");
+            eprintln!("Removed ContextCrawler hook from settings.json");
         }
     }
 
@@ -782,7 +787,7 @@ pub fn uninstall(
 
     // 4. Remove hook entry from settings.json
     if remove_hook_from_settings(ctx)? {
-        removed.push("settings.json: removed RTK hook entry".to_string());
+        removed.push("settings.json: removed ContextCrawler hook entry".to_string());
     }
 
     // 5. Remove OpenCode plugin
@@ -906,7 +911,7 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
     Ok(removed)
 }
 
-/// Orchestrator: patch settings.json with RTK hook (binary command variant)
+/// Orchestrator: patch settings.json with ContextCrawler hook (binary command variant)
 /// Handles reading, checking, prompting, merging, backing up, and atomic writing
 fn patch_settings_json_command(
     hook_command: &str,
@@ -1039,7 +1044,7 @@ fn clean_double_blanks(content: &str) -> String {
     result.join("\n")
 }
 
-/// Deep-merge RTK hook entry into settings.json
+/// Deep-merge ContextCrawler hook entry into settings.json
 /// Creates hooks.PreToolUse structure if missing, preserves existing hooks
 fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result<()> {
     let root_obj = match root.as_object_mut() {
@@ -1072,7 +1077,7 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
     Ok(())
 }
 
-/// Check if RTK hook is already present in settings.json
+/// Check if ContextCrawler hook is already present in settings.json
 /// Matches on legacy rtk-rewrite.sh path OR new `rtk hook claude` command
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
     let pre_tool_use_array = match root
@@ -1132,7 +1137,7 @@ fn run_default_mode(
 
     // 4. Print success message (skip in dry-run)
     if !dry_run {
-        println!("\nRTK hook registered (global).\n");
+        println!("\nContextCrawler hook registered (global).\n");
         println!("  Command:   {}", CLAUDE_HOOK_COMMAND);
         println!("  RTK.md:    {} (10 lines)", rtk_md_path.display());
         if let Some(path) = &opencode_plugin_path {
@@ -1419,7 +1424,7 @@ fn run_hook_only_mode(
     };
 
     if !dry_run {
-        println!("\nRTK hook registered (hook-only mode).\n");
+        println!("\nContextCrawler hook registered (hook-only mode).\n");
         println!("  Command: {}", CLAUDE_HOOK_COMMAND);
         if let Some(path) = &opencode_plugin_path {
             println!("  OpenCode: {}", path.display());
@@ -1533,9 +1538,9 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
 
                 eprintln!("    Action: Manually remove the incomplete block, then re-run:");
                 if global {
-                    eprintln!("            rtk init -g --claude-md");
+                    eprintln!("            contextcrawler init -g --claude-md");
                 } else {
-                    eprintln!("            rtk init --claude-md");
+                    eprintln!("            contextcrawler init --claude-md");
                 }
                 return Ok(());
             }
@@ -1562,10 +1567,10 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
             }
         }
         if !dry_run {
-            println!("   Claude Code will now use rtk in all sessions");
+            println!("   Claude Code will now use contextcrawler in all sessions");
         }
     } else if !dry_run {
-        println!("   Claude Code will use rtk in this project");
+        println!("   Claude Code will use contextcrawler in this project");
     }
 
     Ok(())
@@ -1589,7 +1594,7 @@ fn run_cline_mode(ctx: InitContext) -> Result<()> {
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
         if !dry_run {
-            println!("\nRTK already configured for Cline in this project.\n");
+            println!("\nContextCrawler already configured for Cline in this project.\n");
             println!("  Rules: .clinerules (already present)");
         }
     } else {
@@ -1618,7 +1623,7 @@ fn run_cline_mode(ctx: InitContext) -> Result<()> {
         }
     }
     if !dry_run {
-        println!("  Cline will now use rtk commands for token savings.");
+        println!("  Cline will now use contextcrawler commands for token savings.");
         println!("  Test with: git status\n");
     }
 
@@ -1634,7 +1639,7 @@ fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
         if !dry_run {
-            println!("\nRTK already configured for Windsurf in this project.\n");
+            println!("\nContextCrawler already configured for Windsurf in this project.\n");
             println!("  Rules: .windsurfrules (already present)");
         }
     } else {
@@ -1663,7 +1668,7 @@ fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
         }
     }
     if !dry_run {
-        println!("  Cascade will now use rtk commands for token savings.");
+        println!("  Cascade will now use contextcrawler commands for token savings.");
         println!("  Restart Windsurf. Test with: git status\n");
     }
 
@@ -1687,7 +1692,7 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
         if !dry_run {
-            println!("\nRTK already configured for Kilo Code in this project.\n");
+            println!("\nContextCrawler already configured for Kilo Code in this project.\n");
             println!("  Rules: .kilocode/rules/rtk-rules.md (already present)");
         }
     } else {
@@ -1721,7 +1726,7 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
     if dry_run {
         print_dry_run_footer();
     } else {
-        println!("  Kilo Code will now use rtk commands for token savings.");
+        println!("  Kilo Code will now use contextcrawler commands for token savings.");
         println!("  Test with: git status\n");
     }
 
@@ -1745,7 +1750,7 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
     let existing = fs::read_to_string(&rules_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
         if !dry_run {
-            println!("\nRTK already configured for Antigravity in this project.\n");
+            println!("\nContextCrawler already configured for Antigravity in this project.\n");
             println!("  Rules: .agents/rules/antigravity-rtk-rules.md (already present)");
         }
     } else {
@@ -1778,7 +1783,7 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
     if dry_run {
         print_dry_run_footer();
     } else {
-        println!("  Antigravity will now use rtk commands for token savings.");
+        println!("  Antigravity will now use contextcrawler commands for token savings.");
         println!("  Test with: git status\n");
     }
 
@@ -1839,7 +1844,7 @@ fn run_hermes_mode_at(hermes_home: &Path, ctx: InitContext) -> Result<()> {
         println!("\nRTK configured for Hermes.\n");
         println!("  Plugin: {}", plugin_dir.display());
         println!("  Config: {}", config_path.display());
-        println!("  Hermes will now rewrite terminal commands through rtk.");
+        println!("  Hermes will now rewrite terminal commands through contextcrawler.");
         println!("  Restart Hermes. Test with: git status\n");
     }
 
@@ -2653,7 +2658,7 @@ fn remove_rtk_block(content: &str) -> (String, bool) {
         }
 
         eprintln!("    Action: Manually remove the incomplete block, then re-run:");
-        eprintln!("            rtk init -g");
+        eprintln!("            contextcrawler init -g");
         (content.to_string(), false)
     } else {
         (content.to_string(), false)
@@ -2854,7 +2859,7 @@ fn patch_cursor_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
     // Check idempotency
     if cursor_hook_already_present(&root) {
         if verbose > 0 {
-            eprintln!("Cursor hooks.json: RTK hook already present");
+            eprintln!("Cursor hooks.json: ContextCrawler hook already present");
         }
         return Ok(false);
     }
@@ -3051,7 +3056,7 @@ fn remove_cursor_hooks(ctx: InitContext) -> Result<Vec<String>> {
                         atomic_write(&hooks_json_path, &serialized)?;
 
                         if verbose > 0 {
-                            eprintln!("Removed RTK hook from Cursor hooks.json");
+                            eprintln!("Removed ContextCrawler hook from Cursor hooks.json");
                         }
                     }
                     removed.push("Cursor hooks.json: removed RTK entry".to_string());
@@ -3141,12 +3146,12 @@ fn show_claude_config() -> Result<()> {
                 );
             } else if !is_thin_delegator {
                 println!(
-                    "[warn] Hook: {} (outdated — run `rtk init -g` to upgrade to native binary)",
+                    "[warn] Hook: {} (outdated — run `contextcrawler init -g` to upgrade to native binary)",
                     hook_path.display()
                 );
             } else if is_executable && has_guards {
                 println!(
-                    "[warn] Hook: {} (legacy script v{} — run `rtk init -g` to upgrade)",
+                    "[warn] Hook: {} (legacy script v{} — run `contextcrawler init -g` to upgrade)",
                     hook_path.display(),
                     hook_version
                 );
@@ -3161,7 +3166,7 @@ fn show_claude_config() -> Result<()> {
         #[cfg(not(unix))]
         {
             println!(
-                "[warn] Hook: {} (legacy script — run `rtk init -g` to upgrade)",
+                "[warn] Hook: {} (legacy script — run `contextcrawler init -g` to upgrade)",
                 hook_path.display()
             );
         }
@@ -3183,10 +3188,10 @@ fn show_claude_config() -> Result<()> {
                 println!("[ok] Integrity: hook hash verified");
             }
             Ok(integrity::IntegrityStatus::Tampered { .. }) => {
-                println!("[FAIL] Integrity: hook modified outside rtk init (run: rtk verify)");
+                println!("[FAIL] Integrity: hook modified outside contextcrawler init (run: contextcrawler verify)");
             }
             Ok(integrity::IntegrityStatus::NoBaseline) => {
-                println!("[warn] Integrity: no baseline hash (run: rtk init -g to establish)");
+                println!("[warn] Integrity: no baseline hash (run: contextcrawler init -g to establish)");
             }
             Ok(integrity::IntegrityStatus::NotInstalled)
             | Ok(integrity::IntegrityStatus::OrphanedHash) => {
@@ -3205,10 +3210,10 @@ fn show_claude_config() -> Result<()> {
             println!("[ok] Global (~/.claude/CLAUDE.md): @RTK.md reference");
         } else if content.contains(RTK_BLOCK_START) {
             println!(
-                "[warn] Global (~/.claude/CLAUDE.md): old RTK block (run: rtk init -g to migrate)"
+                "[warn] Global (~/.claude/CLAUDE.md): old RTK block (run: contextcrawler init -g to migrate)"
             );
         } else {
-            println!("[--] Global (~/.claude/CLAUDE.md): exists but rtk not configured");
+            println!("[--] Global (~/.claude/CLAUDE.md): exists but ContextCrawler not configured");
         }
     } else {
         println!("[--] Global (~/.claude/CLAUDE.md): not found");
@@ -3220,7 +3225,7 @@ fn show_claude_config() -> Result<()> {
         if content.contains("rtk") {
             println!("[ok] Local (./CLAUDE.md): rtk enabled");
         } else {
-            println!("[--] Local (./CLAUDE.md): exists but rtk not configured");
+            println!("[--] Local (./CLAUDE.md): exists but ContextCrawler not configured");
         }
     } else {
         println!("[--] Local (./CLAUDE.md): not found");
@@ -3232,10 +3237,10 @@ fn show_claude_config() -> Result<()> {
         if !content.trim().is_empty() {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
                 if hook_already_present(&root, CLAUDE_HOOK_COMMAND) {
-                    println!("[ok] settings.json: RTK hook configured");
+                    println!("[ok] settings.json: ContextCrawler hook configured");
                 } else {
-                    println!("[warn] settings.json: exists but RTK hook not configured");
-                    println!("    Run: rtk init -g --auto-patch");
+                    println!("[warn] settings.json: exists but ContextCrawler hook not configured");
+                    println!("    Run: contextcrawler init -g --auto-patch");
                 }
             } else {
                 println!("[warn] settings.json: exists but invalid JSON");
@@ -3294,7 +3299,7 @@ fn show_claude_config() -> Result<()> {
                     );
                 } else {
                     println!(
-                        "[warn] Cursor hook: {} (legacy script — run `rtk init -g --agent cursor` to upgrade)",
+                        "[warn] Cursor hook: {} (legacy script — run `contextcrawler init -g --agent cursor` to upgrade)",
                         cursor_hook.display()
                     );
                 }
@@ -3302,7 +3307,7 @@ fn show_claude_config() -> Result<()> {
 
             #[cfg(not(unix))]
             {
-                println!("[warn] Cursor hook: {} (legacy script — run `rtk init -g --agent cursor` to upgrade)", cursor_hook.display());
+                println!("[warn] Cursor hook: {} (legacy script — run `contextcrawler init -g --agent cursor` to upgrade)", cursor_hook.display());
             }
         } else {
             println!("[--] Cursor hook: not found");
@@ -3312,17 +3317,17 @@ fn show_claude_config() -> Result<()> {
     }
 
     println!("\nUsage:");
-    println!("  rtk init              # Full injection into local CLAUDE.md");
-    println!("  rtk init -g           # Hook + RTK.md + @RTK.md + settings.json (recommended)");
-    println!("  rtk init -g --auto-patch    # Same as above but no prompt");
-    println!("  rtk init -g --no-patch      # Skip settings.json (manual setup)");
-    println!("  rtk init -g --uninstall     # Remove all RTK artifacts");
-    println!("  rtk init -g --claude-md     # Legacy: full injection into ~/.claude/CLAUDE.md");
-    println!("  rtk init -g --hook-only     # Hook only, no RTK.md");
-    println!("  rtk init --codex            # Configure local AGENTS.md + RTK.md");
-    println!("  rtk init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
-    println!("  rtk init -g --opencode      # OpenCode plugin only");
-    println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks");
+    println!("  contextcrawler init        # Full injection into local CLAUDE.md");
+    println!("  contextcrawler init -g     # Hook + RTK.md + @RTK.md + settings.json (recommended)");
+    println!("  contextcrawler init -g --auto-patch    # Same as above but no prompt");
+    println!("  contextcrawler init -g --no-patch # Skip settings.json (manual setup)");
+    println!("  contextcrawler init -g --uninstall # Remove all ContextCrawler artifacts");
+    println!("  contextcrawler init -g --claude-md     # Legacy: full injection into ~/.claude/CLAUDE.md");
+    println!("  contextcrawler init -g --hook-only # Hook only, no RTK.md");
+    println!("  contextcrawler init --codex      # Configure local AGENTS.md + RTK.md");
+    println!("  contextcrawler init -g --codex   # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
+    println!("  contextcrawler init -g --opencode      # OpenCode plugin only");
+    println!("  contextcrawler init -g --agent cursor  # Install Cursor Agent hooks");
 
     Ok(())
 }
@@ -3335,7 +3340,7 @@ fn show_codex_config() -> Result<()> {
     let local_agents_md = PathBuf::from(AGENTS_MD);
     let local_rtk_md = PathBuf::from(RTK_MD);
 
-    println!("rtk Configuration (Codex CLI):\n");
+    println!("ContextCrawler Configuration (Codex CLI):\n");
 
     if global_rtk_md.exists() {
         println!("[ok] Global RTK.md: {}", global_rtk_md.display());
@@ -3350,7 +3355,7 @@ fn show_codex_config() -> Result<()> {
         } else if content.contains(RTK_BLOCK_START) {
             println!("[!!] Global AGENTS.md: old inline RTK block");
         } else {
-            println!("[--] Global AGENTS.md: exists but rtk not configured");
+            println!("[--] Global AGENTS.md: exists but ContextCrawler not configured");
         }
     } else {
         println!("[--] Global AGENTS.md: not found");
@@ -3369,16 +3374,16 @@ fn show_codex_config() -> Result<()> {
         } else if content.contains(RTK_BLOCK_START) {
             println!("[!!] Local AGENTS.md: old inline RTK block");
         } else {
-            println!("[--] Local AGENTS.md: exists but rtk not configured");
+            println!("[--] Local AGENTS.md: exists but ContextCrawler not configured");
         }
     } else {
         println!("[--] Local AGENTS.md: not found");
     }
 
     println!("\nUsage:");
-    println!("  rtk init --codex              # Configure local AGENTS.md + RTK.md");
-    println!("  rtk init -g --codex           # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
-    println!("  rtk init -g --codex --uninstall  # Remove global Codex RTK artifacts");
+    println!("  contextcrawler init --codex     # Configure local AGENTS.md + RTK.md");
+    println!("  contextcrawler init -g --codex  # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
+    println!("  contextcrawler init -g --codex --uninstall  # Remove global Codex RTK artifacts");
 
     Ok(())
 }
@@ -3415,7 +3420,7 @@ pub fn run_gemini(
 ) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     if !global {
-        anyhow::bail!("Gemini support is global-only. Use: rtk init -g --gemini");
+        anyhow::bail!("Gemini support is global-only. Use: contextcrawler init -g --gemini");
     }
 
     let gemini_dir = resolve_gemini_dir()?;
@@ -3653,7 +3658,7 @@ fn uninstall_gemini(ctx: InitContext) -> Result<Vec<String>> {
                         let new_content = serde_json::to_string_pretty(&settings)?;
                         fs::write(&settings_path, new_content)?;
                     }
-                    removed.push("Gemini settings.json: removed RTK hook entry".to_string());
+                    removed.push("Gemini settings.json: removed ContextCrawler hook entry".to_string());
                 }
             }
         }
@@ -3755,21 +3760,21 @@ mod tests {
     #[test]
     fn test_init_mentions_all_top_level_commands() {
         for cmd in [
-            "rtk cargo",
-            "rtk gh",
-            "rtk vitest",
-            "rtk tsc",
-            "rtk lint",
-            "rtk prettier",
-            "rtk next",
-            "rtk playwright",
-            "rtk prisma",
-            "rtk pnpm",
-            "rtk npm",
-            "rtk curl",
-            "rtk git",
-            "rtk docker",
-            "rtk kubectl",
+            "contextcrawler cargo",
+            "contextcrawler gh",
+            "contextcrawler vitest",
+            "contextcrawler tsc",
+            "contextcrawler lint",
+            "contextcrawler prettier",
+            "contextcrawler next",
+            "contextcrawler playwright",
+            "contextcrawler prisma",
+            "contextcrawler pnpm",
+            "contextcrawler npm",
+            "contextcrawler curl",
+            "contextcrawler git",
+            "contextcrawler docker",
+            "contextcrawler kubectl",
         ] {
             assert!(
                 RTK_INSTRUCTIONS.contains(cmd),
@@ -3864,7 +3869,7 @@ mod tests {
     fn test_claude_md_mode_creates_full_injection() {
         // Just verify RTK_INSTRUCTIONS constant has the right content
         assert!(RTK_INSTRUCTIONS.contains(RTK_BLOCK_START));
-        assert!(RTK_INSTRUCTIONS.contains("rtk cargo test"));
+        assert!(RTK_INSTRUCTIONS.contains("contextcrawler cargo test"));
         assert!(RTK_INSTRUCTIONS.contains(RTK_BLOCK_END));
         assert!(RTK_INSTRUCTIONS.len() > 4000);
     }
@@ -3890,7 +3895,7 @@ mod tests {
         let (content, action) = upsert_rtk_block(&input, RTK_INSTRUCTIONS);
         assert_eq!(action, RtkBlockUpsert::Updated);
         assert!(!content.contains("OLD RTK CONTENT"));
-        assert!(content.contains("rtk cargo test")); // from current RTK_INSTRUCTIONS
+        assert!(content.contains("contextcrawler cargo test")); // from current RTK_INSTRUCTIONS
         assert!(content.contains("# Team instructions"));
         assert!(content.contains("More notes"));
     }
