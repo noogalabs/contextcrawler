@@ -873,11 +873,92 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
     let mut removed = Vec::new();
     let absolute_rtk_md_ref = codex_rtk_md_ref(codex_dir);
 
-    // Remove the canonical file AND any legacy variants (e.g. RTK.md left // branding-lint: allow legacy
-    // behind by the regressed bcddd06 commit). Without the legacy sweep here,
-    // a user who runs `init` while still on a regressed install gets the
-    // orphan file cleaned up, but a user who jumps straight to `uninstall`
-    // would be left with stranded artifacts. See codex review on #19.
+    // ORDER MATTERS (issue #26): patch AGENTS.md FIRST, delete files SECOND.
+    //
+    // The previous order (delete → patch) left users with an inconsistent
+    // install if the patch failed: files gone but AGENTS.md still importing
+    // them. Codex then logged warnings on every load AND uninstall couldn't
+    // be re-run cleanly because the helper tried to delete files that were
+    // already gone. The new order has only two failure shapes:
+    //   - patch fails    → nothing removed, safe to rerun
+    //   - patch succeeds → both phases complete (AGENTS.md update is the
+    //                       expensive/contended step; file deletes after
+    //                       are nearly always trivial)
+    //
+    // Both AGENTS.md mutations (block removal + @-reference strip) are
+    // collapsed into ONE read + ONE atomic_write to avoid a half-mutated
+    // intermediate state between the two operations.
+
+    let agents_md_path = codex_dir.join(AGENTS_MD);
+    let mut refs_to_strip: Vec<String> = vec![
+        RTK_MD_REF.to_string(),
+        absolute_rtk_md_ref.clone(),
+    ];
+    for legacy in LEGACY_RTK_MD_FILES {
+        refs_to_strip.push(format!("@{}", legacy));
+        refs_to_strip.push(format!("@{}", codex_dir.join(legacy).display()));
+    }
+    let refs_borrowed: Vec<&str> = refs_to_strip.iter().map(|s| s.as_str()).collect();
+
+    if agents_md_path.exists() {
+        let content = fs::read_to_string(&agents_md_path)
+            .with_context(|| format!("Failed to read AGENTS.md: {}", agents_md_path.display()))?;
+
+        // Apply BOTH mutations in-memory before any disk write.
+        let mut working_content = content.clone();
+        let mut block_removed = false;
+        let mut ref_removed = false;
+
+        if working_content.contains(RTK_BLOCK_START) {
+            let (cleaned, did_remove) = remove_rtk_block(&working_content);
+            if did_remove {
+                working_content = cleaned;
+                block_removed = true;
+            }
+        }
+
+        if has_rtk_reference(&working_content, &refs_borrowed) {
+            let new_content = working_content
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !refs_borrowed.contains(&trimmed)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            working_content = clean_double_blanks(&new_content);
+            ref_removed = true;
+        }
+
+        let changed = block_removed || ref_removed;
+        if changed && working_content != content {
+            if dry_run {
+                println!(
+                    "[dry-run] would update AGENTS.md: {}",
+                    agents_md_path.display()
+                );
+                if verbose > 0 {
+                    println!("[dry-run] new content:\n{}", working_content);
+                }
+            } else {
+                atomic_write(&agents_md_path, &working_content).with_context(|| {
+                    format!("Failed to write AGENTS.md: {}", agents_md_path.display())
+                })?;
+            }
+            if block_removed {
+                removed.push("AGENTS.md: removed rtk-instructions block".to_string());
+            }
+            if ref_removed {
+                removed.push("AGENTS.md: removed @CONTEXTCRAWLER.md reference".to_string());
+            }
+        }
+    }
+
+    // AGENTS.md patch succeeded (or was unnecessary). Now safe to delete
+    // the canonical file AND any legacy variants. If a delete fails
+    // mid-loop, the earlier removes still count as removed — but AGENTS.md
+    // is already in its final state so the user can re-run `uninstall`
+    // safely; the remaining files will be retried.
     let candidate_files: Vec<&str> = std::iter::once(RTK_MD)
         .chain(LEGACY_RTK_MD_FILES.iter().copied())
         .collect();
@@ -896,46 +977,6 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
             }
             removed.push(format!("{}: {}", filename, file_path.display()));
         }
-    }
-
-    let agents_md_path = codex_dir.join(AGENTS_MD);
-    if agents_md_path.exists() {
-        let content = fs::read_to_string(&agents_md_path)
-            .with_context(|| format!("Failed to read AGENTS.md: {}", agents_md_path.display()))?;
-
-        let mut working_content = content.clone();
-        let mut agents_changed = false;
-
-        if working_content.contains(RTK_BLOCK_START) {
-            let (cleaned, did_remove) = remove_rtk_block(&working_content);
-            if did_remove {
-                working_content = cleaned;
-                agents_changed = true;
-                removed.push("AGENTS.md: removed rtk-instructions block".to_string());
-            }
-        }
-
-        if agents_changed {
-            atomic_write(&agents_md_path, &working_content).with_context(|| {
-                format!("Failed to write AGENTS.md: {}", agents_md_path.display())
-            })?;
-        }
-    }
-
-    // Build the set of references to strip: canonical (relative + absolute)
-    // plus every legacy filename in both forms. Hands the full set to one
-    // call so the helper can do a single read/write.
-    let mut refs_to_strip: Vec<String> = vec![
-        RTK_MD_REF.to_string(),
-        absolute_rtk_md_ref.clone(),
-    ];
-    for legacy in LEGACY_RTK_MD_FILES {
-        refs_to_strip.push(format!("@{}", legacy));
-        refs_to_strip.push(format!("@{}", codex_dir.join(legacy).display()));
-    }
-    let refs_borrowed: Vec<&str> = refs_to_strip.iter().map(|s| s.as_str()).collect();
-    if remove_rtk_reference_from_agents(&agents_md_path, &refs_borrowed, ctx)? {
-        removed.push("AGENTS.md: removed @CONTEXTCRAWLER.md reference".to_string());
     }
 
     Ok(removed)
@@ -2664,51 +2705,11 @@ fn has_rtk_reference(content: &str, refs: &[&str]) -> bool {
         .any(|line| refs.contains(&line))
 }
 
-fn remove_rtk_reference_from_agents(path: &Path, refs: &[&str], ctx: InitContext) -> Result<bool> {
-    let InitContext { verbose, dry_run } = ctx;
-    if !path.exists() {
-        return Ok(false);
-    }
-
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read AGENTS.md: {}", path.display()))?;
-    if !has_rtk_reference(&content, refs) {
-        return Ok(false);
-    }
-
-    let new_content = content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !refs.contains(&trimmed)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let cleaned = clean_double_blanks(&new_content);
-
-    if dry_run {
-        println!(
-            "[dry-run] would remove CONTEXTCRAWLER.md reference from AGENTS.md: {}",
-            path.display()
-        );
-        if verbose > 0 {
-            println!("[dry-run] content:\n{}", cleaned);
-        }
-        return Ok(true);
-    }
-
-    atomic_write(path, &cleaned)
-        .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
-
-    if verbose > 0 {
-        eprintln!(
-            "Removed CONTEXTCRAWLER.md reference from AGENTS.md: {}",
-            path.display()
-        );
-    }
-
-    Ok(true)
-}
+// `remove_rtk_reference_from_agents` was inlined into `uninstall_codex_at`
+// for issue #26 (transactional safety — combine block + ref removal into
+// one atomic write before any file deletion). The standalone helper has no
+// other callers and was removed; the body lives at the bottom of
+// `uninstall_codex_at` and is exercised by the same tests.
 
 /// Remove old RTK block from CLAUDE.md (migration helper)
 fn remove_rtk_block(content: &str) -> (String, bool) {
@@ -5178,6 +5179,66 @@ mod tests {
         assert!(content.contains("# Team rules"));
         assert!(content.contains("More content"));
         assert!(removed.iter().any(|r| r.contains("rtk-instructions block")));
+    }
+
+    #[test]
+    fn test_uninstall_codex_at_patches_agents_md_before_deleting_files() {
+        // REGRESSION (issue #26). The previous order was delete-then-patch:
+        // if the AGENTS.md patch failed (filesystem full, permission flip,
+        // signal during write), the user was left with CONTEXTCRAWLER.md
+        // gone but AGENTS.md still importing it → Codex warned on every
+        // load AND re-running uninstall failed (delete of missing file).
+        //
+        // The fix collapses BOTH AGENTS.md mutations into one atomic_write,
+        // then deletes files only after the patch succeeds. This test pins
+        // the success-path behaviour AND the ordering invariant: it loads
+        // a fixture where AGENTS.md has both a block AND a separate @-ref
+        // line, runs uninstall, and asserts:
+        //   1. AGENTS.md ends up clean (both mutations applied)
+        //   2. CONTEXTCRAWLER.md was deleted
+        //   3. The `removed` list contains entries for both AGENTS.md
+        //      mutations + the file deletion
+        let temp = TempDir::new().unwrap();
+        let codex_dir = temp.path();
+        let agents_md = codex_dir.join("AGENTS.md");
+        let rtk_md = codex_dir.join("CONTEXTCRAWLER.md");
+
+        let fixture = format!(
+            "# Team rules\n\n{} v2 -->\nOLD RTK STUFF\n{}\n\n{}\n\nMore content\n",
+            RTK_BLOCK_START, RTK_BLOCK_END, RTK_MD_REF
+        );
+        fs::write(&agents_md, &fixture).unwrap();
+        fs::write(&rtk_md, "codex config").unwrap();
+
+        let removed = uninstall_codex_at(codex_dir, InitContext::default()).unwrap();
+
+        // 1. AGENTS.md is fully clean.
+        let agents_content = fs::read_to_string(&agents_md).unwrap();
+        assert!(!agents_content.contains(RTK_BLOCK_START));
+        assert!(!agents_content.contains("OLD RTK STUFF"));
+        assert!(!agents_content.contains(RTK_MD_REF));
+        assert!(agents_content.contains("# Team rules"));
+        assert!(agents_content.contains("More content"));
+
+        // 2. CONTEXTCRAWLER.md was deleted.
+        assert!(!rtk_md.exists(), "CONTEXTCRAWLER.md should be deleted");
+
+        // 3. The removed list reports both mutations + the file.
+        assert!(
+            removed.iter().any(|r| r.contains("rtk-instructions block")),
+            "missing block-removal entry: {:?}",
+            removed
+        );
+        assert!(
+            removed.iter().any(|r| r.contains("@CONTEXTCRAWLER.md reference")),
+            "missing @-ref removal entry: {:?}",
+            removed
+        );
+        assert!(
+            removed.iter().any(|r| r.contains("CONTEXTCRAWLER.md:")),
+            "missing file deletion entry: {:?}",
+            removed
+        );
     }
 
     #[test]
