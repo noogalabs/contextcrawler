@@ -86,7 +86,7 @@ fn parse_find_args(args: &[String]) -> Result<FindArgs> {
 
     if has_unsupported_find_flags(args) {
         anyhow::bail!(
-            "rtk find does not support compound predicates or actions (e.g. -not, -exec). Use `find` directly."
+            "contextcrawler find does not support compound predicates or actions (e.g. -not, -exec). Use `find` directly."
         );
     }
 
@@ -282,7 +282,7 @@ pub fn run(
         println!("{}", msg);
         timer.track(
             &format!("find {} -name '{}'", path, effective_pattern),
-            "rtk find",
+            "contextcrawler find",
             &raw_output,
             &msg,
         );
@@ -376,7 +376,7 @@ pub fn run(
     let rtk_output = format!("{}F {}D + {}", total_files, dirs_count, ext_line);
     timer.track(
         &format!("find {} -name '{}'", path, effective_pattern),
-        "rtk find",
+        "contextcrawler find",
         &raw_output,
         &rtk_output,
     );

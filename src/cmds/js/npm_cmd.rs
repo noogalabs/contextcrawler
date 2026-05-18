@@ -86,7 +86,7 @@ pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     if is_run_explicit || is_npm_subcommand {
         effective_args.extend_from_slice(args);
     } else {
-        // "rtk npm build" → "npm run build" (assume script name)
+        // "contextcrawler npm build" → "npm run build" (assume script name)
         effective_args.push("run".to_string());
         effective_args.extend_from_slice(args);
     }

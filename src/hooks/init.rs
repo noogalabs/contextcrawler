@@ -3346,9 +3346,11 @@ fn show_claude_config() -> Result<()> {
             let is_executable = perms.mode() & 0o111 != 0;
 
             let hook_content = fs::read_to_string(&hook_path)?;
-            let has_guards =
-                hook_content.contains("command -v rtk") && hook_content.contains("command -v jq");
-            let is_thin_delegator = hook_content.contains("rtk rewrite");
+            let has_guards = (hook_content.contains("command -v contextcrawler")
+                || hook_content.contains("command -v rtk"))
+                && hook_content.contains("command -v jq");
+            let is_thin_delegator = hook_content.contains("contextcrawler rewrite")
+                || hook_content.contains("rtk rewrite");
             let hook_version = super::hook_check::parse_hook_version(&hook_content);
 
             if !is_executable {
@@ -3502,7 +3504,8 @@ fn show_claude_config() -> Result<()> {
                 let meta = fs::metadata(&cursor_hook)?;
                 let is_executable = meta.permissions().mode() & 0o111 != 0;
                 let content = fs::read_to_string(&cursor_hook)?;
-                let _is_thin = content.contains("rtk rewrite");
+                let _is_thin =
+                    content.contains("contextcrawler rewrite") || content.contains("rtk rewrite");
 
                 if !is_executable {
                     println!(

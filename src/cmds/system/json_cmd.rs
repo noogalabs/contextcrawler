@@ -55,7 +55,7 @@ pub fn run(file: &Path, max_depth: usize, schema_only: bool, verbose: u8) -> Res
     println!("{}", output);
     timer.track(
         &format!("cat {}", file.display()),
-        "rtk json",
+        "contextcrawler json",
         &content,
         &output,
     );
@@ -82,7 +82,7 @@ pub fn run_stdin(max_depth: usize, schema_only: bool, verbose: u8) -> Result<()>
         filter_json_compact(&content, max_depth)?
     };
     println!("{}", output);
-    timer.track("cat - (stdin)", "rtk json -", &content, &output);
+    timer.track("cat - (stdin)", "contextcrawler json -", &content, &output);
     Ok(())
 }
 

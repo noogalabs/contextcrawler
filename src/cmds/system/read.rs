@@ -65,7 +65,7 @@ pub fn run(
     print!("{}", rtk_output);
     timer.track(
         &format!("cat {}", file.display()),
-        "rtk read",
+        "contextcrawler read",
         &content,
         &rtk_output,
     );
@@ -126,7 +126,7 @@ pub fn run_stdin(
     };
     print!("{}", rtk_output);
 
-    timer.track("cat - (stdin)", "rtk read -", &content, &rtk_output);
+    timer.track("cat - (stdin)", "contextcrawler read -", &content, &rtk_output);
     Ok(())
 }
 

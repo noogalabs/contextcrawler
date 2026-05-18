@@ -99,7 +99,7 @@ pub fn run(command: &str, use_shell: bool, verbose: u8) -> Result<i32> {
     } else {
         println!("{}", summary);
     }
-    timer.track(command, "rtk summary", &raw, &summary);
+    timer.track(command, "contextcrawler summary", &raw, &summary);
     Ok(result.exit_code)
 }
 

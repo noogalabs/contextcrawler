@@ -212,7 +212,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     timer.track(
         &format!("{} {}", linter, args.join(" ")),
-        &format!("rtk lint {} {}", linter, args.join(" ")),
+        &format!("contextcrawler lint {} {}", linter, args.join(" ")),
         &raw,
         &filtered,
     );

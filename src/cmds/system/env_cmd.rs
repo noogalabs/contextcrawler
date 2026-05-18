@@ -129,7 +129,7 @@ pub fn run(filter: Option<&str>, show_all: bool, verbose: u8) -> Result<()> {
         output
     });
     let rtk = format!("{} vars -> {} shown", total, shown);
-    timer.track("env", "rtk env", &raw, &rtk);
+    timer.track("env", "contextcrawler env", &raw, &rtk);
     Ok(())
 }
 

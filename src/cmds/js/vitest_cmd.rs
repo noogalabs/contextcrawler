@@ -281,7 +281,7 @@ pub fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32>
 
     timer.track(
         format!("{} run", framework).as_str(),
-        format!("rtk {} run", framework).as_str(),
+        format!("contextcrawler {} run", framework).as_str(),
         &combined,
         &filtered,
     );

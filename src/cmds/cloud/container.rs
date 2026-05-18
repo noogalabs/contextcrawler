@@ -70,7 +70,7 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
 
     if !result.success() {
         eprint!("{}", result.stderr);
-        timer.track("docker ps", "rtk docker ps", &raw, &raw);
+        timer.track("docker ps", "contextcrawler docker ps", &raw, &raw);
         return Ok(result.exit_code);
     }
 
@@ -80,7 +80,7 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
     if stdout.trim().is_empty() {
         rtk.push_str("[docker] 0 containers");
         println!("{}", rtk);
-        timer.track("docker ps", "rtk docker ps", &raw, &rtk);
+        timer.track("docker ps", "contextcrawler docker ps", &raw, &rtk);
         return Ok(0);
     }
 
@@ -114,7 +114,7 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
     }
 
     print!("{}", rtk);
-    timer.track("docker ps", "rtk docker ps", &raw, &rtk);
+    timer.track("docker ps", "contextcrawler docker ps", &raw, &rtk);
     Ok(0)
 }
 
@@ -134,7 +134,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
 
     if !result.success() {
         eprint!("{}", result.stderr);
-        timer.track("docker images", "rtk docker images", &raw, &raw);
+        timer.track("docker images", "contextcrawler docker images", &raw, &raw);
         return Ok(result.exit_code);
     }
 
@@ -145,7 +145,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
     if lines.is_empty() {
         rtk.push_str("[docker] 0 images");
         println!("{}", rtk);
-        timer.track("docker images", "rtk docker images", &raw, &rtk);
+        timer.track("docker images", "contextcrawler docker images", &raw, &rtk);
         return Ok(0);
     }
 
@@ -194,7 +194,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
     }
 
     print!("{}", rtk);
-    timer.track("docker images", "rtk docker images", &raw, &rtk);
+    timer.track("docker images", "contextcrawler docker images", &raw, &rtk);
     Ok(0)
 }
 
@@ -589,7 +589,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
 
     let rtk = format_compose_ps(&structured);
     println!("{}", rtk);
-    timer.track("docker compose ps", "rtk docker compose ps", &raw, &rtk);
+    timer.track("docker compose ps", "contextcrawler docker compose ps", &raw, &rtk);
     Ok(0)
 }
 
