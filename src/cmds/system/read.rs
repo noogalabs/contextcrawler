@@ -150,7 +150,7 @@ pub(crate) fn render_output(
     if filtered.trim().is_empty() && !content.trim().is_empty() {
         if verbose > 0 {
             eprintln!(
-                "rtk: warning: filter produced empty output ({} bytes), showing raw content",
+                "contextcrawler: warning: filter produced empty output ({} bytes), showing raw content",
                 content.len()
             );
         }

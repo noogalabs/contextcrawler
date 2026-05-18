@@ -343,7 +343,7 @@ enum Commands {
         extra_args: Vec<String>,
     },
 
-    /// Initialize rtk instructions for assistant CLI usage
+    /// Initialize contextcrawler instructions for assistant CLI usage
     Init {
         /// Add to global assistant config directory instead of local project file
         #[arg(short, long)]
@@ -1719,7 +1719,7 @@ fn main() {
     let code = match run_cli() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("rtk: {:#}", e);
+            eprintln!("contextcrawler: {:#}", e);
             1
         }
     };
@@ -1917,7 +1917,7 @@ fn run_cli() -> Result<i32> {
             for file in &files {
                 let result = if file == Path::new("-") {
                     if stdin_seen {
-                        eprintln!("rtk: warning: stdin specified more than once");
+                        eprintln!("contextcrawler: warning: stdin specified more than once");
                         continue;
                     }
                     stdin_seen = true;

@@ -644,7 +644,7 @@ fn compile_exclude_patterns(patterns: &[String]) -> Vec<ExcludePattern> {
             let trimmed = pattern.trim();
             if trimmed.is_empty() || trimmed == "^" {
                 eprintln!(
-                    "rtk: warning: ignoring trivial exclude_commands pattern '{}'",
+                    "contextcrawler: warning: ignoring trivial exclude_commands pattern '{}'",
                     pattern
                 );
                 return None;
@@ -658,7 +658,7 @@ fn compile_exclude_patterns(patterns: &[String]) -> Vec<ExcludePattern> {
                 Ok(re) => ExcludePattern::Regex(re),
                 Err(e) => {
                     eprintln!(
-                        "rtk: warning: invalid exclude_commands pattern '{}': {}",
+                        "contextcrawler: warning: invalid exclude_commands pattern '{}': {}",
                         pattern, e
                     );
                     ExcludePattern::Prefix(trimmed.to_string())

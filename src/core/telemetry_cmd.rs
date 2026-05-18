@@ -92,7 +92,7 @@ fn run_enable() -> Result<()> {
     crate::hooks::init::save_telemetry_consent(accepted)?;
 
     if accepted {
-        println!("Telemetry enabled. Disable anytime: rtk telemetry disable");
+        println!("Telemetry enabled. Disable anytime: contextcrawler telemetry disable");
     } else {
         println!("Telemetry not enabled.");
     }
@@ -136,7 +136,7 @@ fn run_forget() -> Result<()> {
     if db_path.exists() {
         match std::fs::remove_file(&db_path) {
             Ok(()) => println!("Local tracking database deleted: {}", db_path.display()),
-            Err(e) => eprintln!("rtk: could not delete {}: {}", db_path.display(), e),
+            Err(e) => eprintln!("contextcrawler: could not delete {}: {}", db_path.display(), e),
         }
     }
 
@@ -147,7 +147,7 @@ fn run_forget() -> Result<()> {
                 println!("Erasure request sent to server.");
             }
             Err(e) => {
-                eprintln!("rtk: could not reach server: {}", e);
+                eprintln!("contextcrawler: could not reach server: {}", e);
                 eprintln!("  To complete erasure, email contact@rtk-ai.app");
                 eprintln!("  with your device hash: {}", hash);
             }

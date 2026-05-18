@@ -27,6 +27,11 @@ const FORBIDDEN_TOKENS: &[(&str, &str)] = &[
     ("[rtk:", "diagnostic prefix variants — use \"[contextcrawler:\" (issue #23)"),
     ("RTK.md", "slim instructions filename — use CONTEXTCRAWLER.md or the RTK_MD constant (issue #19/#20)"),
     ("@RTK.md", "slim instructions @-reference — use @CONTEXTCRAWLER.md or RTK_MD_REF constant (issue #19/#20)"),
+    // User-visible phrases that escaped the rebrand sweep and reached the
+    // dashboard. Each entry below was found in the wild by a user report.
+    ("rtk instructions", "init message — use \"contextcrawler instructions\" (post-v0.1.8 user report)"),
+    ("\"rtk: ", "error prefix in unstructured stderr — use \"contextcrawler: \" (post-v0.1.8 user report)"),
+    ("rtk telemetry", "CLI command in user-facing text — use \"contextcrawler telemetry\" (post-v0.1.8 user report)"),
 ];
 
 /// Per-line allowlist marker. A line ending with this comment is exempt.

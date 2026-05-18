@@ -294,7 +294,7 @@ pub fn runtime_check() -> Result<()> {
             // Silently skip to avoid noise for users who haven't re-run init
         }
         IntegrityStatus::Tampered { expected, actual } => {
-            eprintln!("rtk: hook integrity check FAILED");
+            eprintln!("contextcrawler: hook integrity check FAILED");
             eprintln!(
                 "  Expected hash: {}...",
                 expected.get(..16).unwrap_or(&expected)
@@ -312,7 +312,7 @@ pub fn runtime_check() -> Result<()> {
             std::process::exit(1);
         }
         IntegrityStatus::OrphanedHash => {
-            eprintln!("rtk: warning: hash file exists but hook is missing");
+            eprintln!("contextcrawler: warning: hash file exists but hook is missing");
             eprintln!("  Run `contextcrawler init -g` to reinstall.");
             // Don't block — hook is gone, nothing to exploit
         }
