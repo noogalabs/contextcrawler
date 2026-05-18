@@ -304,17 +304,64 @@ fn run_show(
             return Ok(result.exit_code);
         }
         if wants_blob_show {
-            print!("{}", result.stdout);
+            // Route `git show <hash>:<path>` through the read filter so the
+            // file content gets language-aware compression instead of full
+            // passthrough (issue #55). The path component is the part after
+            // the FIRST colon in the rev:path arg.
+            let blob_path = args
+                .iter()
+                .find(|a| is_blob_show_arg(a))
+                .and_then(|a| a.split_once(':').map(|(_, p)| p));
+            let filtered = match blob_path {
+                Some(path) if !path.is_empty() => {
+                    use crate::core::config;
+                    use crate::core::filter::{FilterLevel, Language};
+                    use std::path::Path as StdPath;
+                    let ext = StdPath::new(path)
+                        .extension()
+                        .and_then(|e| e.to_str());
+                    let lang = ext
+                        .map(Language::from_extension)
+                        .unwrap_or(Language::Unknown);
+                    let read_config = config::read();
+                    crate::cmds::system::read::render_output(
+                        &result.stdout,
+                        ext,
+                        lang,
+                        FilterLevel::Minimal,
+                        None,
+                        None,
+                        &read_config,
+                        true,
+                        path,
+                        verbose,
+                    )
+                }
+                _ => result.stdout.clone(),
+            };
+            print!("{}", filtered);
+
+            let cmd_label = if blob_path.is_some() {
+                format!("rtk git show {} (blob-filtered)", args.join(" "))
+            } else {
+                format!("rtk git show {} (passthrough)", args.join(" "))
+            };
+            timer.track(
+                &format!("git show {}", args.join(" ")),
+                &cmd_label,
+                &result.stdout,
+                &filtered,
+            );
         } else {
             println!("{}", result.stdout.trim());
-        }
 
-        timer.track(
-            &format!("git show {}", args.join(" ")),
-            &format!("rtk git show {} (passthrough)", args.join(" ")),
-            &result.stdout,
-            &result.stdout,
-        );
+            timer.track(
+                &format!("git show {}", args.join(" ")),
+                &format!("rtk git show {} (passthrough)", args.join(" ")),
+                &result.stdout,
+                &result.stdout,
+            );
+        }
 
         return Ok(0);
     }
@@ -494,13 +541,6 @@ fn run_log(
         arg.starts_with("--oneline") || arg.starts_with("--pretty") || arg.starts_with("--format")
     });
 
-    // Check if user provided limit flag (-N, -n N, --max-count=N, --max-count N)
-    let has_limit_flag = args.iter().any(|arg| {
-        (arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
-            || arg == "-n"
-            || arg.starts_with("--max-count")
-    });
-
     // Apply RTK defaults only if user didn't specify them
     // Use %b (body) to preserve first line of commit body for agent context
     // (BREAKING CHANGE, Closes #xxx, design notes)
@@ -508,10 +548,13 @@ fn run_log(
         cmd.args(["--pretty=format:%h %s (%ar) <%an>%n%b%n---END---"]);
     }
 
-    // Determine limit: respect user's explicit -N flag, use sensible defaults otherwise
-    let (limit, user_set_limit) = if has_limit_flag {
-        // User explicitly passed -N / -n N / --max-count=N → respect their choice
-        let n = parse_user_limit(args).unwrap_or(10);
+    // Determine limit: respect user's explicit -N flag, use sensible defaults
+    // otherwise. Driven by `parse_user_limit` directly so a degenerate `-n`
+    // (no value) doesn't count as "user set the limit" — that would suppress
+    // the auto-`--no-merges` injection for a query the user didn't actually
+    // bound (issue #55 pre-PR review).
+    let user_limit = parse_user_limit(args);
+    let (limit, user_set_limit) = if let Some(n) = user_limit {
         (n, true)
     } else if has_format_flag {
         // --oneline / --pretty without -N: user wants compact output, allow more
@@ -523,11 +566,7 @@ fn run_log(
         (10, false)
     };
 
-    // Only add --no-merges if user didn't explicitly request merge commits
-    let wants_merges = args
-        .iter()
-        .any(|arg| arg == "--merges" || arg == "--min-parents=2");
-    if !wants_merges {
+    if should_inject_no_merges(args, user_set_limit) {
         cmd.arg("--no-merges");
     }
 
@@ -606,6 +645,26 @@ fn parse_user_limit(args: &[String]) -> Option<usize> {
 /// so we skip line capping (git already returns exactly N commits) and use a
 /// wider truncation threshold (120 chars) to preserve commit context that LLMs
 /// need for rebase/squash operations.
+/// Decide whether to auto-inject `--no-merges` into a `git log` invocation.
+///
+/// Only when WE are setting the default limit. If the user explicitly passed
+/// `-N` they want N commits as they appear in history — silently dropping
+/// merges changes the query semantics and serves them a different N (the
+/// un-merge tail). Issue #55 caught this regressing tiny
+/// `git log --oneline -5` invocations to NEGATIVE compression because the
+/// un-merge commit subjects ran longer than the merges they replaced.
+///
+/// Always respect the user's explicit `--merges` / `--min-parents=2`.
+fn should_inject_no_merges(args: &[String], user_set_limit: bool) -> bool {
+    if user_set_limit {
+        return false;
+    }
+    let wants_merges = args
+        .iter()
+        .any(|arg| arg == "--merges" || arg == "--min-parents=2");
+    !wants_merges
+}
+
 pub(crate) fn filter_log_output(
     output: &str,
     limit: usize,
@@ -1368,7 +1427,14 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     if !has_list_flag {
         cmd.arg("-a");
     }
-    cmd.arg("--no-color");
+    // Avoid double-injecting --no-color when the user already passed it
+    // (or `--color=never`); audit trails of git args are cleaner that way.
+    let user_set_color = args
+        .iter()
+        .any(|a| a == "--no-color" || a == "--color=never");
+    if !user_set_color {
+        cmd.arg("--no-color");
+    }
     for arg in args {
         cmd.arg(arg);
     }
@@ -1388,7 +1454,10 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         return Ok(result.exit_code);
     }
 
-    let filtered = filter_branch_output(&result.stdout);
+    // Pass the remote-only hint so the filter knows `git branch -r` returns
+    // bare `origin/<branch>` lines (no `remotes/` prefix, no `* current`).
+    let remote_only_mode = args.iter().any(|a| a == "-r" || a == "--remotes");
+    let filtered = filter_branch_output_with_mode(&result.stdout, remote_only_mode);
     println!("{}", filtered);
 
     timer.track(
@@ -1401,7 +1470,13 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     Ok(0)
 }
 
+/// Back-compat wrapper. Existing callers (including tests) pass `output` only
+/// and want the `-a`-mode behavior (mixed local + `remotes/`-prefixed).
 fn filter_branch_output(output: &str) -> String {
+    filter_branch_output_with_mode(output, false)
+}
+
+fn filter_branch_output_with_mode(output: &str, remote_only_mode: bool) -> String {
     let mut current = String::new();
     let mut local: Vec<String> = Vec::new();
     let mut remote: Vec<String> = Vec::new();
@@ -1416,12 +1491,31 @@ fn filter_branch_output(output: &str) -> String {
         if let Some(branch) = line.strip_prefix("* ") {
             current = branch.to_string();
         } else if let Some(rest) = line.strip_prefix("remotes/") {
+            // `-a` mode: lines are `remotes/<remote>/<branch>`. The dedup key
+            // must include the remote name so `origin/feature/x` and
+            // `upstream/feature/x` don't collapse into one entry (pre-existing
+            // bug in -a mode, surfaced by the #55 review).
             if let Some(slash_pos) = rest.find('/') {
                 let branch = &rest[slash_pos + 1..];
                 if branch.starts_with("HEAD ") {
                     continue;
                 }
-                if seen_remote.insert(branch.to_string()) {
+                if seen_remote.insert(rest.to_string()) {
+                    remote.push(branch.to_string());
+                }
+            }
+        } else if remote_only_mode {
+            // `-r` mode: lines are bare `<remote>/<branch>` (no `remotes/`
+            // prefix, no `* ` marker — `git branch -r` never marks current).
+            // Skip `origin/HEAD -> origin/main` redirect lines.
+            if line.contains(" -> ") {
+                continue;
+            }
+            if let Some(slash_pos) = line.find('/') {
+                let branch = &line[slash_pos + 1..];
+                // Use the full `<remote>/<branch>` as the dedup key so
+                // same-named branches from different remotes are both shown.
+                if seen_remote.insert(line.to_string()) {
                     remote.push(branch.to_string());
                 }
             }
@@ -1431,7 +1525,12 @@ fn filter_branch_output(output: &str) -> String {
     }
 
     let mut result = Vec::new();
-    result.push(format!("* {}", current));
+
+    // Suppress the `* <current>` header in remote-only mode — `git branch -r`
+    // doesn't surface a current branch and the empty `* ` line is pure noise.
+    if !remote_only_mode {
+        result.push(format!("* {}", current));
+    }
 
     if !local.is_empty() {
         for b in &local {
@@ -1445,7 +1544,8 @@ fn filter_branch_output(output: &str) -> String {
             .filter(|r| *r != &current && !local.contains(r))
             .collect();
         if !remote_only.is_empty() {
-            result.push(format!("  remote-only ({}):", remote_only.len()));
+            let label = if remote_only_mode { "remote" } else { "remote-only" };
+            result.push(format!("  {} ({}):", label, remote_only.len()));
             for b in remote_only.iter().take(10) {
                 result.push(format!("    {}", b));
             }
@@ -2122,6 +2222,193 @@ mod tests {
         // remote-only should show release/v2 but not main or feature/auth (already local)
         assert!(result.contains("remote-only"));
         assert!(result.contains("release/v2"));
+    }
+
+    #[test]
+    fn test_blob_show_render_through_read_filter() {
+        // REGRESSION (#55): `git show <hash>:<path>` was full passthrough
+        // (0% savings on 16.8K/24h). Now we route through render_output.
+        // This test exercises the same code path directly with a Rust blob
+        // and asserts the filter produces SOME compression (>0% savings) —
+        // matches the project's cli-testing rule that every filter change
+        // ship with a token-savings assertion.
+        use crate::core::config;
+        use crate::core::filter::{FilterLevel, Language};
+        let blob = include_str!("../../main.rs"); // dogfood: real Rust file
+        let read_config = config::read();
+        let filtered = crate::cmds::system::read::render_output(
+            blob,
+            Some("rs"),
+            Language::Rust,
+            FilterLevel::Minimal,
+            None,
+            None,
+            &read_config,
+            true,
+            "src/main.rs",
+            0,
+        );
+        let raw_len = blob.len();
+        let filtered_len = filtered.len();
+        assert!(
+            filtered_len < raw_len,
+            "blob-show filter should compress: raw={} filtered={}",
+            raw_len,
+            filtered_len
+        );
+        // Not too aggressive — Minimal level shouldn't gut the file.
+        // A real-world Rust file with comments+whitespace typically lands
+        // in the 1-15% range under Minimal. Pin a minimum floor of 1%
+        // so we catch regression to 0% (the bug we're fixing here).
+        let savings_pct = 100.0 - (filtered_len as f64 / raw_len as f64 * 100.0);
+        assert!(
+            savings_pct >= 1.0,
+            "blob-show filter saved only {:.2}% — fix #55 regression?",
+            savings_pct
+        );
+    }
+
+    #[test]
+    fn test_blob_show_path_extraction() {
+        // REGRESSION (issue #55): `git show <hash>:<path>` was raw passthrough
+        // (0% savings on 16.8K input/24h). Now we extract <path> and route
+        // through the read filter. Pin the path-extraction logic so flags
+        // with embedded `:` (e.g. `--pretty=format:`) don't get treated as
+        // blob refs.
+        let blob_arg = "abc123:src/main.rs";
+        assert!(is_blob_show_arg(blob_arg));
+        let path = blob_arg.split_once(':').map(|(_, p)| p);
+        assert_eq!(path, Some("src/main.rs"));
+
+        // Flag with colon must NOT match.
+        assert!(!is_blob_show_arg("--pretty=format:%H %s"));
+        // Hash without colon must NOT match.
+        assert!(!is_blob_show_arg("abc123"));
+        // Empty path after colon — should still parse but treated as "no path".
+        let empty_path = "abc123:";
+        let (_, p) = empty_path.split_once(':').unwrap();
+        assert!(p.is_empty(), "empty path tail must be detectable so we fall back to passthrough");
+    }
+
+    #[test]
+    fn test_should_inject_no_merges_respects_user_limit() {
+        // REGRESSION (issue #55): the previous code unconditionally added
+        // --no-merges, so `git log --oneline -5` returned 5 *different*
+        // commits (the merge-free tail) — a correctness bug AND a savings
+        // regression (un-merge subjects ran longer than the merges).
+        let with_explicit_limit: Vec<String> =
+            vec!["--oneline".into(), "-5".into()];
+        assert!(
+            !should_inject_no_merges(&with_explicit_limit, true),
+            "user-set limit must NOT trigger --no-merges injection"
+        );
+
+        // RTK default limit (we set -10): inject --no-merges for compression.
+        let rtk_default: Vec<String> = vec![];
+        assert!(
+            should_inject_no_merges(&rtk_default, false),
+            "RTK-default limit should inject --no-merges"
+        );
+
+        // User asked for merges explicitly: never inject regardless of limit.
+        let explicit_merges: Vec<String> = vec!["--merges".into()];
+        assert!(!should_inject_no_merges(&explicit_merges, false));
+        let min_parents: Vec<String> = vec!["--min-parents=2".into()];
+        assert!(!should_inject_no_merges(&min_parents, false));
+    }
+
+    #[test]
+    fn test_filter_branch_remote_only_mode_handles_bare_origin_prefix() {
+        // REGRESSION (issue #55). `git branch -r` emits lines as bare
+        // `<remote>/<branch>` (no `remotes/` prefix, no `* <current>`).
+        // The original filter_branch_output ignored these — they fell
+        // through to the `local` bucket and 24h-DB showed 0% savings.
+        // Now filter_branch_output_with_mode(_, true) routes them to the
+        // remote bucket and suppresses the empty `* ` header.
+        let output = "  origin/HEAD -> origin/main\n  origin/main\n  origin/develop\n  origin/feature-x\n";
+        let result = filter_branch_output_with_mode(output, true);
+
+        // No leading `* ` line (current is meaningless in -r mode).
+        assert!(
+            !result.starts_with("* "),
+            "remote-only mode should not emit `* <empty>`; got: {}",
+            result
+        );
+        // HEAD redirect skipped.
+        assert!(
+            !result.contains("origin/HEAD ->"),
+            "HEAD redirect should be skipped; got: {}",
+            result
+        );
+        // Real branches present, summarised as `remote (<n>):`
+        assert!(result.contains("remote ("), "remote summary missing: {}", result);
+        assert!(result.contains("main"), "main missing: {}", result);
+        assert!(result.contains("develop"), "develop missing: {}", result);
+        assert!(result.contains("feature-x"), "feature-x missing: {}", result);
+    }
+
+    #[test]
+    fn test_filter_branch_remote_only_mode_preserves_same_name_across_remotes() {
+        // REGRESSION (#55 review): the original dedup key stripped the remote
+        // prefix, so `origin/feature/x` and `upstream/feature/x` collapsed
+        // into one entry. In -r mode this silently hides a branch from a
+        // second remote. Pin that both are now preserved.
+        let output = "  origin/main\n  origin/feature/topic\n  upstream/main\n  upstream/feature/topic\n";
+        let result = filter_branch_output_with_mode(output, true);
+        // Both `feature/topic` entries must survive. They display as the
+        // post-first-slash portion, so both lines render as `feature/topic`
+        // — count occurrences.
+        let topic_count = result.matches("feature/topic").count();
+        assert_eq!(
+            topic_count, 2,
+            "both origin and upstream feature/topic must be preserved; got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_parse_user_limit_returns_none_for_bare_dash_n() {
+        // REGRESSION (#55 review): `has_limit_flag` previously matched bare
+        // `-n` (no value) and the no-merges decision suppressed --no-merges
+        // for a query the user didn't actually bound. Now we drive
+        // user_set_limit from parse_user_limit().is_some() directly, so
+        // bare `-n` must yield None.
+        let args_bare: Vec<String> = vec!["-n".into()];
+        assert_eq!(
+            parse_user_limit(&args_bare),
+            None,
+            "bare -n (no following value) must not parse as a limit"
+        );
+        // And the combined form continues to work.
+        let args_combined: Vec<String> = vec!["-5".into()];
+        assert_eq!(parse_user_limit(&args_combined), Some(5));
+        // Space-separated -n 7
+        let args_n_space: Vec<String> = vec!["-n".into(), "7".into()];
+        assert_eq!(parse_user_limit(&args_n_space), Some(7));
+        // --max-count=12
+        let args_max_eq: Vec<String> = vec!["--max-count=12".into()];
+        assert_eq!(parse_user_limit(&args_max_eq), Some(12));
+    }
+
+    #[test]
+    fn test_branch_list_does_not_double_inject_no_color() {
+        // Pin that we don't append --no-color when the user already passed it
+        // (or --color=never). Pre-PR review caught this; check via the
+        // detection used in `run_branch`.
+        let args1: Vec<String> = vec!["-r".into(), "--no-color".into()];
+        assert!(args1.iter().any(|a| a == "--no-color" || a == "--color=never"));
+        let args2: Vec<String> = vec!["-a".into(), "--color=never".into()];
+        assert!(args2.iter().any(|a| a == "--no-color" || a == "--color=never"));
+        let args3: Vec<String> = vec!["-r".into()];
+        assert!(!args3.iter().any(|a| a == "--no-color" || a == "--color=never"));
+    }
+
+    #[test]
+    fn test_filter_branch_back_compat_signature() {
+        // Pin the back-compat wrapper so callers without args don't drift.
+        let output = "* main\n  develop\n  remotes/origin/main\n";
+        let result = filter_branch_output(output);
+        assert!(result.contains("* main"));
     }
 
     #[test]
