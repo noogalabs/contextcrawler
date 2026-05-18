@@ -2587,10 +2587,18 @@ pub fn secure_go_command(name: &str) -> Command {
 // at `contextcrawler proxy <tool>` if they really need them.
 
 fn pyrbjvm_deny_message(tool: &str, flag: &str, reason: &str) -> String {
+    pyrbjvm_deny_message_with_issue(tool, flag, reason, "#36")
+}
+
+/// Variant that lets callers cite the issue that drove a specific deny
+/// instead of the umbrella `#36`. New deny additions should call this
+/// directly so operators looking up the referenced issue land on the
+/// right tracker entry (e.g. pytest `-p` denies cite #49).
+fn pyrbjvm_deny_message_with_issue(tool: &str, flag: &str, reason: &str, issue: &str) -> String {
     format!(
-        "[contextcrawler] refusing to forward '{}' to {} — {} (issue #36). \
+        "[contextcrawler] refusing to forward '{}' to {} — {} (issue {}). \
          If you genuinely need it, use: contextcrawler proxy {} <args>",
-        flag, tool, reason, tool
+        flag, tool, reason, issue, tool
     )
 }
 
@@ -2614,24 +2622,87 @@ pub fn check_forbidden_pytest_args<S: AsRef<str>>(args: &[S]) -> Result<(), Stri
             ));
         }
 
-        if a == "-p" {
-            if let Some(next) = args.get(i + 1) {
-                let v = next.as_ref();
-                if looks_like_path(v) {
-                    return Err(pyrbjvm_deny_message(
-                        "pytest",
-                        &format!("-p {}", v),
-                        "-p with a filesystem path loads arbitrary plugin code",
-                    ));
-                }
+        // `-p VALUE` (space form). Also handle the argparse-accepted glued
+        // forms `-pVALUE` and `-p=VALUE` — pytest's argparse honours both,
+        // so the old whitespace-only split was bypassable (issue #49 P2).
+        if let Some(value) = pytest_p_value(a, args.get(i + 1).map(|s| s.as_ref())) {
+            if pytest_p_value_is_filesystem_path(value) {
+                return Err(pyrbjvm_deny_message_with_issue(
+                    "pytest",
+                    &format!("-p {}", value),
+                    "-p with a filesystem path loads arbitrary plugin code",
+                    "#49",
+                ));
             }
-            i += 2;
-            continue;
+            // Skip the value arg if we consumed it from the next slot.
+            if a == "-p" {
+                i += 2;
+                continue;
+            }
         }
 
         i += 1;
     }
     Ok(())
+}
+
+/// Returns the `-p` value if `a` is a `-p` flag in any of pytest's accepted
+/// shapes: `-p VALUE` (consumes next arg), `-pVALUE` (glued), `-p=VALUE`.
+/// Returns `None` for any other arg. Border case: `-p` with no following
+/// value returns `None` (nothing to validate).
+fn pytest_p_value<'a>(a: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    if a == "-p" {
+        return next;
+    }
+    if let Some(rest) = a.strip_prefix("-p=") {
+        return Some(rest);
+    }
+    if let Some(rest) = a.strip_prefix("-p") {
+        // `-pVALUE` glued form. Reject the empty case (`-p` alone falls
+        // through the first arm above; this would only fire if some future
+        // refactor reordered the checks).
+        if !rest.is_empty() {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// pytest-specific path detection for `-p`. Stricter than the shared
+/// `looks_like_path` heuristic because pytest's plugin loader treats any
+/// value containing a path separator OR ending in `.py` as a filesystem
+/// path, even without a leading `./` (issue #49 main fix).
+///
+/// Examples accepted (legitimate plugin/module names):
+///   `myplugin`, `no:cacheprovider`, `mypackage.testplugin`
+/// Examples rejected (filesystem-path forms):
+///   `/tmp/evil.py`, `./local.py`, `..\plug.py`, `C:\evil.py`,
+///   `subdir/plugin.py`, `subdir\plugin`, `plugin.py` (bare .py)
+///
+/// ACCEPTED RESIDUAL RISK (out of scope for this check, documented per
+/// #49 pre-PR review): a dotted module name like `evil.payload` may
+/// still resolve to a file in cwd when pytest is invoked as
+/// `python -m pytest` (which adds `.` to sys.path) and the attacker has
+/// planted `evil/payload.py`. We can't reject dotted names categorically
+/// because legitimate plugins use them (`pytest_django.plugin`). The
+/// remaining defense is the agent threat model: don't accept untrusted
+/// `-p` values, and ensure cwd isn't writable by an attacker before
+/// running pytest. Add a stricter allowlist here if a higher-assurance
+/// mode is needed later.
+fn pytest_p_value_is_filesystem_path(value: &str) -> bool {
+    if looks_like_path(value) {
+        return true;
+    }
+    if value.contains('/') || value.contains('\\') {
+        return true;
+    }
+    // Bare `.py` suffix is a path even with no separator (pytest will load
+    // it from the cwd). A dotted Python module name never ends in `.py`
+    // (the `.py` is the file extension, not part of the module name).
+    if value.ends_with(".py") {
+        return true;
+    }
+    false
 }
 
 /// `--config-file` lets mypy read settings (and `mypy_path`, `plugins=`)
@@ -2819,9 +2890,60 @@ mod secure_pyrbjvmdotnet_tests {
     }
 
     #[test]
+    fn pytest_rejects_p_bare_relative_path() {
+        // REGRESSION (issue #49). `looks_like_path` requires `./`, `/`,
+        // `~/`, `.\`, or a drive letter — `subdir/plugin.py` fell through
+        // and pytest loaded it as a file. Now any value containing `/`
+        // or `\` is rejected, regardless of leading character.
+        assert!(check_forbidden_pytest_args(&["-p", "subdir/plugin.py"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p", "a/b/c"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p", r"subdir\plugin"]).is_err());
+        // Bare `.py` ending is also a filesystem path (a dotted Python
+        // module name never ends in `.py` — the `.py` IS the extension).
+        assert!(check_forbidden_pytest_args(&["-p", "plugin.py"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p", "evil.py"]).is_err());
+    }
+
+    #[test]
+    fn pytest_p_deny_cites_issue_49() {
+        // REGRESSION (#49 pre-PR review): the umbrella `#36` was hardcoded
+        // in pyrbjvm_deny_message. The `-p` deny now cites #49 directly so
+        // operators land on the right tracker entry when they look it up.
+        let err = check_forbidden_pytest_args(&["-p", "subdir/plugin.py"]).unwrap_err();
+        assert!(err.contains("#49"), "expected #49 in deny; got: {}", err);
+        // Other pyrbjvmdotnet denies still cite the umbrella #36 — pin
+        // that explicitly so a refactor doesn't drift them all to #49.
+        let umbrella = check_forbidden_pytest_args(&["--rootdir", "/tmp"]).unwrap_err();
+        assert!(
+            umbrella.contains("#36"),
+            "--rootdir deny should still cite umbrella #36; got: {}",
+            umbrella
+        );
+    }
+
+    #[test]
+    fn pytest_rejects_p_glued_and_equals_forms() {
+        // REGRESSION (issue #49 derived): argparse accepts `-pVALUE` and
+        // `-p=VALUE` in addition to the space form. The old check only
+        // looked at `a == "-p"`, so glued forms bypassed it.
+        assert!(check_forbidden_pytest_args(&["-p/tmp/evil.py"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-psubdir/plugin"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p=plugin.py"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p=./local.py"]).is_err());
+    }
+
+    #[test]
     fn pytest_allows_p_with_module_name() {
         assert!(check_forbidden_pytest_args(&["-p", "no:cacheprovider"]).is_ok());
         assert!(check_forbidden_pytest_args(&["-p", "myplugin"]).is_ok());
+        // Dotted Python module names are valid plugin specifiers.
+        assert!(check_forbidden_pytest_args(&["-p", "mypackage.testplugin"]).is_ok());
+        assert!(check_forbidden_pytest_args(&["-p", "a.b.c.d"]).is_ok());
+        // Glued legitimate forms.
+        assert!(check_forbidden_pytest_args(&["-pmyplugin"]).is_ok());
+        assert!(check_forbidden_pytest_args(&["-p=no:cacheprovider"]).is_ok());
+        // `-p` with no value present is a no-op (pytest would error itself).
+        assert!(check_forbidden_pytest_args(&["-p"]).is_ok());
     }
 
     #[test]
