@@ -1422,6 +1422,25 @@ fn shell_split(input: &str) -> Vec<String> {
     discover::lexer::shell_split(input)
 }
 
+/// `true` when the proxy nudge should be printed to stderr. Three independent
+/// suppression knobs (any one silences the nudge): explicit env opt-out,
+/// `CI=*` env marker, stderr is not a tty. The override env var can carry
+/// any value — empty string still suppresses.
+fn should_emit_proxy_nudge() -> bool {
+    use std::io::IsTerminal;
+
+    if std::env::var_os("CONTEXTCRAWLER_NO_PROXY_NUDGE").is_some() {
+        return false;
+    }
+    if std::env::var_os("CI").is_some() {
+        return false;
+    }
+    if !std::io::stderr().is_terminal() {
+        return false;
+    }
+    true
+}
+
 /// Returns the suggested wrapped invocation if `tool` has a `contextcrawler`
 /// equivalent. Drives the nudge in `Commands::Proxy`. Keep this list aligned
 /// with `WRAPPED_TOOLS` in `discover::codex` — if we add a wrapper there,
@@ -2754,11 +2773,14 @@ fn run_cli() -> Result<i32> {
             // caller at it. The wrap exists for a reason (token-savings filter
             // + env-strip + arg deny-list), and `proxy <wrapped-tool>` is
             // currently the #1 token leak in the dashboard. Don't auto-rewrite
-            // — measure adoption of the nudge first (issue #53).
+            // — measure adoption of the nudge first.
             //
-            // Suppressed in CI/non-tty environments and when CONTEXTCRAWLER_NO_PROXY_NUDGE
-            // is set, so noisy scripts can opt out.
-            if std::env::var_os("CONTEXTCRAWLER_NO_PROXY_NUDGE").is_none() {
+            // Suppression order (any one silences the nudge):
+            //   1. `CONTEXTCRAWLER_NO_PROXY_NUDGE=<anything>` — explicit opt-out
+            //   2. `CI=<anything>` — common CI marker (GitHub Actions, GitLab,
+            //      CircleCI, Travis all set this) so pipeline stderr stays clean
+            //   3. stderr not a tty — script/pipe consumer can't act on the nudge
+            if should_emit_proxy_nudge() {
                 let basename = std::path::Path::new(&cmd_name)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -2767,7 +2789,7 @@ fn run_cli() -> Result<i32> {
                     eprintln!(
                         "[contextcrawler] note: `proxy {basename}` bypasses the wrapped filter. \
                          Consider: `{suggestion}`. \
-                         Set CONTEXTCRAWLER_NO_PROXY_NUDGE=1 to suppress. (issue #53)"
+                         Set CONTEXTCRAWLER_NO_PROXY_NUDGE=1 to suppress."
                     );
                 }
             }

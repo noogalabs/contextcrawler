@@ -188,22 +188,23 @@ pub fn is_wrapped(cmd: &str) -> bool {
         return true;
     }
 
-    // Case 2/3: nav-builtin lead. First word check, with trailing punctuation
-    // (`;`, `&`, `|`) stripped so `pwd;` and `pwd` both register as `pwd`.
-    let first = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(|c: char| matches!(c, ';' | '&' | '|'));
+    // Case 2/3: nav-builtin lead. First token = leading run of non-{whitespace,
+    // shell-connector} chars. So both `pwd ...` and `pwd;contextcrawler ls`
+    // yield first == "pwd".
+    let first_end = trimmed
+        .find(|c: char| matches!(c, ' ' | '\t' | ';' | '&' | '|'))
+        .unwrap_or(trimmed.len());
+    let first = &trimmed[..first_end];
     if !NAV_BUILTINS.contains(&first) {
         return false;
     }
 
     // Find the FIRST sequential connector at top level. We only split on the
     // first occurrence so awk-style quoted `&&` inside a wrapped second
-    // segment is preserved.
+    // segment is preserved. Both spaced (`; `) and unspaced (`;`) semicolons
+    // are accepted because codex occasionally emits tightly-packed forms.
     let mut tail: Option<&str> = None;
-    for connector in &[" && ", " || ", "; "] {
+    for connector in &[" && ", " || ", "; ", ";"] {
         if let Some(idx) = trimmed.find(connector) {
             tail = Some(&trimmed[idx + connector.len()..]);
             break;
@@ -227,8 +228,15 @@ pub fn canonicalise_pattern(cmd: &str) -> String {
     if lower.contains("nl -ba") && lower.contains("| sed") {
         return "nl -ba <file> | sed -n '<range>p'".to_string();
     }
-    if lower.starts_with("git -c ") {
+    // CASE-SENSITIVE: `-C <dir>` is project-dir override; `-c key=val` is
+    // config override. Lowercasing would collapse them into one bucket and
+    // mis-attribute every CI `git -c core.X=Y` invocation to the gap. Keep
+    // these two checks on the original-cased `trimmed`.
+    if trimmed.starts_with("git -C ") || trimmed.starts_with("git -C\t") {
         return "git -C <dir> <subcmd>".to_string();
+    }
+    if trimmed.starts_with("git -c ") || trimmed.starts_with("git -c\t") {
+        return "git -c <key=val> <subcmd>".to_string();
     }
     if lower.starts_with("rg ") || lower.starts_with("rg\t") {
         return "rg <args>".to_string();
@@ -252,12 +260,20 @@ pub fn canonicalise_pattern(cmd: &str) -> String {
 }
 
 fn truncate_for_display(cmd: &str) -> String {
-    const MAX: usize = 100;
+    const MAX_CHARS: usize = 100;
     let s = cmd.trim();
-    if s.len() <= MAX {
+    // Use char_indices, not byte slicing — command strings from arbitrary logs
+    // may contain multibyte UTF-8 (paths with Japanese, emoji in piped output)
+    // and byte-slicing across a char boundary panics.
+    let cut = s
+        .char_indices()
+        .nth(MAX_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    if cut == s.len() {
         s.to_string()
     } else {
-        format!("{}…", &s[..MAX])
+        format!("{}…", &s[..cut])
     }
 }
 
@@ -395,6 +411,17 @@ mod tests {
     }
 
     #[test]
+    fn truncate_for_display_handles_multibyte() {
+        // REGRESSION (pre-PR review): byte-index slice across a multibyte
+        // boundary panics. Use a string where the 100th char is multibyte.
+        let s: String = "日本語パスで読み込み".chars().cycle().take(150).collect();
+        // Should not panic; result is well-formed UTF-8 with the ellipsis.
+        let out = truncate_for_display(&s);
+        assert!(out.ends_with('…'));
+        assert!(out.is_char_boundary(out.len() - '…'.len_utf8()));
+    }
+
+    #[test]
     fn is_wrapped_handles_cd_compositions() {
         assert!(is_wrapped("cd /tmp && contextcrawler git status"));
         assert!(is_wrapped(
@@ -408,6 +435,18 @@ mod tests {
         // Empty / whitespace.
         assert!(!is_wrapped(""));
         assert!(!is_wrapped("   "));
+    }
+
+    #[test]
+    fn is_wrapped_handles_tightly_packed_semicolons() {
+        // REGRESSION (pre-PR review): connector list previously only had
+        // `"; "` (with trailing space), so `pwd;contextcrawler ls` would
+        // fall through to "standalone nav builtin" and falsely report wrapped.
+        // Now both `; ` and `;` are accepted as connectors.
+        assert!(is_wrapped("pwd;contextcrawler ls"));
+        assert!(!is_wrapped("pwd;ls"));
+        assert!(is_wrapped("export FOO=bar;contextcrawler git status"));
+        assert!(!is_wrapped("export FOO=bar;git status"));
     }
 
     #[test]
@@ -430,6 +469,19 @@ mod tests {
     fn canonicalise_git_dash_c() {
         let p = canonicalise_pattern("git -C /Users/x/repo status --short");
         assert_eq!(p, "git -C <dir> <subcmd>");
+    }
+
+    #[test]
+    fn canonicalise_git_lowercase_c_is_separate_bucket() {
+        // REGRESSION (pre-PR review): the original implementation lowercased
+        // the command before matching, collapsing `git -c` (config override)
+        // into the `git -C <dir>` bucket. Every CI `git -c core.X=Y` invocation
+        // would inflate the gap report. Keep these two buckets distinct.
+        let lower = canonicalise_pattern("git -c core.pager=cat log --oneline");
+        assert_eq!(lower, "git -c <key=val> <subcmd>");
+        let upper = canonicalise_pattern("git -C /repo log");
+        assert_eq!(upper, "git -C <dir> <subcmd>");
+        assert_ne!(lower, upper);
     }
 
     #[test]
