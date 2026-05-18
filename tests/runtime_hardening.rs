@@ -11,6 +11,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
@@ -20,8 +22,11 @@ fn tool_present(name: &str) -> bool {
 }
 
 /// Run `contextcrawler <args>` with extra env var `key=val` set on the
-/// parent so the inheritance behavior is what we're testing.
+/// child process. The shared [`common::GLOBAL_ENV_LOCK`] is held across
+/// the spawn so env-mutating tests across the suite serialize on a
+/// single mutex (issue #48).
 fn run_with_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(args);
     for (k, v) in envs {

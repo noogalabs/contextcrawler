@@ -20,6 +20,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+mod common;
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
@@ -39,6 +41,8 @@ fn write_evil_config(filename: &str, content: &str) -> (tempfile::TempDir, PathB
 }
 
 fn run_cc(env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+    // Serialize env-mutating spawns via the shared lock (issue #48).
+    let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(args);
     // Clear DB path so tracking doesn't touch user state.

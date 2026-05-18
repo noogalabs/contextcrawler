@@ -12,6 +12,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
@@ -60,12 +62,14 @@ fn rustc_wrapper_does_not_fire_under_version() {
 
     write_marker_script(&script, &marker);
 
+    let _guard = common::env_lock();
     let output = Command::new(binary_path())
         .arg("cargo")
         .arg("--version")
         .env("RUSTC_WRAPPER", &script)
         .output()
         .expect("spawn contextcrawler cargo --version");
+    drop(_guard);
 
     let _ = std::fs::remove_file(&script);
     let marker_exists = marker.exists();
@@ -102,6 +106,7 @@ fn rustc_wrapper_env_is_stripped_during_check() {
     .unwrap();
     std::fs::write(tmp_crate.join("src/lib.rs"), "// empty\n").unwrap();
 
+    let _guard = common::env_lock();
     let output = Command::new(binary_path())
         .arg("cargo")
         .arg("check")
@@ -113,6 +118,7 @@ fn rustc_wrapper_env_is_stripped_during_check() {
         .current_dir(&tmp_crate)
         .output()
         .expect("spawn contextcrawler cargo check");
+    drop(_guard);
 
     let _ = std::fs::remove_file(&script);
     let marker_exists = marker.exists();

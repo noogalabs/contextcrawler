@@ -17,6 +17,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
@@ -115,6 +117,7 @@ fn make_marker_script(dir: &std::path::Path, marker: &std::path::Path) -> PathBu
 #[test]
 #[cfg(unix)]
 fn git_external_diff_env_is_stripped() {
+    let _guard = common::env_lock();
     let (repo, repo_path) = make_repo();
     let marker = repo.path().join("MARKER_external_diff");
     let script = make_marker_script(repo.path(), &marker);
@@ -157,6 +160,7 @@ fn git_external_diff_env_is_stripped() {
 #[test]
 #[cfg(unix)]
 fn git_config_count_env_injection_is_stripped() {
+    let _guard = common::env_lock();
     let (repo, repo_path) = make_repo();
     let marker = repo.path().join("MARKER_config_count");
     let script = make_marker_script(repo.path(), &marker);
@@ -202,6 +206,7 @@ fn git_config_count_env_injection_is_stripped() {
 #[test]
 #[cfg(unix)]
 fn git_config_global_env_pointing_at_evil_gitconfig_is_stripped() {
+    let _guard = common::env_lock();
     let (repo, repo_path) = make_repo();
     let marker = repo.path().join("MARKER_config_global");
     let script = make_marker_script(repo.path(), &marker);
@@ -254,6 +259,7 @@ fn c_diff_external_arg_is_rejected_with_deny_error() {
     // No need to actually be in a repo — the deny check fires before
     // git is spawned. Use a tempdir for cwd to avoid mutating whatever
     // tree the test is run from.
+    let _guard = common::env_lock();
     let dir = tempfile::tempdir().expect("tempdir");
     let out = ccrawl_in(dir.path())
         .args(["git", "-c", "diff.external=/tmp/evil.sh", "diff"])
@@ -277,6 +283,7 @@ fn c_diff_external_arg_is_rejected_with_deny_error() {
 
 #[test]
 fn benign_git_status_still_succeeds() {
+    let _guard = common::env_lock();
     let (_repo, repo_path) = make_repo();
     let out = ccrawl_in(&repo_path)
         .args(["git", "status"])
@@ -293,6 +300,7 @@ fn benign_git_status_still_succeeds() {
 
 #[test]
 fn benign_git_log_still_succeeds() {
+    let _guard = common::env_lock();
     let (_repo, repo_path) = make_repo();
     let out = ccrawl_in(&repo_path)
         .args(["git", "log", "-3", "--oneline"])
