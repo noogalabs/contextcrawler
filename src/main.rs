@@ -1194,9 +1194,11 @@ const RTK_META_COMMANDS: &[&str] = &[
 fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
     use core::utils::{
         check_forbidden_aws_args, check_forbidden_curl_args, check_forbidden_docker_args,
+        check_forbidden_gh_args, check_forbidden_glab_args, check_forbidden_gt_args,
         check_forbidden_kubectl_args, check_forbidden_psql_args, check_forbidden_wget_args,
-        secure_aws_command, secure_curl_command, secure_docker_command,
-        secure_kubectl_command, secure_psql_command, secure_wget_command,
+        secure_aws_command, secure_curl_command, secure_docker_command, secure_gh_command,
+        secure_glab_command, secure_gt_command, secure_kubectl_command, secure_psql_command,
+        secure_wget_command,
     };
 
     // Match on the basename so absolute paths (/usr/local/bin/kubectl) still resolve.
@@ -1215,6 +1217,13 @@ fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
         "psql" => (check_forbidden_psql_args(args), secure_psql_command()),
         "curl" => (check_forbidden_curl_args(args), secure_curl_command()),
         "wget" => (check_forbidden_wget_args(args), secure_wget_command()),
+        // gh/glab/gt fallback path (issue #50). If clap routing didn't match
+        // a typed subcommand and the unknown command name is one of these,
+        // still apply env-strip + arg deny rather than dropping back to a
+        // raw spawn.
+        "gh" => (check_forbidden_gh_args(args), secure_gh_command()),
+        "glab" => (check_forbidden_glab_args(args), secure_glab_command()),
+        "gt" => (check_forbidden_gt_args(args), secure_gt_command()),
         _ => return None,
     };
 

@@ -2,7 +2,9 @@
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{ok_confirmation, resolved_command, strip_ansi, truncate};
+use crate::core::utils::{
+    check_forbidden_gt_args, ok_confirmation, secure_gt_command, strip_ansi, truncate,
+};
 use anyhow::{Context, Result};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -29,7 +31,13 @@ fn run_gt_filtered(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = resolved_command("gt");
+    // Arg deny check (issue #50). Stub today, real denials later.
+    if let Err(msg) = check_forbidden_gt_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    let mut cmd = secure_gt_command();
     for part in subcmd {
         cmd.arg(part);
     }
@@ -163,9 +171,12 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<i32> {
 }
 
 fn passthrough_gt(subcommand: &str, args: &[String], verbose: u8) -> Result<i32> {
+    // SECURITY (issue #50 pre-PR review P0): gt passthrough must use
+    // `secure_gt_command()` to apply UNIVERSAL_ENV_STRIP + GT_STRIP_ENV +
+    // the inherited git env deny set.
     let mut os_args: Vec<OsString> = vec![OsString::from(subcommand)];
     os_args.extend(args.iter().map(OsString::from));
-    crate::core::runner::run_passthrough("gt", &os_args, verbose)
+    crate::core::runner::run_passthrough_cmd(secure_gt_command(), "gt", &os_args, verbose)
 }
 
 const MAX_LOG_ENTRIES: usize = 15;
