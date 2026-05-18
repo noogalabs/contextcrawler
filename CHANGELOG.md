@@ -3,6 +3,98 @@
 All notable changes to ContextCrawler are documented here. Format adapted
 from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.7] — 2026-05-18
+
+Read-filter, grep, and downstream-rebrand cleanup release. Lands the
+post-upstream-rebase fixes plus a regression-test framework
+("branding lint" + three constant-pinning tests) so the rebrand can't
+silently drift again on the next rebase.
+
+### Changed
+
+- **Read filter — symmetric 80/80 head/tail cap** (`tests/fixtures/bench`
+  baseline: cap-firing case 67.1% savings on 8473-token input). Previous
+  upstream default was 80/20, biasing toward the file's opening; equal
+  weight to tail preserves final assertions / result lines. Plus a
+  `passthrough_extensions` allowlist (e.g. `[".svelte", ".astro"]` to
+  skip the cap for source files in unfiltered languages), a two-line
+  marker that includes the escape hatch (`contextcrawler proxy cat <path>`
+  so an LLM can self-recover full content), and stdin coverage so piping
+  large files through `cat … | rtk read -` gets the same protection.
+  Closes #12.
+- **Grep pre-clap intercept for documented format flags.** `-c, -L, -o,
+  -Z` and the long-form equivalents (`--count, --files-with-matches,
+  --files-without-match, --only-matching, --null`) now route directly
+  through `rg` (system `grep` fallback), bypassing clap before its
+  unknown-arg error fires. Eliminates the 518 spurious parse_failures
+  observed in pre-fix usage. Keeps mixed invocations like
+  `grep -c --glob '*.rs' pat` working because rg understands both. `-l`
+  intentionally excluded (this app's clap claims `-l` for `--max-len`).
+  Closes #13.
+
+### Fixed
+
+- **Slim-instructions filename regression** (#19). Commit bcddd06 in
+  the upstream rebase silently flipped `RTK_MD` from `CONTEXTCRAWLER.md`
+  back to `RTK.md`. After-effects: `init -g --codex` wrote
+  `~/.codex/RTK.md` instead of `~/.codex/CONTEXTCRAWLER.md`, orphan +
+  duplicate `@`-refs accumulated in AGENTS.md, and `patch_claude_md`
+  had a hardcoded `@RTK.md` literal that bypassed its own contains-check.
+  Restored constants + added `cleanup_legacy_codex_files()` auto-migration
+  so users upgrading from regressed installs get cleaned automatically +
+  `LEGACY_RTK_MD_FILES` registry that future renames extend.
+- **`--version` printed `rtk 0.39.0`** (#22) — clap derive's `name="rtk"`
+  attribute overrode the package name. Now prints `contextcrawler X.Y.Z`.
+- **Print-string rebrand sweep** (#20 #23). 47 `[rtk]` warning/error
+  prefixes → `[contextcrawler]`, plus ~15 `RTK.md`/`@RTK.md` user-facing
+  labels in print/init paths.
+- **`release-please-config.json` had `package-name: "rtk"`** — would have
+  produced `rtk-vX.Y.Z` tags instead of `contextcrawler-vX.Y.Z`. Plus
+  Cargo.toml's `extended-description` still mentioned "rtk filters and
+  compresses". Both corrected.
+- **`patch_claude_md` would duplicate `@RTK.md` + `@CONTEXTCRAWLER.md`**
+  on upgrade (codex review catch); legacy `@`-refs now migrate in place
+  before the contains-check.
+- **`uninstall_codex_at` + `show_codex_config` ignored legacy artifacts**
+  (codex review catch); both now iterate `LEGACY_RTK_MD_FILES`.
+- **Codex CLI compliance with `contextcrawler ` prefix rule** (#9).
+  Strengthened `hooks/codex/rtk-awareness.md` template from advisory
+  one-line wording to imperative MUST + WRONG/RIGHT examples + self-check
+  instruction. Empirical compliance jumped from **0% → 80%** on real
+  codex job logs after the new template landed.
+
+### Added
+
+- **`tests/branding_lint.rs`** — scope-aware lint that scans every `.rs`
+  in `src/` for forbidden upstream literals (`[rtk]`, `[rtk:`, `RTK.md`,
+  `@RTK.md`). Allow-marker (`// branding-lint: allow legacy`) and
+  function-prefix allowlist with brace-depth tracking cover intentional
+  legacy references in cleanup tests. Plus a separate config-file check
+  that pins Cargo.toml's `[package].name` and release-please-config.json's
+  `package-name` field to `"contextcrawler"`.
+- **`tests/harness_standalone.rs`** (#29 Tier 1) — Rust integration test
+  that invokes the built binary as a subprocess with `RTK_DB_PATH` set to
+  an isolated tempfile (does NOT touch the user's real history.db), runs
+  a fixture battery, and writes `bench/results-<git-sha>.{json,md}` for
+  pre/post comparison. Baseline: 65.2% weighted savings across 4 cases
+  on develop tip. Hard regression gates: cap savings ≥50%, xcstrings
+  savings >0%. Tier 2 (Claude Code) + Tier 3 (Codex) deferred to
+  follow-up PRs.
+- **Three constant-pinning regression tests** so the next rebase can't
+  silently revert today's rebrand fixes:
+  `test_rtk_md_constant_pinned_to_contextcrawler_filename` (#19),
+  `test_cli_name_pinned_to_contextcrawler` (#22), and
+  `branding_lint_config_files_pin_canonical_package_name`.
+
+### Internal
+
+- Open follow-ups filed during this release cycle: #26 (uninstall
+  ordering — file delete should happen after AGENTS.md write succeeds,
+  low severity), #27 (`$CODEX_HOME` canonicalization — defence in
+  depth), #28 (lift codex compliance from 80% → 95% via additional
+  WRONG/RIGHT examples + a compliance measurement script), #29 (Tier
+  2/3 of the bench harness).
+
 ## [0.1.6] — 2026-05-15
 
 Security and maintenance release. Closes 12 audit findings from the

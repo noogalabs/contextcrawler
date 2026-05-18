@@ -35,12 +35,25 @@ const ALLOW_MARKER: &str = "// branding-lint: allow legacy";
 /// Substrings that, if present on the line being scanned, exempt that line.
 /// Use for short structural references (variable names, history comments)
 /// that don't justify a per-line marker.
-const STRUCTURAL_ALLOW_NEEDLES: &[&str] = &[
-    "LEGACY_RTK_MD_FILES",       // the registry itself
-    "issue #19",                 // regression-history comments
+///
+/// The history-comment exemptions below are restricted to **comment lines
+/// only** (lines whose trimmed text starts with `//`) — a non-comment line
+/// containing both `[rtk]` AND `issue #19` should still fail the lint
+/// instead of slipping through (codex P3 catch on the introduction of the
+/// config-file pin test).
+const STRUCTURAL_ALLOW_NEEDLES_ANYWHERE: &[&str] = &[
+    "LEGACY_RTK_MD_FILES", // the registry itself — appears in declarations, not comments
+];
+
+/// Same idea but only exempts the line if it's a comment. Catches the
+/// regression-history references in `src/hooks/init.rs` without weakening
+/// the lint for production code that incidentally mentions the issue
+/// number.
+const STRUCTURAL_ALLOW_NEEDLES_IN_COMMENTS_ONLY: &[&str] = &[
+    "issue #19",
     "see issue #19",
     "see #19",
-    "bcddd06",                   // the offending commit hash mentioned in history comments
+    "bcddd06", // the offending commit hash mentioned in history comments
 ];
 
 /// Function-name prefixes whose entire body is exempt from the lint. Use
@@ -133,7 +146,21 @@ fn branding_lint_no_forbidden_upstream_literals_in_src() {
             if line.contains(ALLOW_MARKER) {
                 continue;
             }
-            if STRUCTURAL_ALLOW_NEEDLES.iter().any(|n| line.contains(n)) {
+            if STRUCTURAL_ALLOW_NEEDLES_ANYWHERE
+                .iter()
+                .any(|n| line.contains(n))
+            {
+                continue;
+            }
+            // Comment-only exemptions: only applied if the line is a
+            // comment. Prevents bypass via "production code that happens
+            // to mention issue #19".
+            let is_comment_line = line.trim_start().starts_with("//");
+            if is_comment_line
+                && STRUCTURAL_ALLOW_NEEDLES_IN_COMMENTS_ONLY
+                    .iter()
+                    .any(|n| line.contains(n))
+            {
                 continue;
             }
 
@@ -188,5 +215,62 @@ fn branding_lint_canonical_name_present_in_init() {
         content.contains("@CONTEXTCRAWLER.md"),
         "src/hooks/init.rs no longer mentions @CONTEXTCRAWLER.md — \
          same regression family as #19."
+    );
+}
+
+#[test]
+fn branding_lint_config_files_pin_canonical_package_name() {
+    // Config files outside src/ — Cargo.toml's [package].name field and
+    // release-please-config.json's "package-name" — also need to read
+    // "contextcrawler", not "rtk". The upstream rebase silently set
+    // release-please-config.json's package-name back to "rtk", which would
+    // have produced rtk-vX.Y.Z tags + release-PR titles. The src/-scoped
+    // lint above doesn't cover the build/release-engineering surface, so
+    // this extra check pins those two fields explicitly.
+
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // Cargo.toml [package].name — extract via simple line scan to avoid
+    // pulling in a TOML parser dependency just for one assertion.
+    let cargo = fs::read_to_string(repo_root.join("Cargo.toml"))
+        .expect("Cargo.toml readable");
+    let mut in_package = false;
+    let mut found_name: Option<String> = None;
+    for line in cargo.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if in_package && t.starts_with("name") {
+            if let Some(eq) = t.find('=') {
+                let value = t[eq + 1..].trim().trim_matches('"').to_string();
+                found_name = Some(value);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        found_name.as_deref(),
+        Some("contextcrawler"),
+        "Cargo.toml [package].name must be \"contextcrawler\" — \
+         see issue #19 family."
+    );
+
+    // release-please-config.json package-name field. serde_json is already
+    // a workspace dep so no new dependency cost.
+    let rp = fs::read_to_string(repo_root.join("release-please-config.json"))
+        .expect("release-please-config.json readable");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&rp).expect("release-please-config.json is valid JSON");
+    let pkg_name = parsed
+        .pointer("/packages/./package-name")
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        pkg_name,
+        Some("contextcrawler"),
+        "release-please-config.json packages[\".\"].package-name must be \
+         \"contextcrawler\" — caught silently set to \"rtk\" by the \
+         upstream rebase. Same regression family as #19/#20/#22."
     );
 }
