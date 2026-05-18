@@ -2777,12 +2777,41 @@ fn resolve_codex_dir_from(
     home_dir: Option<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(path) = codex_home.filter(|path| !path.as_os_str().is_empty()) {
+        // Defence-in-depth (#27): if `$CODEX_HOME` resolves outside `$HOME`,
+        // emit a one-line stderr warning so accidental misconfiguration
+        // (`CODEX_HOME=/etc`, `CODEX_HOME=..`, etc.) is visible before init
+        // writes a config file or uninstall deletes one. Don't bail —
+        // upstream OpenAI Codex CLI accepts the same convention and legit
+        // non-home setups exist; the warning is the cheapest paranoid check.
+        if let Some(home) = home_dir.as_deref() {
+            if codex_home_path_escapes_home(&path, home) {
+                eprintln!(
+                    "[contextcrawler] WARNING: $CODEX_HOME resolves outside $HOME: {} \
+                     (continuing — set CODEX_HOME=unset if unintentional)",
+                    path.display()
+                );
+            }
+        }
         return Ok(path);
     }
 
     home_dir
         .map(|home| home.join(CODEX_DIR))
         .context("Cannot determine Codex config directory. Set $CODEX_HOME or $HOME.")
+}
+
+/// `true` if `codex_home`, after best-effort canonicalisation, does not start
+/// with `home`. Pure function — no I/O side effects, no warnings (the caller
+/// decides what to do with the result).
+///
+/// Best-effort: if `canonicalize()` fails (path doesn't exist yet — common
+/// on first-run init), we fall back to lexical comparison of the raw path,
+/// which catches the most obvious accidents (`CODEX_HOME=/etc`,
+/// `CODEX_HOME=/tmp/x`) without forcing the path to exist.
+fn codex_home_path_escapes_home(codex_home: &Path, home: &Path) -> bool {
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let canon_codex = std::fs::canonicalize(codex_home).unwrap_or_else(|_| codex_home.to_path_buf());
+    !canon_codex.starts_with(&canon_home)
 }
 
 fn resolve_hermes_home() -> Result<PathBuf> {
@@ -5007,6 +5036,50 @@ mod tests {
         assert_eq!(preferred, codex_home);
         assert_eq!(empty_falls_back, home_dir.join(".codex"));
         assert_eq!(missing_falls_back, home_dir.join(".codex"));
+    }
+
+    #[test]
+    fn test_codex_home_path_escapes_home() {
+        // REGRESSION (issue #27 defence-in-depth). Lexical fallback when
+        // canonicalize fails (paths don't have to exist for this check;
+        // canonicalize errors get swallowed and we compare raw paths).
+        let home = PathBuf::from("/Users/test");
+
+        // Outside-home accidents that should be flagged.
+        assert!(
+            codex_home_path_escapes_home(&PathBuf::from("/etc"), &home),
+            "/etc should be flagged as outside /Users/test"
+        );
+        assert!(
+            codex_home_path_escapes_home(&PathBuf::from("/tmp/evil"), &home),
+            "/tmp/evil should be flagged"
+        );
+        assert!(
+            codex_home_path_escapes_home(&PathBuf::from("/var/folders"), &home),
+            "/var/folders should be flagged"
+        );
+
+        // Inside-home: standard locations should NOT be flagged.
+        assert!(
+            !codex_home_path_escapes_home(&PathBuf::from("/Users/test/.codex"), &home),
+            "default ~/.codex must not be flagged"
+        );
+        assert!(
+            !codex_home_path_escapes_home(&PathBuf::from("/Users/test/custom-codex"), &home),
+            "alt path inside home must not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_resolve_codex_dir_returns_path_even_when_outside_home() {
+        // Behaviour contract: defence-in-depth WARNS (stderr) but does NOT
+        // bail when $CODEX_HOME points outside $HOME. The function still
+        // returns the path so legitimate non-home setups keep working.
+        // (Upstream OpenAI Codex CLI follows the same convention.)
+        let escapes = PathBuf::from("/etc/codex-fake");
+        let home = PathBuf::from("/Users/test");
+        let resolved = resolve_codex_dir_from(Some(escapes.clone()), Some(home)).unwrap();
+        assert_eq!(resolved, escapes, "function still returns the escaping path");
     }
 
     #[test]
