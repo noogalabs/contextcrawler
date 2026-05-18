@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_get_rewritten_already_rtk() {
-        assert!(get_rewritten("rtk git status").is_none());
+        assert!(get_rewritten("contextcrawler git status").is_none());
     }
 
     #[test]
@@ -614,7 +614,7 @@ mod tests {
             "decision": "allow",
             "hookSpecificOutput": {
                 "tool_input": {
-                    "command": "rtk git status"
+                    "command": "contextcrawler git status"
                 }
             }
         });
@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(json["decision"], "allow");
         assert_eq!(
             json["hookSpecificOutput"]["tool_input"]["command"],
-            "rtk git status"
+            "contextcrawler git status"
         );
     }
 
@@ -630,15 +630,15 @@ mod tests {
     fn test_gemini_hook_uses_rewrite_command() {
         assert_eq!(
             rewrite_command_no_prefixes("git status", &[]),
-            Some("rtk git status".into())
+            Some("contextcrawler git status".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("cargo test", &[]),
-            Some("rtk cargo test".into())
+            Some("contextcrawler cargo test".into())
         );
         assert_eq!(
-            rewrite_command_no_prefixes("rtk git status", &[]),
-            Some("rtk git status".into())
+            rewrite_command_no_prefixes("contextcrawler git status", &[]),
+            Some("contextcrawler git status".into())
         );
         assert_eq!(rewrite_command_no_prefixes("cat <<EOF", &[]), None);
     }
@@ -652,7 +652,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
-            Some("rtk git status".into())
+            Some("contextcrawler git status".into())
         );
     }
 
@@ -660,7 +660,7 @@ mod tests {
     fn test_gemini_hook_env_prefix_preserved() {
         assert_eq!(
             rewrite_command_no_prefixes("RUST_LOG=debug cargo test", &[]),
-            Some("RUST_LOG=debug rtk cargo test".into())
+            Some("RUST_LOG=debug contextcrawler cargo test".into())
         );
     }
 
@@ -694,7 +694,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "rtk git status");
+        assert_eq!(cmd, "contextcrawler git status");
     }
 
     #[test]
@@ -703,7 +703,7 @@ mod tests {
         let result = run_claude_inner(&input).unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
         let updated = &v["hookSpecificOutput"]["updatedInput"];
-        assert_eq!(updated["command"], "rtk git status");
+        assert_eq!(updated["command"], "contextcrawler git status");
         assert_eq!(updated["timeout"], 30000);
         assert_eq!(updated["description"], "Check repo status");
     }
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_claude_already_rtk_passthrough() {
-        assert!(run_claude_inner(&claude_input("rtk git status")).is_none());
+        assert!(run_claude_inner(&claude_input("contextcrawler git status")).is_none());
     }
 
     #[test]
@@ -746,7 +746,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "GIT_PAGER=cat rtk git status");
+        assert_eq!(cmd, "GIT_PAGER=cat contextcrawler git status");
     }
 
     #[test]
@@ -757,7 +757,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "rtk git add . && rtk cargo test");
+        assert_eq!(cmd, "contextcrawler git add . && contextcrawler cargo test");
     }
 
     #[test]
@@ -796,7 +796,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         // Cursor preToolUse expects allow/deny for rewrite application.
         assert_eq!(v["permission"], "allow");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "contextcrawler git status");
         assert!(v.get("hookSpecificOutput").is_none());
         // `continue: true` keeps the Cursor preToolUse panel from collapsing
         // to `Output: {}`; without it the rewrite is invisible to users.
@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn test_cursor_already_rtk_passthrough() {
-        let result = run_cursor_inner(&cursor_input("rtk git status"));
+        let result = run_cursor_inner(&cursor_input("contextcrawler git status"));
         assert_eq!(result, "{}");
     }
 
@@ -845,7 +845,7 @@ mod tests {
         assert_eq!(v["permission"], "allow");
         assert_eq!(
             v["updated_input"]["command"],
-            "cd \"/tmp/proj\" && rtk git status"
+            "cd \"/tmp/proj\" && contextcrawler git status"
         );
     }
 
@@ -860,14 +860,14 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "contextcrawler git status");
     }
 
     #[test]
     fn test_cursor_strips_double_utf8_bom() {
         // Cursor on Windows ships hook stdin with **two** leading
         // UTF-8 BOMs (`EF BB BF EF BB BF`), confirmed via a stdin
-        // tracer wrapping `rtk hook cursor` on Cursor 3.2.x. This is
+        // tracer wrapping `contextcrawler hook cursor` on Cursor 3.2.x. This is
         // the real-world payload shape the loop needs to survive.
         let payload = cursor_input("git status");
         let with_double_bom = format!("\u{feff}\u{feff}{}", payload);
@@ -875,7 +875,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "contextcrawler git status");
     }
 
     #[test]
@@ -896,7 +896,7 @@ mod tests {
     #[test]
     fn test_audit_log_silent_when_disabled() {
         std::env::remove_var("RTK_HOOK_AUDIT");
-        audit_log("test", "git status", "rtk git status");
+        audit_log("test", "git status", "contextcrawler git status");
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
                 .open(&log_path)
                 .unwrap();
             let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-            writeln!(file, "{} | rewrite | git status | rtk git status", ts).unwrap();
+            writeln!(file, "{} | rewrite | git status | contextcrawler git status", ts).unwrap();
         }
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -926,7 +926,7 @@ mod tests {
         );
         assert_eq!(parts[1], "rewrite");
         assert_eq!(parts[2], "git status");
-        assert_eq!(parts[3], "rtk git status");
+        assert_eq!(parts[3], "contextcrawler git status");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -11,14 +11,17 @@ use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-// ===== contextzip-downstream: drop redundant `rtk ` prefix in display =====
-// Every tracked command starts with `rtk ` in the SQLite column because the
-// registry rewriter emits "rtk <subcmd> ..." strings. That prefix is the
-// same on every row — strip it at display time so the table stays useful.
+// Drop the redundant tool-name prefix at display time. Tracked commands
+// have one of TWO prefixes depending on when they were recorded:
+//   - `rtk X`            — pre-#62 (kept for historical rows + tracking
+//                          labels in cmd modules that haven't migrated yet)
+//   - `contextcrawler X` — post-#62 (current rewrite output + new tracking)
+// Strip whichever prefix the row has so old + new bucket together.
 fn display_cmd(s: &str) -> &str {
-    s.strip_prefix("rtk ").unwrap_or(s)
+    s.strip_prefix("contextcrawler ")
+        .or_else(|| s.strip_prefix("rtk "))
+        .unwrap_or(s)
 }
-// ===== end contextzip-downstream =====
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(

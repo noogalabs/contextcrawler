@@ -65,7 +65,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     timer.track(
         &format!("curl {}", args.join(" ")),
-        &format!("rtk curl {}", args.join(" ")),
+        &format!("contextcrawler curl {}", args.join(" ")),
         &raw,
         &filtered.content,
     );

@@ -81,7 +81,7 @@ fn run_gt_filtered(
     } else {
         format!("gt {} {}", subcmd_str, args.join(" "))
     };
-    let rtk_label = format!("rtk {}", label);
+    let rtk_label = format!("contextcrawler {}", label);
     timer.track(&label, &rtk_label, &raw, &output);
 
     Ok(cmd_output.exit_code)

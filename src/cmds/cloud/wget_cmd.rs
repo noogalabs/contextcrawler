@@ -43,12 +43,12 @@ pub fn run(url: &str, args: &[String], verbose: u8) -> Result<i32> {
             format_size(size)
         );
         println!("{}", msg);
-        timer.track(&format!("wget {}", url), "rtk wget", &raw_output, &msg);
+        timer.track(&format!("wget {}", url), "contextcrawler wget", &raw_output, &msg);
     } else {
         let error = parse_error(&result.stderr, &result.stdout);
         let msg = format!("{} FAILED: {}", compact_url(url), error);
         println!("{}", msg);
-        timer.track(&format!("wget {}", url), "rtk wget", &raw_output, &msg);
+        timer.track(&format!("wget {}", url), "contextcrawler wget", &raw_output, &msg);
         return Ok(result.exit_code);
     }
 
@@ -104,7 +104,7 @@ pub fn run_stdout(url: &str, args: &[String], verbose: u8) -> Result<i32> {
         print!("{}", rtk_output);
         timer.track(
             &format!("wget -O - {}", url),
-            "rtk wget -o",
+            "contextcrawler wget -o",
             &result.stdout,
             &rtk_output,
         );
@@ -112,7 +112,7 @@ pub fn run_stdout(url: &str, args: &[String], verbose: u8) -> Result<i32> {
         let error = parse_error(&result.stderr, "");
         let msg = format!("{} FAILED: {}", compact_url(url), error);
         println!("{}", msg);
-        timer.track(&format!("wget -O - {}", url), "rtk wget -o", &result.stderr, &msg);
+        timer.track(&format!("wget -O - {}", url), "contextcrawler wget -o", &result.stderr, &msg);
         return Ok(result.exit_code);
     }
 

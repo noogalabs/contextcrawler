@@ -1346,7 +1346,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
 
                 timer.track(
                     &raw_command,
-                    &format!("rtk:toml {}", raw_command),
+                    &format!("contextcrawler:toml {}", raw_command),
                     &combined_raw,
                     &filtered,
                 );
@@ -1372,7 +1372,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
 
         match status {
             Ok(s) => {
-                timer.track_passthrough(&raw_command, &format!("rtk fallback: {}", raw_command));
+                timer.track_passthrough(&raw_command, &format!("contextcrawler fallback: {}", raw_command));
 
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
 
@@ -1707,7 +1707,7 @@ fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
             timer.track_passthrough(
                 &raw_command,
                 &format!(
-                    "rtk grep (format-flag passthrough via {}): {}",
+                    "contextcrawler grep (format-flag passthrough via {}): {}",
                     preferred, raw_command
                 ),
             );
@@ -2611,7 +2611,7 @@ fn run_cli() -> Result<i32> {
                                 let args_str = args.join(" ");
                                 timer.track_passthrough(
                                     &format!("npx {}", args_str),
-                                    &format!("rtk npx {} (passthrough)", args_str),
+                                    &format!("contextcrawler npx {} (passthrough)", args_str),
                                 );
                                 core::utils::exit_code_from_status(&status, "npx prisma")
                             }
@@ -2941,7 +2941,7 @@ fn run_cli() -> Result<i32> {
             // Track usage (input = output since no filtering)
             timer.track(
                 &format!("{} {}", cmd_name, cmd_args.join(" ")),
-                &format!("rtk proxy {} {}", cmd_name, cmd_args.join(" ")),
+                &format!("contextcrawler proxy {} {}", cmd_name, cmd_args.join(" ")),
                 &full_output,
                 &full_output,
             );

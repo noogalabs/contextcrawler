@@ -19,7 +19,7 @@
 //! let timer = TimedExecution::start();
 //! let input = "raw output";
 //! let output = "filtered output";
-//! timer.track("ls -la", "rtk ls", input, output);
+//! timer.track("ls -la", "contextcrawler ls", input, output);
 //!
 //! // Query statistics
 //! let tracker = Tracker::new().unwrap();
@@ -174,7 +174,7 @@ use super::constants::{DEFAULT_HISTORY_DAYS, HISTORY_DB, RTK_DATA_DIR};
 /// use rtk::tracking::Tracker;
 ///
 /// let tracker = Tracker::new()?;
-/// tracker.record("ls -la", "rtk ls", 1000, 200, 50)?;
+/// tracker.record("ls -la", "contextcrawler ls", 1000, 200, 50)?;
 ///
 /// let summary = tracker.get_summary()?;
 /// println!("Total saved: {} tokens", summary.total_saved);
@@ -191,7 +191,7 @@ pub struct Tracker {
 pub struct CommandRecord {
     /// UTC timestamp when command was executed
     pub timestamp: DateTime<Utc>,
-    /// RTK command that was executed (e.g., "rtk ls")
+    /// RTK command that was executed (e.g., "contextcrawler ls")
     pub rtk_cmd: String,
     /// Number of tokens saved (input - output)
     pub saved_tokens: usize,
@@ -1181,7 +1181,7 @@ impl Tracker {
 
     /// Count invocations of a specific meta-command (by rtk_cmd suffix).
     pub fn count_meta_command(&self, name: &str) -> Result<i64> {
-        let pattern = format!("rtk {}", name);
+        let pattern = format!("contextcrawler {}", name);
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM commands WHERE rtk_cmd LIKE ?1 || '%'",
             params![pattern],
@@ -1725,7 +1725,7 @@ mod tests {
         let tracker = Tracker::new().expect("Failed to create tracker");
 
         // Use unique test identifier to avoid conflicts with other tests
-        let test_cmd = format!("rtk git status test_{}", std::process::id());
+        let test_cmd = format!("contextcrawler git status test_{}", std::process::id());
 
         tracker
             .record("git status", &test_cmd, 100, 20, 50)
@@ -1750,8 +1750,8 @@ mod tests {
 
         // Use unique test identifiers
         let pid = std::process::id();
-        let cmd1 = format!("rtk cmd1_test_{}", pid);
-        let cmd2 = format!("rtk cmd2_passthrough_test_{}", pid);
+        let cmd1 = format!("contextcrawler cmd1_test_{}", pid);
+        let cmd2 = format!("contextcrawler cmd2_passthrough_test_{}", pid);
 
         // Record one real command with 80% savings
         tracker
@@ -1931,7 +1931,7 @@ mod tests {
         tracker
             .record(
                 "git status",
-                &format!("rtk git status reset_test_{}", pid),
+                &format!("contextcrawler git status reset_test_{}", pid),
                 100,
                 20,
                 50,

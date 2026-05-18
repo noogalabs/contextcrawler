@@ -91,7 +91,7 @@ pub fn run(
 
         timer.track_passthrough(
             &format!("grep {}", args_display),
-            &format!("rtk grep {} (passthrough)", args_display),
+            &format!("contextcrawler grep {} (passthrough)", args_display),
         );
         return Ok(result.exit_code);
     }

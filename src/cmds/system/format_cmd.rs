@@ -127,7 +127,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     timer.track(
         &format!("{} {}", formatter, user_args.join(" ")),
-        &format!("rtk format {} {}", formatter, user_args.join(" ")),
+        &format!("contextcrawler format {} {}", formatter, user_args.join(" ")),
         &raw,
         &filtered,
     );
