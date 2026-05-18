@@ -480,6 +480,370 @@ pub fn secure_rg_command(name: &str) -> Command {
     cmd
 }
 
+/// git env vars that contextcrawler refuses to forward to the spawned
+/// `git` subprocess. All of these let an attacker steer git into running
+/// an attacker-controlled binary or read an attacker-controlled config
+/// file before the user-supplied subcommand even runs — confirmed RCE
+/// vectors equivalent to the rg `--pre` class from issue #32. See issue
+/// #35 for the empirical PoCs.
+///
+/// Grouped by mechanism:
+///   - `GIT_EXTERNAL_DIFF` / `GIT_PAGER` / `GIT_EDITOR` / `GIT_SEQUENCE_EDITOR`
+///     run as helper subprocesses with the user's env around diff/log/commit.
+///   - `GIT_SSH` / `GIT_SSH_COMMAND` / `GIT_PROXY_COMMAND` override the
+///     transport binary for fetch/push.
+///   - `GIT_ASKPASS` / `SSH_ASKPASS` get exec'd for credential prompts.
+///   - `GIT_CONFIG` / `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` swap in an
+///     attacker-controlled config file, which can in turn set
+///     `diff.external` etc. and reach the first group.
+///   - `GIT_CONFIG_COUNT` + `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+///     inject ad-hoc config entries via env (the env-var equivalent of
+///     `git -c key=val`); the loop below strips up to N=63 which covers
+///     `GIT_CONFIG_COUNT` values up to 64.
+///   - `GIT_TEMPLATE_DIR` / `GIT_EXEC_PATH` / `GIT_HOOKS_PATH` redirect
+///     git to load helpers/hooks from an attacker-controlled directory.
+const FORBIDDEN_GIT_ENV_VARS: &[&str] = &[
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_PROXY_COMMAND",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_TEMPLATE_DIR",
+    "GIT_EXEC_PATH",
+    "GIT_HOOKS_PATH",
+];
+
+/// Upper bound (exclusive) for the `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+/// strip loop. Covers `GIT_CONFIG_COUNT` values up to 64, which is well above
+/// any plausible legitimate use and matches the env-var injection ceiling we
+/// care about for issue #35.
+const GIT_CONFIG_ENV_INDEX_LIMIT: usize = 64;
+
+/// Build a Command for invoking `git` with the env-var-driven RCE/config
+/// injection vectors stripped from the inherited environment. Without
+/// this, any process that has `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`,
+/// `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_COUNT=…` + `GIT_CONFIG_KEY_0=…` etc.
+/// set in its env can hijack every contextcrawler git call — git will
+/// happily exec the attacker-supplied binary, or load the attacker-
+/// supplied config file (which can in turn set `diff.external` and reach
+/// the same exec sink). Confirmed RCE; see issue #35.
+///
+/// All legitimate `git`-spawning call sites should use this instead of
+/// the raw `resolved_command("git")`.
+pub fn secure_git_command() -> Command {
+    let mut cmd = resolved_command("git");
+    for var in FORBIDDEN_GIT_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    // Strip the indexed config-injection pairs. `GIT_CONFIG_COUNT=N` tells
+    // git to read `GIT_CONFIG_KEY_0..N-1` + `GIT_CONFIG_VALUE_0..N-1` as
+    // ad-hoc `-c key=val` entries, which is enough on its own to set
+    // `diff.external` and reach a script. Removing `GIT_CONFIG_COUNT`
+    // above neutralizes the trigger, but we also strip the data pairs so
+    // a future code path that re-sets `GIT_CONFIG_COUNT` can't accidentally
+    // resurrect the attacker's payload.
+    for n in 0..GIT_CONFIG_ENV_INDEX_LIMIT {
+        cmd.env_remove(format!("GIT_CONFIG_KEY_{}", n));
+        cmd.env_remove(format!("GIT_CONFIG_VALUE_{}", n));
+    }
+    cmd
+}
+
+/// git flags that contextcrawler refuses to forward to the spawned
+/// `git` subprocess. All of these either run an attacker-supplied
+/// program or load attacker-controlled config that does the same. See
+/// issue #35.
+///
+/// Long-form transport overrides (`--upload-pack`, `--receive-pack`)
+/// set the remote-side binary that git execs over the transport when
+/// you fetch / push / clone — confirmed RCE vector against any host
+/// the attacker can convince you to clone from. `--exec-path` swaps the
+/// directory git looks in for its own helpers (`git-fetch-pack` etc.),
+/// equivalent in blast radius.
+const FORBIDDEN_GIT_FLAGS_EXACT: &[&str] =
+    &["--upload-pack", "--receive-pack", "--exec-path"];
+
+const FORBIDDEN_GIT_FLAGS_PREFIX: &[&str] =
+    &["--upload-pack=", "--receive-pack=", "--exec-path="];
+
+/// Config keys (case-insensitive prefix match) that contextcrawler
+/// refuses to forward via `-c key=val`. Each of these, when set,
+/// causes git to exec an attacker-controlled program during ordinary
+/// subcommands. The denylist mirrors the env-var deny set:
+///
+///   - `diff.external` — runs per-file during `diff` / `log -p` / `show`.
+///   - `core.editor` / `core.pager` — exec'd by `commit`, paged output, etc.
+///   - `core.sshCommand` / `core.gitProxy` — transport-layer exec.
+///   - `core.fsmonitor` — exec'd by every status-like command.
+///   - `core.hooksPath` — redirects hooks to an attacker-controlled dir.
+///   - `protocol.*` — `protocol.<name>.command` is straightforward RCE
+///     against any URL matching that scheme; the whole namespace is gated.
+///   - `uploadpack.packObjectsHook` — server-side exec during pack-objects.
+///   - `safe.directory` — not an RCE on its own, but lets an attacker
+///     mark a planted `.git` directory as trusted so subsequent commands
+///     in that tree run its hooks; gated for defense-in-depth.
+///
+/// All entries are matched case-insensitively against the key portion of
+/// `key=val`. Git config keys are case-insensitive in the section and
+/// variable name (only the subsection is case-sensitive), so we lowercase
+/// both sides of the comparison; redundant `Camel` / `lower` variants are
+/// not needed but are tolerated as no-ops.
+const FORBIDDEN_GIT_CONFIG_KEY_PREFIXES: &[&str] = &[
+    "diff.external",
+    "core.editor",
+    "core.pager",
+    "core.sshcommand",
+    "core.fsmonitor",
+    "core.gitproxy",
+    "core.hookspath",
+    "protocol.",
+    "uploadpack.packobjectshook",
+    "safe.directory",
+];
+
+/// Scan args for any flag in the git deny list. Returns `Err` with a
+/// clear user-facing explanation if one is found. The error message
+/// names the offending flag and points at the escape hatch.
+///
+/// Handles all four shapes the denied flags can appear in:
+///   - `--upload-pack=foo` (prefix form)
+///   - `--upload-pack foo` (two-arg form — denied on the flag alone,
+///     so the value never reaches git)
+///   - `-c diff.external=/x` (two-arg `-c`)
+///   - `-c=diff.external=/x` (single-arg `-c=`)
+///
+/// See issue #35 for the empirical PoCs that motivate each shape.
+pub fn check_forbidden_git_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+
+        // Exact-match deny for the long-form transport overrides. We
+        // reject on the flag alone so the value (whether in the next
+        // arg or absent) never reaches git.
+        if FORBIDDEN_GIT_FLAGS_EXACT.iter().any(|f| a == *f) {
+            return Err(git_deny_message(a));
+        }
+
+        // Prefix-match deny for `--flag=value` form.
+        if FORBIDDEN_GIT_FLAGS_PREFIX.iter().any(|p| a.starts_with(p)) {
+            return Err(git_deny_message(a));
+        }
+
+        // `-c key=val` (two-arg shape).
+        if a == "-c" {
+            if let Some(next) = args.get(i + 1) {
+                let entry = next.as_ref();
+                if let Some(reason) = forbidden_git_config_entry(entry) {
+                    return Err(git_deny_message(&reason));
+                }
+            }
+            // Skip past the value either way — if it's not a deny-listed
+            // key it's fine, and skipping prevents the scanner from
+            // misinterpreting a `value` that happens to look like a flag.
+            i += 2;
+            continue;
+        }
+
+        // `-c=key=val` (single-arg shape — rarer but git accepts it).
+        if let Some(rest) = a.strip_prefix("-c=") {
+            if let Some(reason) = forbidden_git_config_entry(rest) {
+                return Err(git_deny_message(&reason));
+            }
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
+/// If `entry` is a `key=val` whose key matches the config denylist (case-
+/// insensitive prefix), return a human-readable description naming the
+/// offending key. Otherwise return None.
+fn forbidden_git_config_entry(entry: &str) -> Option<String> {
+    let key = entry.split_once('=').map(|(k, _)| k).unwrap_or(entry);
+    let key_lower = key.to_ascii_lowercase();
+    for denied in FORBIDDEN_GIT_CONFIG_KEY_PREFIXES {
+        if key_lower.starts_with(denied) {
+            return Some(format!("-c {}=…", key));
+        }
+    }
+    None
+}
+
+fn git_deny_message(offending: &str) -> String {
+    format!(
+        "[contextcrawler] refusing to forward '{}' to git — this flag or \
+         config key lets an attacker run an arbitrary program during ordinary \
+         git subcommands (issue #35). If you genuinely need it, use: \
+         contextcrawler proxy git <args>",
+        offending
+    )
+}
+
+#[cfg(test)]
+mod secure_git_tests {
+    use super::*;
+
+    #[test]
+    fn secure_git_command_strips_all_listed_env_vars() {
+        // Set every var the helper claims to strip, plus a few
+        // GIT_CONFIG_KEY_<n> / VALUE_<n> entries, then introspect the
+        // resulting Command to confirm each one has been removed from
+        // the child env (via `get_envs()` returning `(key, None)`).
+        for var in FORBIDDEN_GIT_ENV_VARS {
+            std::env::set_var(var, "marker");
+        }
+        std::env::set_var("GIT_CONFIG_KEY_0", "diff.external");
+        std::env::set_var("GIT_CONFIG_VALUE_0", "/tmp/x");
+        std::env::set_var("GIT_CONFIG_KEY_63", "core.editor");
+        std::env::set_var("GIT_CONFIG_VALUE_63", "/tmp/x");
+
+        let cmd = secure_git_command();
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+
+        let stripped = |name: &str| {
+            envs.iter().any(|(k, v)| {
+                k.to_string_lossy() == name && v.is_none()
+            })
+        };
+
+        for var in FORBIDDEN_GIT_ENV_VARS {
+            assert!(
+                stripped(var),
+                "secure_git_command must env_remove({})",
+                var
+            );
+        }
+        assert!(stripped("GIT_CONFIG_KEY_0"));
+        assert!(stripped("GIT_CONFIG_VALUE_0"));
+        assert!(stripped("GIT_CONFIG_KEY_63"));
+        assert!(stripped("GIT_CONFIG_VALUE_63"));
+
+        // Cleanup — these are process-global and would leak into
+        // sibling tests if the harness reuses the test process.
+        for var in FORBIDDEN_GIT_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        std::env::remove_var("GIT_CONFIG_KEY_0");
+        std::env::remove_var("GIT_CONFIG_VALUE_0");
+        std::env::remove_var("GIT_CONFIG_KEY_63");
+        std::env::remove_var("GIT_CONFIG_VALUE_63");
+    }
+
+    #[test]
+    fn rejects_upload_pack_both_forms() {
+        assert!(
+            check_forbidden_git_args(&["clone", "--upload-pack", "/tmp/evil", "url"]).is_err()
+        );
+        assert!(check_forbidden_git_args(&["clone", "--upload-pack=/tmp/evil", "url"]).is_err());
+    }
+
+    #[test]
+    fn rejects_receive_pack_both_forms() {
+        assert!(
+            check_forbidden_git_args(&["push", "--receive-pack", "/tmp/evil", "url"]).is_err()
+        );
+        assert!(check_forbidden_git_args(&["push", "--receive-pack=/tmp/evil"]).is_err());
+    }
+
+    #[test]
+    fn rejects_exec_path_both_forms() {
+        assert!(check_forbidden_git_args(&["--exec-path", "/tmp/evil", "status"]).is_err());
+        assert!(check_forbidden_git_args(&["--exec-path=/tmp/evil", "status"]).is_err());
+    }
+
+    #[test]
+    fn rejects_c_diff_external() {
+        assert!(check_forbidden_git_args(&["-c", "diff.external=/tmp/x", "diff"]).is_err());
+        assert!(check_forbidden_git_args(&["-c=diff.external=/tmp/x", "diff"]).is_err());
+    }
+
+    #[test]
+    fn rejects_c_core_editor_and_pager() {
+        assert!(check_forbidden_git_args(&["-c", "core.editor=/tmp/x", "commit"]).is_err());
+        assert!(check_forbidden_git_args(&["-c", "core.pager=/tmp/x", "log"]).is_err());
+    }
+
+    #[test]
+    fn rejects_c_ssh_command_case_insensitive() {
+        // Git treats the section/variable as case-insensitive; the
+        // denylist must too. `core.sshCommand` and `core.sshcommand`
+        // both map to the same key, so both should bounce.
+        assert!(check_forbidden_git_args(&["-c", "core.sshCommand=/tmp/x", "fetch"]).is_err());
+        assert!(check_forbidden_git_args(&["-c", "core.sshcommand=/tmp/x", "fetch"]).is_err());
+    }
+
+    #[test]
+    fn rejects_c_fsmonitor_proxy_hooks() {
+        assert!(check_forbidden_git_args(&["-c", "core.fsmonitor=/tmp/x", "status"]).is_err());
+        assert!(check_forbidden_git_args(&["-c", "core.gitProxy=/tmp/x", "clone"]).is_err());
+        assert!(check_forbidden_git_args(&["-c", "core.hooksPath=/tmp/x", "commit"]).is_err());
+    }
+
+    #[test]
+    fn rejects_c_protocol_namespace() {
+        // Any subkey under `protocol.<name>` (e.g. `protocol.ext.allow`,
+        // `protocol.https.allow`, `protocol.file.command`) can be abused.
+        // Gate the whole namespace, not a hand-rolled subset.
+        assert!(check_forbidden_git_args(&["-c", "protocol.ext.allow=always", "clone"]).is_err());
+        assert!(
+            check_forbidden_git_args(&["-c", "protocol.file.command=/x", "clone"]).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_c_uploadpack_pack_objects_hook() {
+        assert!(check_forbidden_git_args(&[
+            "-c",
+            "uploadpack.packObjectsHook=/tmp/x",
+            "upload-pack"
+        ])
+        .is_err());
+        assert!(check_forbidden_git_args(&[
+            "-c",
+            "uploadpack.packobjectshook=/tmp/x",
+            "upload-pack"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_c_safe_directory() {
+        assert!(check_forbidden_git_args(&["-c", "safe.directory=/tmp/evil", "status"]).is_err());
+    }
+
+    #[test]
+    fn allows_benign_git_args() {
+        assert!(check_forbidden_git_args(&["status"]).is_ok());
+        assert!(check_forbidden_git_args(&["log", "-3", "--oneline"]).is_ok());
+        assert!(check_forbidden_git_args(&["diff", "HEAD~1"]).is_ok());
+        // Benign `-c` config that isn't on the denylist must still pass —
+        // e.g. setting commit template or user.email. We don't want to
+        // over-block.
+        assert!(check_forbidden_git_args(&["-c", "user.email=foo@bar.com", "commit"]).is_ok());
+        assert!(check_forbidden_git_args(&["-c", "color.ui=always", "log"]).is_ok());
+    }
+
+    #[test]
+    fn error_message_mentions_escape_hatch() {
+        let err = check_forbidden_git_args(&["-c", "diff.external=/x", "diff"]).unwrap_err();
+        assert!(err.contains("contextcrawler proxy git"));
+        assert!(err.contains("#35"));
+    }
+}
+
 #[cfg(test)]
 mod secure_rg_tests {
     use super::*;

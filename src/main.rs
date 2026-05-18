@@ -1810,7 +1810,19 @@ fn run_cli() -> Result<i32> {
                 global_args.push("-C".to_string());
                 global_args.push(dir.clone());
             }
+            // Validate `-c key=val` overrides BEFORE pushing them into
+            // global_args — `core::utils::check_forbidden_git_args` rejects
+            // `-c diff.external=…`, `-c core.sshCommand=…`, `-c protocol.*`,
+            // etc., which would otherwise let an attacker drive git into
+            // exec'ing an arbitrary program during ordinary subcommands.
+            // See issue #35 for the empirical PoCs. Synthesize the `-c <entry>`
+            // pair the validator expects.
             for cfg in &config_override {
+                let synth = ["-c".to_string(), cfg.clone()];
+                if let Err(msg) = core::utils::check_forbidden_git_args(&synth) {
+                    eprintln!("{}", msg);
+                    return Ok(2);
+                }
                 global_args.push("-c".to_string());
                 global_args.push(cfg.clone());
             }

@@ -186,7 +186,12 @@ fn find_project_root() -> Option<PathBuf> {
     // Fallback: git (spawns a subprocess, slower but handles monorepo layouts).
     // exec_capture_short bounds the wall-clock so a stalled git can't freeze
     // the PreToolUse hook. Timeout → None → caller treats as "no project root".
-    let mut cmd = std::process::Command::new("git");
+    // `secure_git_command` strips the env-driven RCE vectors (GIT_EXTERNAL_DIFF,
+    // GIT_SSH_COMMAND, GIT_CONFIG_GLOBAL, GIT_CONFIG_COUNT/_KEY_/_VALUE_, …)
+    // — even though `rev-parse --show-toplevel` itself is not a known exec
+    // sink, hardening uniformly avoids surprises if a future git version
+    // grows one. See issue #35.
+    let mut cmd = crate::core::utils::secure_git_command();
     cmd.args(["rev-parse", "--show-toplevel"]);
     let result = exec_capture_short(&mut cmd, GIT_TOPLEVEL_TIMEOUT).ok()?;
 
