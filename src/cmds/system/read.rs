@@ -131,7 +131,7 @@ pub fn run_stdin(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_output(
+pub(crate) fn render_output(
     content: &str,
     ext: Option<&str>,
     lang: Language,
