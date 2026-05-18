@@ -1,18 +1,23 @@
 //! Filters Next.js build output down to route metrics and bundle sizes.
 
 use crate::core::runner;
-use crate::core::utils::{resolved_command, strip_ansi, tool_exists, truncate};
-use anyhow::Result;
+use crate::core::utils::{
+    check_forbidden_node_args, secure_node_command, strip_ansi, tool_exists, truncate,
+};
+use anyhow::{anyhow, Result};
 use regex::Regex;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
     // Try next directly first, fallback to npx if not found
     let next_exists = tool_exists("next");
 
     let mut cmd = if next_exists {
-        resolved_command("next")
+        secure_node_command("next")
     } else {
-        let mut c = resolved_command("npx");
+        let mut c = secure_node_command("npx");
         c.arg("next");
         c
     };

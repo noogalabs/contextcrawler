@@ -3,10 +3,12 @@
 use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{package_manager_exec, resolved_command, truncate};
+use crate::core::utils::{
+    check_forbidden_node_args, package_manager_exec, resolved_command, truncate,
+};
 use crate::mypy_cmd;
 use crate::ruff_cmd;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -99,6 +101,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = if is_python_linter(linter) {
         resolved_command(linter)
     } else {
+        // Issue #37: gate user-forwarded args before they reach
+        // eslint/biome/etc. Python linters keep their own hardening
+        // path; this gate covers Node tools only.
+        check_forbidden_node_args(effective_args).map_err(|m| anyhow!(m))?;
         package_manager_exec(linter)
     };
 

@@ -2,8 +2,10 @@
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{detect_package_manager, resolved_command, strip_ansi};
-use anyhow::{Context, Result};
+use crate::core::utils::{
+    check_forbidden_node_args, detect_package_manager, secure_node_command, strip_ansi,
+};
+use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -244,22 +246,25 @@ fn extract_failures_regex(output: &str) -> Vec<TestFailure> {
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
     // Skip `which playwright` — it can find pyenv shims or other non-Node
     // binaries. Always resolve through the package manager.
     let pm = detect_package_manager();
     let mut cmd = match pm {
         "pnpm" => {
-            let mut c = resolved_command("pnpm");
+            let mut c = secure_node_command("pnpm");
             c.arg("exec").arg("--").arg("playwright");
             c
         }
         "yarn" => {
-            let mut c = resolved_command("yarn");
+            let mut c = secure_node_command("yarn");
             c.arg("exec").arg("--").arg("playwright");
             c
         }
         _ => {
-            let mut c = resolved_command("npx");
+            let mut c = secure_node_command("npx");
             c.arg("--no-install").arg("--").arg("playwright");
             c
         }
