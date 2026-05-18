@@ -1524,27 +1524,27 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
         match action {
             RtkBlockUpsert::Added => {
                 if dry_run {
-                    println!("[dry-run] would add rtk instructions to {}", path.display());
+                    println!("[dry-run] would add contextcrawler instructions to {}", path.display());
                 } else {
                     fs::write(&path, new_content)?;
-                    println!("[ok] Added rtk instructions to existing {}", path.display());
+                    println!("[ok] Added contextcrawler instructions to existing {}", path.display());
                 }
             }
             RtkBlockUpsert::Updated => {
                 if dry_run {
                     println!(
-                        "[dry-run] would update rtk instructions in {}",
+                        "[dry-run] would update contextcrawler instructions in {}",
                         path.display()
                     );
                 } else {
                     fs::write(&path, new_content)?;
-                    println!("[ok] Updated rtk instructions in {}", path.display());
+                    println!("[ok] Updated contextcrawler instructions in {}", path.display());
                 }
             }
             RtkBlockUpsert::Unchanged => {
                 if !dry_run {
                     println!(
-                        "[ok] {} already contains up-to-date rtk instructions",
+                        "[ok] {} already contains up-to-date contextcrawler instructions",
                         path.display()
                     );
                 }
@@ -1576,12 +1576,12 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
         }
     } else if dry_run {
         println!(
-            "[dry-run] would create {} with rtk instructions",
+            "[dry-run] would create {} with contextcrawler instructions",
             path.display()
         );
     } else {
         fs::write(&path, RTK_INSTRUCTIONS)?;
-        println!("[ok] Created {} with rtk instructions", path.display());
+        println!("[ok] Created {} with contextcrawler instructions", path.display());
     }
 
     if global {

@@ -368,7 +368,7 @@ fn run_aws_filtered(
     }
 
     let result = filter_fn(&stdout).unwrap_or_else(|| {
-        eprintln!("rtk: filter warning: aws filter returned None, passing through raw output");
+        eprintln!("contextcrawler: filter warning: aws filter returned None, passing through raw output");
         FilterResult::new(stdout.clone())
     });
 

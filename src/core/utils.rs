@@ -369,14 +369,14 @@ pub fn resolved_command(name: &str) -> Command {
             // On Unix, this is less common; only log in debug builds.
             #[cfg(target_os = "windows")]
             eprintln!(
-                "rtk: Failed to resolve '{}' via PATH, falling back to direct exec: {}",
+                "contextcrawler: Failed to resolve '{}' via PATH, falling back to direct exec: {}",
                 name, _e
             );
             #[cfg(not(target_os = "windows"))]
             {
                 #[cfg(debug_assertions)]
                 eprintln!(
-                    "rtk: Failed to resolve '{}' via PATH, falling back to direct exec: {}",
+                    "contextcrawler: Failed to resolve '{}' via PATH, falling back to direct exec: {}",
                     name, _e
                 );
             }
