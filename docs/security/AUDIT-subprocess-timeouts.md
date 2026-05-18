@@ -10,10 +10,21 @@ sites need the same — and which deliberately don't.
 
 ## TL;DR
 
-There is **one central choke point** (`src/core/stream.rs::exec_capture`)
-that 18 modules go through. Two additional call sites bypass it
-(`main.rs` raw `--shell` passthrough; `hooks/permissions.rs` git
-rev-parse via `exec_capture` itself).
+`exec_capture` is the **major** choke point — 18 modules route through
+it. But it is **not** the only path: a class of filter modules
+(`aws_cmd`, `go_cmd`, `git.rs::run_commit`, the main-level TOML-match
+filter dispatch, the proxy command) call `Command::output()` /
+`Command::status()` / `Command::spawn()` directly. The original cut of
+this audit understated that surface; the **2026-05-18 re-grep** (Codex
+review of the first hardening commit) found those sites and they are
+now enumerated below.
+
+Also surfaced by the re-grep: `src/analytics/security_cmd.rs::{fetch_audit_stats, fetch_doctor_status}`
+is **NOT** hardened despite the v0.1.6 overnight summary claiming it
+was. There is no `run_tirith_capture` helper and no `wait_timeout`
+import in that file — `Command::new(bin).output()` runs unbounded.
+This is the same "trust the commit subject, not the code" failure mode
+the project memory rule covers. Tracked as F-06 below.
 
 Three policy classes emerge:
 
@@ -31,24 +42,39 @@ variant.
 
 ## Method
 
-`grep -rn "Command::new" src/ --include="*.rs"` yielded **52 matches
-across 10 files**. Filtering out `#[test]`, `#[cfg(test)]`, `#[ignore]`,
-factory helpers (`ruby_exec`, `resolved_command`, `build_command`,
-`build_shell_command` — they return a `Command` but don't run it), and
-the test fixtures in `core/stream.rs`, the production call surface
-collapses to:
+Initial grep was over `Command::new`. The 2026-05-18 re-grep widened
+to also catch `.output()`, `.status()`, `.spawn()` on Command values
+returned by helpers like `resolved_command` / `build_commit_command`,
+which the original grep missed. Filtering out `#[test]`,
+`#[cfg(test)]`, `#[ignore]`, and pure factories (`ruby_exec`,
+`resolved_command`, `build_command`, `build_shell_command` — they
+return a `Command` but don't run it), the production call surface is:
 
 ```
-src/core/stream.rs:502    Command::output()  via exec_capture          [CENTRAL]
-src/main.rs:2393          Command::status()  for `--shell` passthrough [class B*]
-src/hooks/tirith_gate.rs  Command::spawn + wait_timeout(8s)            [DONE — v0.1.6]
-src/analytics/security_cmd.rs:459,479   wait_timeout(8s) via helper    [DONE — v0.1.6]
+[CENTRAL — hardened in this branch]
+src/core/stream.rs::exec_capture(_with_limits)   default 64 MiB cap, optional timeout
+
+[HARDENED — v0.1.6]
+src/hooks/tirith_gate.rs::check                  spawn + wait_timeout(8s) + cap
+
+[BYPASSES exec_capture — needs assessment]
+src/analytics/security_cmd.rs:459 fetch_audit_stats   F-06 — NOT hardened despite doc claim
+src/analytics/security_cmd.rs:479 fetch_doctor_status F-06 — NOT hardened despite doc claim
+src/analytics/ccusage.rs:98       npx ccusage --help check   class C (short-lived)
+src/cmds/cloud/aws_cmd.rs:244     aws CLI invocation         class B (user-driven filter)
+src/cmds/go/go_cmd.rs:138         go subcommand              class B (user-driven filter)
+src/cmds/git/git.rs:1058          git commit (stdin inherit) class B (user-driven, needs TTY)
+src/main.rs:1301                  TOML-match filter dispatch class B (user-driven filter)
+src/main.rs:2263                  npx prisma passthrough     class B* (explicit passthrough)
+src/main.rs:2483                  Proxy command              class B* (explicit passthrough)
+src/main.rs:2711                  rtk web curl invocation    in-process timeout via --max-time 30
+src/main.rs:2393                  --shell raw passthrough    class B* (explicit passthrough)
+
+[HOOK-PATH — newly hardened in this branch]
+src/hooks/permissions.rs:179      git rev-parse fallback     exec_capture_short(10s)
 ```
 
-That's it. Everything else is a test, a factory, or a transitive call
-through `exec_capture`.
-
-*main.rs:2393 is a special case — see "Out of scope" below.
+class B* = explicit user-requested passthrough; documented as accepted.
 
 ## Findings
 
@@ -105,6 +131,55 @@ recommended; F-01's cap is the mitigation.
 If we only cap stdout, an attacker can still flood stderr (which is
 piped, not null, because the filter uses it). Apply the same cap to
 stderr — same primitive, same default.
+
+### F-06 (HIGH — newly surfaced) — `security_cmd.rs` is not actually hardened
+
+The v0.1.6 overnight summary (`docs/sessions/2026-05-15-overnight.md`,
+branch #12) claimed `fetch_audit_stats` and `fetch_doctor_status` had
+the wait_timeout / stdout-cap / stdin-null pattern applied via a
+`run_tirith_capture` helper. Grepping the current file:
+
+```
+$ grep -n 'run_tirith_capture\|wait_timeout' src/analytics/security_cmd.rs
+$ # (no matches)
+```
+
+Both call sites use raw `Command::new(bin).output()`. The hardening
+either was never committed or got lost in a rebase. **Acute** because
+`security_cmd` runs from `rtk security` — invoked from the dashboard
+poll path; a hung tirith here is the same UX failure mode tirith F-01
+existed to fix in the hook path.
+
+**Fix:** route both call sites through `exec_capture_short(_, 8s)`
+using the new primitive. Lands in its own branch off `develop`
+(`feat/sec-security-cmd-actual-timeout`) since it's a caller change
+independent of the primitive itself.
+
+### F-07 (LOW — newly surfaced) — `aws_cmd`, `go_cmd`, `git commit` bypass exec_capture
+
+These three filter modules run user-driven commands directly via
+`cmd.output()`. They are class B (user can ^C, no wall-clock deadline
+appropriate) but they also bypass the new 64 MiB cap.
+
+**Recommendation:** route through `exec_capture` (default limits,
+no timeout). Caveat: `git commit` uses `stdin(Stdio::inherit())` to
+let the user edit the commit message in `$EDITOR`; `exec_capture`
+nulls stdin. Solution: either widen `exec_capture` with an
+`stdin_inherit: bool` flag, or leave `git commit` on its own path and
+document why. Defer to a per-caller branch.
+
+### F-08 (LOW — newly surfaced) — `main.rs:1301` TOML-match filter
+
+Same as F-07 — direct `cmd.output()` bypassing the cap. Same fix
+recommendation, same `stdin(Stdio::inherit())` constraint. Defer.
+
+### F-09 (informational) — `main.rs:2711` `rtk web` curl call
+
+Not capped at the spawn layer, but curl is invoked with
+`--max-time 30` and `--max-filesize 64M` (v0.1.6 web hardening).
+That's a process-internal timeout — the parent will block until
+curl exits, but curl itself bounds the work. Acceptable as is;
+documenting for completeness.
 
 ### F-05 (LOW / out of scope) — `main.rs:2393` raw shell passthrough
 
