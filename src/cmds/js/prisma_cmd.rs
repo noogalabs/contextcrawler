@@ -1,10 +1,31 @@
 //! Filters Prisma CLI output by stripping ASCII art and verbose decoration.
 
-use crate::core::stream::exec_capture;
+use crate::core::stream::{exec_capture, CaptureResult};
 use crate::core::tracking;
 use crate::core::utils::{resolved_command, tool_exists};
 use anyhow::{Context, Result};
 use std::process::Command;
+
+/// If `exec_capture` truncated either stream, emit the raw prefix as
+/// passthrough and skip the filter step. Parsing a capped JSON / table
+/// prefix would silently produce wrong counts. Returns `Some(exit_code)`
+/// when the caller should early-return.
+fn passthrough_if_truncated(result: &CaptureResult, label: &str) -> Option<i32> {
+    if !(result.truncated_stdout || result.truncated_stderr) {
+        return None;
+    }
+    eprintln!(
+        "[ctxc] warning: {} output truncated at capture cap; emitting raw prefix without parsing",
+        label
+    );
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.trim().is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    Some(result.exit_code)
+}
 
 #[derive(Debug, Clone)]
 pub enum PrismaCommand {
@@ -55,6 +76,10 @@ fn run_generate(args: &[String], verbose: u8) -> Result<i32> {
 
     let result = exec_capture(&mut cmd)
         .context("Failed to run prisma generate (try: npm install -g prisma)")?;
+
+    if let Some(code) = passthrough_if_truncated(&result, "prisma generate") {
+        return Ok(code);
+    }
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 
@@ -110,6 +135,10 @@ fn run_migrate(subcommand: MigrateSubcommand, args: &[String], verbose: u8) -> R
 
     let result = exec_capture(&mut cmd).context("Failed to run prisma migrate")?;
 
+    if let Some(code) = passthrough_if_truncated(&result, cmd_name) {
+        return Ok(code);
+    }
+
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 
     if !result.success() {
@@ -150,6 +179,10 @@ fn run_db_push(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let result = exec_capture(&mut cmd).context("Failed to run prisma db push")?;
+
+    if let Some(code) = passthrough_if_truncated(&result, "prisma db push") {
+        return Ok(code);
+    }
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 

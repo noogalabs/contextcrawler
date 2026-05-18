@@ -1,8 +1,18 @@
 use super::constants::{CLAUDE_DIR, SETTINGS_JSON, SETTINGS_LOCAL_JSON};
-use crate::core::stream::exec_capture;
+use crate::core::stream::exec_capture_short;
 use crate::discover::lexer::split_on_operators;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Wall-clock budget for the `git rev-parse --show-toplevel` fallback in
+/// `find_project_root`. This runs inside Claude Code's PreToolUse hook
+/// path; a stalled git (dead NFS / hung FUSE / network mount) would
+/// otherwise freeze the agent. 10s is generous for a healthy git and
+/// short enough that fall-through to "no project root" is the right
+/// answer when git is wedged. See docs/security/AUDIT-subprocess-timeouts.md
+/// finding F-02.
+const GIT_TOPLEVEL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Verdict from checking a command against Claude Code's permission rules.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -174,9 +184,11 @@ fn find_project_root() -> Option<PathBuf> {
     }
 
     // Fallback: git (spawns a subprocess, slower but handles monorepo layouts).
+    // exec_capture_short bounds the wall-clock so a stalled git can't freeze
+    // the PreToolUse hook. Timeout → None → caller treats as "no project root".
     let mut cmd = std::process::Command::new("git");
     cmd.args(["rev-parse", "--show-toplevel"]);
-    let result = exec_capture(&mut cmd).ok()?;
+    let result = exec_capture_short(&mut cmd, GIT_TOPLEVEL_TIMEOUT).ok()?;
 
     if result.success() {
         return Some(PathBuf::from(result.stdout.trim()));

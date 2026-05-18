@@ -1,12 +1,33 @@
 //! Filters pnpm output — dependency trees, install logs, outdated packages.
 
-use crate::core::stream::exec_capture;
+use crate::core::stream::{exec_capture, CaptureResult};
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
+
+/// Same pattern as `prisma_cmd::passthrough_if_truncated` — if the capture
+/// cap fired, the parsers (`PnpmListParser`, `PnpmOutdatedParser`,
+/// `filter_pnpm_install`) would silently report wrong counts from a
+/// prefix of the real output. Emit the raw prefix as passthrough instead.
+fn passthrough_if_truncated(result: &CaptureResult, label: &str) -> Option<i32> {
+    if !(result.truncated_stdout || result.truncated_stderr) {
+        return None;
+    }
+    eprintln!(
+        "[ctxc] warning: {} output truncated at capture cap; emitting raw prefix without parsing",
+        label
+    );
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.trim().is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    Some(result.exit_code)
+}
 
 use crate::parser::{
     emit_degradation_warning, emit_passthrough_warning, truncate_passthrough, Dependency,
@@ -299,6 +320,10 @@ fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
 
     let result = exec_capture(&mut cmd).context("Failed to run pnpm list")?;
 
+    if let Some(code) = passthrough_if_truncated(&result, "pnpm list") {
+        return Ok(code);
+    }
+
     if !result.success() {
         eprint!("{}", result.stderr);
         return Ok(result.exit_code);
@@ -352,6 +377,11 @@ fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let result = exec_capture(&mut cmd).context("Failed to run pnpm outdated")?;
+
+    if let Some(code) = passthrough_if_truncated(&result, "pnpm outdated") {
+        return Ok(code);
+    }
+
     let combined = result.combined();
 
     // Parse output using PnpmOutdatedParser
@@ -403,6 +433,10 @@ fn run_install(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let result = exec_capture(&mut cmd).context("Failed to run pnpm install")?;
+
+    if let Some(code) = passthrough_if_truncated(&result, "pnpm install") {
+        return Ok(code);
+    }
 
     if !result.success() {
         eprint!("{}", result.stderr);

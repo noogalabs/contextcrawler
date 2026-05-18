@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 #[cfg(test)]
 use regex::Regex;
@@ -519,6 +521,14 @@ pub struct CaptureResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    /// True if the per-stream cap fired and `stdout` is a prefix of the
+    /// child's full output. Callers parsing structured data (JSON, etc.)
+    /// should treat parse failures on a truncated buffer as expected
+    /// rather than as a real error. Defaults to false.
+    pub truncated_stdout: bool,
+    /// True if the per-stream cap fired on stderr. Same semantics as
+    /// `truncated_stdout`.
+    pub truncated_stderr: bool,
 }
 
 impl CaptureResult {
@@ -531,14 +541,174 @@ impl CaptureResult {
     }
 }
 
-pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
+/// Default per-stream cap for `exec_capture*`. A runaway child filling
+/// stdout/stderr could otherwise OOM the host. 64 MiB matches the upper
+/// bound used by the tirith gate hardening (v0.1.6 `b4c93c3`).
+pub const DEFAULT_CAPTURE_STREAM_MAX: u64 = 64 * 1024 * 1024;
+
+/// Limits applied to `exec_capture_with_limits`.
+///
+/// `Default` uses generous caps (64 MiB / 64 MiB) and no wall-clock
+/// timeout — appropriate for user-driven filter runs (`rtk cargo test`,
+/// `rtk pnpm install`) where the user has explicit context and can ^C.
+/// Hook-path callers should use `exec_capture_short` instead, which sets
+/// `timeout = Some(_)` so a hung child cannot freeze the agent.
+pub struct CaptureLimits {
+    pub stdout_max: u64,
+    pub stderr_max: u64,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for CaptureLimits {
+    fn default() -> Self {
+        Self {
+            stdout_max: DEFAULT_CAPTURE_STREAM_MAX,
+            stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+            timeout: None,
+        }
+    }
+}
+
+/// Capture a child's stdout/stderr with explicit caps and optional
+/// wall-clock timeout. stdin is always nulled (callers that need to feed
+/// stdin should use `run_streaming` with `StdinMode::Filter`).
+///
+/// Caps fire silently: the returned `CaptureResult` contains the
+/// truncated prefix and the child runs to completion. A timeout, by
+/// contrast, returns `Err` — the caller decides fallback.
+pub fn exec_capture_with_limits(
+    cmd: &mut Command,
+    limits: CaptureLimits,
+) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
-    let output = cmd.output().context("Failed to execute command")?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("Failed to execute command")?;
+
+    // Drain stdout/stderr concurrently so a chatty child can't fill the
+    // ~64 KiB kernel pipe buffer and deadlock either us or itself.
+    let stdout_handle = child.stdout.take().context("No child stdout handle")?;
+    let stderr_handle = child.stderr.take().context("No child stderr handle")?;
+    let stdout_max = limits.stdout_max;
+    let stderr_max = limits.stderr_max;
+    let stdout_thread = std::thread::spawn(move || drain_with_cap(stdout_handle, stdout_max));
+    let stderr_thread = std::thread::spawn(move || drain_with_cap(stderr_handle, stderr_max));
+
+    let status = match limits.timeout {
+        Some(deadline) => match child.wait_timeout(deadline) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Child exceeded the deadline. Kill, reap, drain threads,
+                // then surface as Err so the caller can fall back.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                anyhow::bail!(
+                    "command exceeded wall-clock budget of {:?}",
+                    deadline
+                );
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(anyhow::Error::from(e)
+                    .context("wait_timeout on child process failed"));
+            }
+        },
+        None => child.wait().context("Failed to wait on child")?,
+    };
+
+    let (stdout_buf, truncated_stdout) = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))?;
+    let (stderr_buf, truncated_stderr) = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))?;
+
     Ok(CaptureResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: status_to_exit_code(output.status),
+        stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+        exit_code: status_to_exit_code(status),
+        truncated_stdout,
+        truncated_stderr,
     })
+}
+
+/// Read at most `max` bytes from `r`, returning the bytes plus a flag
+/// indicating whether the stream had more pending after the cap.
+///
+/// Detection works by reading one byte past the cap: if the read returns
+/// 0 we hit EOF exactly at the cap (not truncated); if it returns 1 we
+/// truncated. We then close the handle implicitly by dropping `r`,
+/// which lets the child receive SIGPIPE on its next write.
+fn drain_with_cap<R: Read>(mut r: R, max: u64) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    if max == 0 {
+        // Pathological config; still peek one byte to detect truncation.
+        let mut probe = [0u8; 1];
+        let truncated = matches!(r.read(&mut probe), Ok(n) if n > 0);
+        return (buf, truncated);
+    }
+    let _ = (&mut r).take(max).read_to_end(&mut buf);
+    let mut probe = [0u8; 1];
+    let truncated = matches!(r.read(&mut probe), Ok(n) if n > 0);
+    (buf, truncated)
+}
+
+/// Capture with default limits — 64 MiB per stream, no wall-clock deadline.
+/// Use for user-driven commands where the user can ^C themselves.
+///
+/// Emits a fail-loud `[ctxc] warning: ...` on stderr if either cap fires.
+/// This protects callers that don't (yet) read `CaptureResult.truncated_*`
+/// from silently treating a capped prefix as complete output. Mirrors the
+/// existing `RAW_CAP` warnings in `run_streaming`. Callers that want
+/// silence — because they're going to inspect the flags themselves —
+/// should use `exec_capture_with_limits` directly.
+pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
+    let r = exec_capture_with_limits(cmd, CaptureLimits::default())?;
+    warn_if_capped(&r, "exec_capture");
+    Ok(r)
+}
+
+/// Capture with a wall-clock deadline. Use this from hook-path callers
+/// (PreToolUse, integrity check, anything Claude Code waits on
+/// synchronously) so a hung child cannot freeze the agent.
+///
+/// Returns `Err` on timeout; callers should treat that as "subprocess
+/// unavailable" and fall back, the same shape `tirith_gate::check` uses.
+/// Like `exec_capture`, emits a fail-loud warning on cap-hit so silent
+/// truncation can't mislead a downstream parser.
+pub fn exec_capture_short(cmd: &mut Command, timeout: Duration) -> Result<CaptureResult> {
+    let r = exec_capture_with_limits(
+        cmd,
+        CaptureLimits {
+            timeout: Some(timeout),
+            ..CaptureLimits::default()
+        },
+    )?;
+    warn_if_capped(&r, "exec_capture_short");
+    Ok(r)
+}
+
+fn warn_if_capped(r: &CaptureResult, label: &str) {
+    if r.truncated_stdout {
+        eprintln!(
+            "[ctxc] warning: {} stdout exceeded {} MiB — capture truncated",
+            label,
+            DEFAULT_CAPTURE_STREAM_MAX / (1024 * 1024)
+        );
+    }
+    if r.truncated_stderr {
+        eprintln!(
+            "[ctxc] warning: {} stderr exceeded {} MiB — capture truncated",
+            label,
+            DEFAULT_CAPTURE_STREAM_MAX / (1024 * 1024)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -837,6 +1007,8 @@ pub(crate) mod tests {
             stdout: String::new(),
             stderr: String::new(),
             exit_code: 0,
+            truncated_stdout: false,
+            truncated_stderr: false,
         };
         assert_eq!(r.combined(), "");
     }
@@ -1116,5 +1288,301 @@ pub(crate) mod tests {
         let result = run_line_filter(&mut f, "DROP a\nDROP b\nkeep\n", 0);
         // Only "keep" was observed, so summary says "1 kept"
         assert!(result.contains("demo: 1 kept"), "got: {}", result);
+    }
+
+    // -----------------------------------------------------------------
+    // exec_capture* limits and timeout coverage.
+    // See docs/security/AUDIT-subprocess-timeouts.md (F-01, F-02, F-04).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_exec_capture_short_times_out() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let err = match exec_capture_short(&mut cmd, Duration::from_millis(500)) {
+            Ok(_) => panic!("should error on timeout"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should return promptly after timeout, took {:?}",
+            elapsed
+        );
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("wall-clock") || msg.contains("budget"),
+            "error should mention the deadline, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_exec_capture_short_returns_normally_when_under_deadline() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hi");
+        let r = exec_capture_short(&mut cmd, Duration::from_secs(5)).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("hi"));
+    }
+
+    #[test]
+    fn test_exec_capture_caps_stdout() {
+        // Print ~512 KiB but cap at 4 KiB. Output should be exactly the cap.
+        // We use `yes` piped through `head` to bound the child's own work too.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "yes ABCDEFGHIJKLMNOPQRSTUVWXYZ | head -c 524288",
+        ]);
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: 4096,
+                stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .unwrap();
+        assert!(
+            r.stdout.len() <= 4096,
+            "stdout should be capped at 4 KiB, got {} bytes",
+            r.stdout.len()
+        );
+        // The child will typically receive SIGPIPE once we stop reading
+        // (drain thread drops the pipe handle on cap-hit), so exit_code
+        // may legitimately be 141 (128 + SIGPIPE). That's the *desired*
+        // outcome — runaway children die — but it means we can't assert
+        // exit_code == 0 here. The contract is: cap is enforced and we
+        // return successfully (no Err). Either is acceptable.
+    }
+
+    #[test]
+    fn test_exec_capture_caps_stderr_independently() {
+        // Flood stderr only; stdout stays empty.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "yes ZZZZZZZZZZZZZZZZZZZZZZZZ 1>&2 | head -c 524288 1>&2",
+        ]);
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: DEFAULT_CAPTURE_STREAM_MAX,
+                stderr_max: 2048,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .unwrap();
+        assert!(
+            r.stderr.len() <= 2048,
+            "stderr should be capped at 2 KiB, got {} bytes",
+            r.stderr.len()
+        );
+        assert!(r.stdout.is_empty(), "stdout should remain empty");
+    }
+
+    #[test]
+    fn test_exec_capture_default_unchanged_for_short_output() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello world");
+        let r = exec_capture(&mut cmd).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("hello world"));
+        assert!(r.stderr.is_empty());
+    }
+
+    #[test]
+    fn test_capture_limits_default_values() {
+        let d = CaptureLimits::default();
+        assert_eq!(d.stdout_max, DEFAULT_CAPTURE_STREAM_MAX);
+        assert_eq!(d.stderr_max, DEFAULT_CAPTURE_STREAM_MAX);
+        assert!(d.timeout.is_none(), "default = no wall-clock deadline");
+    }
+
+    // -----------------------------------------------------------------
+    // Truncation contract — CaptureResult.truncated_stdout/_stderr
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_truncated_stdout_flag_set_when_cap_fires() {
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "yes ABCDEFGHIJ | head -c 524288"]);
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: 4096,
+                stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .unwrap();
+        assert!(r.truncated_stdout, "cap fired, flag must be set");
+        assert!(!r.truncated_stderr, "stderr was empty, flag must stay false");
+    }
+
+    #[test]
+    fn test_truncated_flag_clear_when_under_cap() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("small output");
+        let r = exec_capture(&mut cmd).unwrap();
+        assert!(!r.truncated_stdout, "output well under default cap");
+        assert!(!r.truncated_stderr, "stderr empty");
+    }
+
+    #[test]
+    fn test_truncated_flag_clear_at_exact_cap_boundary() {
+        // Produce exactly 32 bytes; cap at exactly 32. Should NOT report truncation
+        // — the contract is "had more pending after cap", which an exact-EOF read does not.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]);
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: 32,
+                stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+                timeout: Some(Duration::from_secs(5)),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.stdout.len(), 32);
+        assert!(
+            !r.truncated_stdout,
+            "exact EOF at cap is not truncation, got truncated_stdout=true"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Edge cases from Codex round-2 review (2026-05-18).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_very_short_deadline_race() {
+        // 1ms deadline against a real spawn: either the child exits before the
+        // deadline (Ok) or we time out (Err). Both are acceptable — what's NOT
+        // acceptable is a panic, a hang, or an orphan.
+        let mut cmd = Command::new("true");
+        let start = std::time::Instant::now();
+        let result = exec_capture_short(&mut cmd, Duration::from_millis(1));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should return promptly either way, took {:?}",
+            elapsed
+        );
+        match result {
+            Ok(r) => assert_eq!(r.exit_code, 0, "if not timed out, true exits 0"),
+            Err(_) => { /* timed out — acceptable */ }
+        }
+    }
+
+    #[test]
+    fn test_cap_before_first_read_with_zero_max() {
+        // Pathological: cap of 0 bytes. Child still runs, output is empty,
+        // truncation flag is set if the child wrote anything.
+        let mut cmd = Command::new("echo");
+        cmd.arg("anything");
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: 0,
+                stderr_max: 0,
+                timeout: Some(Duration::from_secs(5)),
+            },
+        )
+        .unwrap();
+        assert!(r.stdout.is_empty());
+        assert!(
+            r.truncated_stdout,
+            "child wrote bytes that exceeded the 0-byte cap"
+        );
+    }
+
+    #[test]
+    fn test_stderr_only_flood_completes_without_deadlock() {
+        // Child writes only to stderr. stdout pipe stays empty (no EOF
+        // signaled until child exits). Tests that the stdout drain thread
+        // doesn't hang waiting for data that never arrives.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "yes ZZZ 1>&2 | head -c 8192 1>&2"]);
+        let start = std::time::Instant::now();
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: DEFAULT_CAPTURE_STREAM_MAX,
+                stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(r.stdout.is_empty());
+        assert!(!r.stderr.is_empty());
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not block waiting on empty stdout pipe, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_kill_on_already_exited_child_does_not_error() {
+        // Race: child exits between wait_timeout returning Ok(None) and our
+        // kill() call. kill() will return an error on Linux (ESRCH) but our
+        // code uses `let _ = child.kill();` so it must not propagate.
+        //
+        // We can't deterministically trigger the race, but we can verify the
+        // shape: a normally-completing command under a generous deadline
+        // returns Ok and does NOT leave any side-effect from the (unused)
+        // timeout-error path.
+        let mut cmd = Command::new("true");
+        let r1 = exec_capture_short(&mut cmd, Duration::from_secs(5)).unwrap();
+        assert_eq!(r1.exit_code, 0);
+        // Second invocation must work the same — no leftover state.
+        let mut cmd2 = Command::new("true");
+        let r2 = exec_capture_short(&mut cmd2, Duration::from_secs(5)).unwrap();
+        assert_eq!(r2.exit_code, 0);
+    }
+
+    #[test]
+    fn test_warn_if_capped_helper_is_silent_when_not_truncated() {
+        // White-box test: warn_if_capped is a side-effect helper, can't
+        // capture eprintln from a unit test trivially. We rely on the
+        // truncation flags being correct (covered above) and the path
+        // being conditional. Manual confirmation: when truncated_* is
+        // false, no eprintln is reached. This test exists to anchor the
+        // contract; the indirect coverage via exec_capture default path
+        // verifies the call site.
+        let r = CaptureResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            truncated_stdout: false,
+            truncated_stderr: false,
+        };
+        warn_if_capped(&r, "test-noop");
+    }
+
+    #[test]
+    fn test_drain_with_cap_helper_signals_truncation() {
+        use std::io::Cursor;
+        let input = b"0123456789ABCDEF";
+        let (buf, truncated) = drain_with_cap(Cursor::new(&input[..]), 8);
+        assert_eq!(buf, b"01234567");
+        assert!(truncated, "16 bytes in, 8-byte cap → truncated");
+
+        let (buf2, truncated2) = drain_with_cap(Cursor::new(&input[..]), 16);
+        assert_eq!(buf2, input);
+        assert!(!truncated2, "exact-fit read should not signal truncation");
+
+        let (buf3, truncated3) = drain_with_cap(Cursor::new(&input[..]), 99);
+        assert_eq!(buf3, input);
+        assert!(!truncated3, "cap above input size, not truncated");
     }
 }
