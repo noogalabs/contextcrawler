@@ -199,9 +199,16 @@ pub fn downgrades_log_path() -> Option<std::path::PathBuf> {
 }
 
 /// Read the tail of the downgrades log, returning up to `limit` most
-/// recent lines as raw strings. Lines are not parsed — the dashboard
-/// command formats them for human display, the `--json` mode emits them
-/// as-is wrapped in a JSON array.
+/// recent records. Each returned `String` is one VALID JSON record
+/// (re-serialised compactly via `serde_json` to ensure parseability),
+/// so multi-line / pretty-printed records get coalesced into single
+/// logical entries.
+///
+/// Naive `content.lines()` splitting would corrupt any record that ever
+/// spans multiple physical lines (today `log_downgrade` writes
+/// single-line JSON, but a future change to pretty-print would silently
+/// break the `--json` dashboard output). Codex P2 catch on the initial
+/// draft of this fix.
 pub fn read_recent_downgrades(limit: usize) -> Vec<String> {
     let path = match downgrades_log_path() {
         Some(p) if p.exists() => p,
@@ -211,9 +218,64 @@ pub fn read_recent_downgrades(limit: usize) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = lines.len().saturating_sub(limit);
-    lines[start..].iter().map(|s| s.to_string()).collect()
+
+    // Walk the file looking for top-level `{...}` balanced regions and
+    // parse each as a JSON value. Any malformed run is skipped — better
+    // to drop one record than corrupt the whole dashboard.
+    let bytes = content.as_bytes();
+    let mut records: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // Find the matching '}' with brace-balance + string-aware scanning
+        // so braces inside JSON string literals don't fool us.
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut end = i;
+        for (j, b) in bytes[i..].iter().enumerate() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if *b == b'\\' {
+                    escaped = true;
+                } else if *b == b'"' {
+                    in_str = false;
+                }
+            } else if *b == b'"' {
+                in_str = true;
+            } else if *b == b'{' {
+                depth += 1;
+            } else if *b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + j + 1;
+                    break;
+                }
+            }
+        }
+        if end > i {
+            let chunk = &content[i..end];
+            // Validate by round-tripping through serde_json. Re-serialised
+            // form is canonical (single-line, compact) so JSON consumers
+            // can rely on one record == one line.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
+                if let Ok(canon) = serde_json::to_string(&v) {
+                    records.push(canon);
+                }
+            }
+            i = end;
+        } else {
+            // Malformed tail — bail out, don't loop forever.
+            break;
+        }
+    }
+
+    let start = records.len().saturating_sub(limit);
+    records[start..].to_vec()
 }
 
 /// `contextcrawler security` dashboard. Renders the current Tirith gate
@@ -238,25 +300,28 @@ pub fn run_security_dashboard(all: bool, json: bool) -> anyhow::Result<i32> {
     let recent = read_recent_downgrades(limit);
 
     if json {
-        let bin_str = bin
-            .as_ref()
-            .map(|p| format!("\"{}\"", json_escape_inner(&p.to_string_lossy())))
-            .unwrap_or_else(|| "null".to_string());
-        let log_str = log_path
-            .as_ref()
-            .map(|p| format!("\"{}\"", json_escape_inner(&p.to_string_lossy())))
-            .unwrap_or_else(|| "null".to_string());
-        let recent_json = recent.join(",\n    ");
-        println!(
-            "{{\n  \"tirith_binary\": {},\n  \"installed\": {},\n  \"gate_disabled\": {},\n  \"gate_required\": {},\n  \"log_path\": {},\n  \"log_exists\": {},\n  \"recent_downgrades\": [\n    {}\n  ]\n}}",
-            bin_str,
-            bin.is_some(),
-            disabled,
-            required,
-            log_str,
-            log_exists,
-            recent_json,
-        );
+        // Use serde_json for the whole envelope — the previous draft
+        // hand-rolled escaping only covered `\` and `"`, which leaves
+        // control chars (tab, newline) producing invalid JSON when a
+        // path contains them. Codex P3 catch.
+        // Each recent record is ALREADY canonical-form JSON (see
+        // read_recent_downgrades), so we splice it in as a raw value.
+        let parsed_recent: Vec<serde_json::Value> = recent
+            .iter()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect();
+        let envelope = serde_json::json!({
+            "tirith_binary": bin.as_ref().map(|p| p.to_string_lossy()),
+            "installed": bin.is_some(),
+            "gate_disabled": disabled,
+            "gate_required": required,
+            "log_path": log_path.as_ref().map(|p| p.to_string_lossy()),
+            "log_exists": log_exists,
+            "recent_downgrades": parsed_recent,
+        });
+        let rendered = serde_json::to_string_pretty(&envelope)
+            .unwrap_or_else(|_| "{}".to_string());
+        println!("{}", rendered);
         return Ok(0);
     }
 
@@ -315,10 +380,6 @@ pub fn run_security_dashboard(all: bool, json: bool) -> anyhow::Result<i32> {
     println!("(e.g. RIPGREP_CONFIG_PATH hijack, see issue #32) are blocked separately");
     println!("inside the spawning code path via env_remove + arg deny-list.");
     Ok(0)
-}
-
-fn json_escape_inner(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Minimal JSON string escape for our log lines.

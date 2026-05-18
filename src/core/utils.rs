@@ -406,24 +406,61 @@ const FORBIDDEN_RG_FLAGS_EXACT: &[&str] =
 
 const FORBIDDEN_RG_FLAGS_PREFIX: &[&str] = &["--pre=", "--pre-glob="];
 
+/// Short-flag letters that should be denied even when appearing inside a
+/// bundled short-flag group like `-cz` or `-rzL`. Today's only entry is
+/// `z` (rg's `--search-zip` short form). `--pre`/`--pre-glob` are
+/// long-form only — they have no short-letter equivalent in rg and so
+/// cannot appear in bundles.
+const FORBIDDEN_RG_SHORT_LETTERS_IN_BUNDLE: &[char] = &['z'];
+
 /// Scan args for any flag in the deny list. Returns `Err` with a clear
 /// user-facing explanation if one is found. The error message names the
 /// offending flag and points at the escape hatch.
+///
+/// Bundle handling: `-z` appearing as ANY letter inside a single-`-`
+/// all-alphabetic group (e.g. `-cz`, `-rzL`) also triggers rejection.
+/// Without this, the deny-list could be bypassed by typing `-cz` instead
+/// of `-z` (codex P1 catch on the initial draft of this fix).
 pub fn check_forbidden_rg_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
     for arg in args {
         let a = arg.as_ref();
-        let hit = FORBIDDEN_RG_FLAGS_EXACT.iter().any(|f| a == *f)
-            || FORBIDDEN_RG_FLAGS_PREFIX.iter().any(|p| a.starts_with(p));
-        if hit {
-            return Err(format!(
-                "[contextcrawler] refusing to forward '{}' to rg/grep — this flag \
-                 enables per-file script execution or archive reads (issue #32). \
-                 If you genuinely need it, use: contextcrawler proxy rg <args>",
-                a
-            ));
+
+        // Exact-match deny (covers long forms and the bare `-z`).
+        if FORBIDDEN_RG_FLAGS_EXACT.iter().any(|f| a == *f) {
+            return Err(rg_deny_message(a));
+        }
+
+        // Prefix-match deny (covers `--pre=value`, `--pre-glob=value`).
+        if FORBIDDEN_RG_FLAGS_PREFIX.iter().any(|p| a.starts_with(p)) {
+            return Err(rg_deny_message(a));
+        }
+
+        // Short-letter bundle deny (covers `-cz`, `-rzL`, etc.).
+        // Mirror the bundle-detection rules used in main.rs's
+        // grep_format_flag_present so the scanner agrees with what
+        // rg/grep actually parses: must start with single `-`, length
+        // >= 2, body all ascii-alphabetic (so `-5` / `-A 3` are skipped).
+        if a.starts_with('-') && !a.starts_with("--") && a.len() >= 2 {
+            let body = &a[1..];
+            if body.chars().all(|c| c.is_ascii_alphabetic())
+                && body
+                    .chars()
+                    .any(|c| FORBIDDEN_RG_SHORT_LETTERS_IN_BUNDLE.contains(&c))
+            {
+                return Err(rg_deny_message(a));
+            }
         }
     }
     Ok(())
+}
+
+fn rg_deny_message(offending: &str) -> String {
+    format!(
+        "[contextcrawler] refusing to forward '{}' to rg/grep — this flag \
+         enables per-file script execution or archive reads (issue #32). \
+         If you genuinely need it, use: contextcrawler proxy rg <args>",
+        offending
+    )
 }
 
 /// Build a Command for invoking `rg` (or `grep` as fallback) with the
@@ -477,6 +514,19 @@ mod secure_rg_tests {
         assert!(check_forbidden_rg_args(&["pattern", "-rn", "src/"]).is_ok());
         assert!(check_forbidden_rg_args(&["-c", "pattern", "file"]).is_ok());
         assert!(check_forbidden_rg_args(&["--glob", "*.rs", "pattern"]).is_ok());
+        assert!(check_forbidden_rg_args(&["-A", "3", "pattern"]).is_ok());
+        assert!(check_forbidden_rg_args(&["-5", "pattern"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_z_inside_bundled_short_flags() {
+        // Codex P1 catch — `-cz` / `-rz` / `-rzL` would have slipped past
+        // the exact-match check and reached rg, where `z` enables
+        // --search-zip. Verify all common bundle positions blow up now.
+        assert!(check_forbidden_rg_args(&["-cz", "pat", "file"]).is_err());
+        assert!(check_forbidden_rg_args(&["-rz", "pat", "src/"]).is_err());
+        assert!(check_forbidden_rg_args(&["-rzL", "pat", "src/"]).is_err());
+        assert!(check_forbidden_rg_args(&["-Lzn", "pat", "src/"]).is_err());
     }
 
     #[test]
