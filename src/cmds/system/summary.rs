@@ -80,8 +80,25 @@ pub fn run(command: &str, use_shell: bool, verbose: u8) -> Result<i32> {
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 
+    // If the capture cap fired, a synthesised summary built from a prefix
+    // of the real output would silently mislead the caller (wrong test /
+    // error counts, partial JSON structure, etc). Prepend an explicit
+    // truncation marker so the summary cannot be mistaken for complete data.
+    let truncation_note = if result.truncated_stdout || result.truncated_stderr {
+        Some(format!(
+            "[!] OUTPUT TRUNCATED — summary built from a {} MiB prefix only; rerun with `contextcrawler proxy` for raw output.\n",
+            crate::core::stream::DEFAULT_CAPTURE_STREAM_MAX / (1024 * 1024)
+        ))
+    } else {
+        None
+    };
+
     let summary = summarize_output(&raw, command, result.success());
-    println!("{}", summary);
+    if let Some(note) = &truncation_note {
+        println!("{}{}", note, summary);
+    } else {
+        println!("{}", summary);
+    }
     timer.track(command, "rtk summary", &raw, &summary);
     Ok(result.exit_code)
 }
