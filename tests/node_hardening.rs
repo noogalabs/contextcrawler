@@ -22,6 +22,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+mod common;
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
@@ -115,12 +117,15 @@ fn node_options_require_does_not_execute_evil_js_via_tsc() {
         // the `tsc` route — it's wired through secure_node_command.
         // `--version` will fail fast if tsc isn't installed, but the
         // critical assertion is on the marker, not the exit code.
+        // Hold the shared env lock across the spawn (issue #48).
+        let _guard = common::env_lock();
         let _ = Command::new(binary_path())
             .args(["tsc", "--version"])
             .env("NODE_OPTIONS", &node_options)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        drop(_guard);
 
         assert!(
             !marker.exists(),
@@ -155,6 +160,7 @@ fn npm_config_userconfig_is_ignored() {
         )
         .expect("write evil .npmrc");
 
+        let _guard = common::env_lock();
         let out = Command::new(binary_path())
             .args(["npm", "config", "get", "registry"])
             .env("NPM_CONFIG_USERCONFIG", &evil_npmrc)
@@ -166,6 +172,7 @@ fn npm_config_userconfig_is_ignored() {
             .stderr(Stdio::null())
             .output()
             .expect("spawn contextcrawler npm config get registry");
+        drop(_guard);
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(

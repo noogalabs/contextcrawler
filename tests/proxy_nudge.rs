@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
@@ -16,6 +18,7 @@ fn binary_path() -> PathBuf {
 /// We don't care about stdout for the nudge tests. `extra_env` is a list of
 /// `(key, value)` pairs added to the child env on top of `clean_env` defaults.
 fn run_capture_stderr(args: &[&str], extra_env: &[(&str, &str)]) -> String {
+    let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(args);
     // Start from a known-clean env baseline so test results don't depend on
@@ -67,11 +70,13 @@ fn proxy_nudge_suppressed_when_stderr_not_tty() {
     // This is the test-harness-friendly version of the tty check: even with
     // both env-var suppressions explicitly removed, the nudge should NOT fire
     // because our pipe-capture isn't a terminal.
+    let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(["proxy", "sed", "--version"]);
     cmd.env_remove("CONTEXTCRAWLER_NO_PROXY_NUDGE");
     cmd.env_remove("CI");
     let out = cmd.output().expect("spawn contextcrawler");
+    drop(_guard);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("bypasses the wrapped filter"),
