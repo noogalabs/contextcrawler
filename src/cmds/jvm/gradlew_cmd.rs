@@ -1,6 +1,6 @@
 use crate::core::runner::{self, RunOptions};
 use crate::core::stream::StreamFilter;
-use crate::core::utils::resolved_command;
+use crate::core::utils::{check_forbidden_gradle_args, secure_jvm_command};
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -81,21 +81,42 @@ fn gradlew_binary() -> &'static str {
 ///
 /// Local wrappers (`./gradlew`, `gradlew.bat`) are passed as string literals so
 /// semgrep's `dynamic-command-execution` rule stays happy. The `gradle` system
-/// binary is resolved via `resolved_command("gradle")` for PATHEXT support on
+/// binary is resolved via `secure_jvm_command("gradle")` for PATHEXT support on
 /// Windows (`.CMD`/`.BAT` shims) — matches how cargo, golangci-lint, etc. do it.
+///
+/// Env hardening: even when invoking the local wrapper directly (no
+/// `resolved_command` path), strip `JAVA_TOOL_OPTIONS`, `GRADLE_OPTS`,
+/// etc. so a tainted parent can't inject `-javaagent:/tmp/evil.jar` into
+/// every gradle JVM. See issue #36.
 fn new_gradle_command(args: &[String]) -> Command {
     let mut cmd = if cfg!(windows) {
         if std::path::Path::new(".\\gradlew.bat").exists() {
-            Command::new(".\\gradlew.bat")
+            strip_jvm_env(Command::new(".\\gradlew.bat"))
         } else {
-            resolved_command("gradle")
+            secure_jvm_command("gradle")
         }
     } else if std::path::Path::new("./gradlew").exists() {
-        Command::new("./gradlew")
+        strip_jvm_env(Command::new("./gradlew"))
     } else {
-        resolved_command("gradle")
+        secure_jvm_command("gradle")
     };
     cmd.args(args);
+    cmd
+}
+
+/// Apply the JVM env scrub to an already-constructed Command. Used for
+/// the `./gradlew` / `gradlew.bat` literal-path branches where we can't
+/// go through `secure_jvm_command` (which calls `resolved_command`).
+fn strip_jvm_env(mut cmd: Command) -> Command {
+    for var in [
+        "JAVA_OPTS",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "GRADLE_OPTS",
+        "GRADLE_USER_HOME",
+    ] {
+        cmd.env_remove(var);
+    }
     cmd
 }
 
@@ -117,13 +138,32 @@ impl StreamFilter for BuildLineFilter {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    // Verbose flags bypass filtering — user wants full output
+    // Reject `--init-script <file>` / `-I <file>` — evaluates arbitrary
+    // Groovy at every gradle invocation. See issue #36.
+    if let Err(msg) = check_forbidden_gradle_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // Verbose flags bypass filtering — user wants full output.
+    // Use the env-hardened gradle command builder so the stacktrace path
+    // can't be used to bypass the JAVA_TOOL_OPTIONS strip.
     if args
         .iter()
         .any(|a| a == "--stacktrace" || a == "--info" || a == "--debug" || a == "--full-stacktrace")
     {
-        let osargs: Vec<OsString> = args.iter().map(OsString::from).collect();
-        return runner::run_passthrough(gradlew_binary(), &osargs, verbose);
+        let mut cmd = new_gradle_command(args);
+        // Stream stdout/stderr direct to inherited fds — same as
+        // runner::run_passthrough does, but with the hardened env.
+        let status = cmd
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+        return Ok(crate::core::utils::exit_code_from_status(
+            &status,
+            gradlew_binary(),
+        ));
     }
 
     let cmd = new_gradle_command(args);

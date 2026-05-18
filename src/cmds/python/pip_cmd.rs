@@ -2,7 +2,7 @@
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{resolved_command, tool_exists};
+use crate::core::utils::{check_forbidden_pip_args, secure_python_command, tool_exists};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -15,6 +15,14 @@ struct Package {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Reject `--index-url` / `--extra-index-url` — these enable
+    // dependency-confusion attacks where a malicious package's
+    // setup.py executes during install. See issue #36.
+    if let Err(msg) = check_forbidden_pip_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     // Auto-detect uv vs pip
@@ -52,7 +60,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn run_list(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, String, i32)> {
-    let mut cmd = resolved_command(base_cmd);
+    let mut cmd = secure_python_command(base_cmd);
 
     if base_cmd == "uv" {
         cmd.arg("pip");
@@ -80,7 +88,7 @@ fn run_list(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, Str
 }
 
 fn run_outdated(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, String, i32)> {
-    let mut cmd = resolved_command(base_cmd);
+    let mut cmd = secure_python_command(base_cmd);
 
     if base_cmd == "uv" {
         cmd.arg("pip");
@@ -108,7 +116,7 @@ fn run_outdated(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String,
 }
 
 fn run_passthrough(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, String, i32)> {
-    let mut cmd = resolved_command(base_cmd);
+    let mut cmd = secure_python_command(base_cmd);
 
     if base_cmd == "uv" {
         cmd.arg("pip");

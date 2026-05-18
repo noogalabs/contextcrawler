@@ -3,7 +3,7 @@
 use crate::binlog;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{resolved_command, truncate};
+use crate::core::utils::{secure_dotnet_command, truncate};
 use crate::dotnet_format_report;
 use crate::dotnet_trx;
 use anyhow::{Context, Result};
@@ -34,7 +34,11 @@ pub fn run_restore(args: &[String], verbose: u8) -> Result<i32> {
 pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
     let (report_path, cleanup_report_path) = resolve_format_report_path(args);
-    let mut cmd = resolved_command("dotnet");
+    // `secure_dotnet_command` strips DOTNET_STARTUP_HOOKS /
+    // DOTNET_ADDITIONAL_DEPS / DOTNET_SHARED_STORE / DOTNET_CLI_HOME /
+    // NUGET_PACKAGES from inherited env so a tainted parent can't
+    // sideload an assembly into every dotnet invocation. See issue #36.
+    let mut cmd = secure_dotnet_command("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg("format");
 
@@ -79,7 +83,11 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
     let subcommand = args[0].to_string_lossy().to_string();
 
-    let mut cmd = resolved_command("dotnet");
+    // `secure_dotnet_command` strips DOTNET_STARTUP_HOOKS /
+    // DOTNET_ADDITIONAL_DEPS / DOTNET_SHARED_STORE / DOTNET_CLI_HOME /
+    // NUGET_PACKAGES from inherited env so a tainted parent can't
+    // sideload an assembly into every dotnet invocation. See issue #36.
+    let mut cmd = secure_dotnet_command("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg(&subcommand);
     for arg in &args[1..] {
@@ -116,7 +124,11 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     // For test commands, prefer user-provided results directory; otherwise create isolated one.
     let (trx_results_dir, cleanup_trx_results_dir) = resolve_trx_results_dir(subcommand, args);
 
-    let mut cmd = resolved_command("dotnet");
+    // `secure_dotnet_command` strips DOTNET_STARTUP_HOOKS /
+    // DOTNET_ADDITIONAL_DEPS / DOTNET_SHARED_STORE / DOTNET_CLI_HOME /
+    // NUGET_PACKAGES from inherited env so a tainted parent can't
+    // sideload an assembly into every dotnet invocation. See issue #36.
+    let mut cmd = secure_dotnet_command("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg(subcommand);
 

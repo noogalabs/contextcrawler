@@ -6,7 +6,7 @@
 //! fails to parse.
 
 use crate::core::runner;
-use crate::core::utils::{fallback_tail, ruby_exec, truncate};
+use crate::core::utils::{check_forbidden_rspec_args, fallback_tail, ruby_exec, truncate};
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -63,6 +63,15 @@ struct RspecSummary {
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Reject `--require <module>` / `-r <module>` — Kernel.require on
+    // attacker-controlled path runs arbitrary Ruby. See issue #36.
+    if let Err(msg) = check_forbidden_rspec_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // `ruby_exec` is env-hardened: RUBYOPT / BUNDLE_GEMFILE / GEM_HOME
+    // stripped before exec. See issue #36.
     let mut cmd = ruby_exec("rspec");
 
     let has_format = args.iter().any(|a| {

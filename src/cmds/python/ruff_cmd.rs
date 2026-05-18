@@ -2,7 +2,7 @@
 
 use crate::core::config;
 use crate::core::runner;
-use crate::core::utils::{resolved_command, truncate};
+use crate::core::utils::{secure_python_command, truncate};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -41,7 +41,9 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     let is_format = args.iter().any(|a| a == "format");
 
-    let mut cmd = resolved_command("ruff");
+    // Strip PYTHONPATH / PYTHONSTARTUP / PIP_* from inherited env to
+    // prevent sitecustomize.py / startup-file hijack. See issue #36.
+    let mut cmd = secure_python_command("ruff");
 
     if is_check {
         if !args.contains(&"--output-format".to_string()) {

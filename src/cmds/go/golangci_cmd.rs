@@ -3,7 +3,9 @@
 use crate::core::config;
 use crate::core::runner;
 use crate::core::stream::exec_capture;
-use crate::core::utils::{resolved_command, truncate};
+// `secure_go_command` strips GOFLAGS/GOPATH/GOPROXY/CC/CXX from
+// inherited env — golangci-lint shells out to `go` underneath. See #36.
+use crate::core::utils::{secure_go_command, truncate};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -100,7 +102,7 @@ pub(crate) fn parse_major_version(version_output: &str) -> u32 {
 /// Run `golangci-lint --version` and return the major version number.
 /// Returns 1 on any failure.
 pub(crate) fn detect_major_version() -> u32 {
-    let mut cmd = resolved_command("golangci-lint");
+    let mut cmd = secure_go_command("golangci-lint");
     cmd.arg("--version");
 
     match exec_capture(&mut cmd) {
@@ -126,7 +128,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 fn run_filtered(original_args: &[String], invocation: &RunInvocation, verbose: u8) -> Result<i32> {
     let version = detect_major_version();
 
-    let mut cmd = resolved_command("golangci-lint");
+    let mut cmd = secure_go_command("golangci-lint");
     for arg in build_filtered_args(invocation, version) {
         cmd.arg(arg);
     }

@@ -273,7 +273,7 @@ pub fn ruby_exec(tool: &str) -> Command {
         c.arg("exec").arg(tool);
         return c;
     }
-    Command::new(tool)
+    secure_ruby_command(tool)
 }
 
 /// Count whitespace-delimited tokens in text. Used by filter tests to verify
@@ -2427,5 +2427,506 @@ mod secure_node_tests {
         std::env::set_var("NPM_CONFIG_TEST_SENTINEL", "1");
         let _cmd2 = secure_node_command("node");
         std::env::remove_var("NPM_CONFIG_TEST_SENTINEL");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Python / Ruby / JVM / .NET / Go runtime hardening — issue #36
+// ════════════════════════════════════════════════════════════════════════
+//
+// Same defense-in-depth pattern as `secure_rg_command()` above. Each
+// runtime exposes env vars that load arbitrary code into the spawned
+// process at startup:
+//
+//   - Python: PYTHONSTARTUP runs a file before the interpreter prompt;
+//     PYTHONPATH prepends dirs to sys.path (sitecustomize.py hijack);
+//     PIP_INDEX_URL redirects package fetches to an attacker server.
+//   - Ruby:   RUBYOPT injects `-r<gem>` at every ruby invocation;
+//     BUNDLE_GEMFILE points bundler at an arbitrary Gemfile.
+//   - JVM:    JAVA_TOOL_OPTIONS / JDK_JAVA_OPTIONS prepend args including
+//     `-javaagent:/path/to/evil.jar`; GRADLE_OPTS the same for Gradle.
+//   - .NET:   DOTNET_STARTUP_HOOKS loads an arbitrary assembly during
+//     CLR startup; DOTNET_ADDITIONAL_DEPS / DOTNET_SHARED_STORE alter
+//     assembly resolution.
+//
+// Any contextcrawler subprocess that inherits these env vars from a
+// tainted parent (LLM agent, CI runner, shared shell) gets pwned the
+// moment we shell out. We strip them. Operators with legitimate need
+// for those env vars use the escape hatch `contextcrawler proxy <tool>`.
+
+/// Python env vars that load arbitrary code at interpreter startup.
+const PYTHON_DANGEROUS_ENVS: &[&str] = &[
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "PIP_CONFIG_FILE",
+    "PIP_TARGET",
+    "PIP_PREFIX",
+];
+
+/// Build a `Command` for Python tools (python/pip/pytest/mypy/ruff) with
+/// dangerous env vars stripped. Covers both the static list above and any
+/// `PIP_*` var picked up at runtime (PIP_INDEX_URL, PIP_EXTRA_INDEX_URL,
+/// PIP_TRUSTED_HOST, PIP_FIND_LINKS, ...). See issue #36.
+pub fn secure_python_command(name: &str) -> Command {
+    let mut cmd = resolved_command(name);
+    for var in PYTHON_DANGEROUS_ENVS {
+        cmd.env_remove(var);
+    }
+    // Dynamic strip: pip honors every PIP_<UPPER_FLAG> env var, so the
+    // static list above can't be exhaustive. Walk the current env once.
+    for (k, _) in std::env::vars() {
+        if k.starts_with("PIP_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd
+}
+
+/// Ruby env vars that load arbitrary code at ruby/bundler startup.
+const RUBY_DANGEROUS_ENVS: &[&str] = &[
+    "RUBYOPT",
+    "RUBYLIB",
+    "BUNDLE_GEMFILE",
+    "BUNDLE_PATH",
+    "GEM_HOME",
+    "GEM_PATH",
+];
+
+/// Build a `Command` for Ruby tools (ruby/bundle/rake/rspec/rubocop) with
+/// dangerous env vars stripped. See issue #36.
+pub fn secure_ruby_command(name: &str) -> Command {
+    let mut cmd = resolved_command(name);
+    for var in RUBY_DANGEROUS_ENVS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// JVM env vars that prepend arguments / load javaagents at JVM startup.
+const JVM_DANGEROUS_ENVS: &[&str] = &[
+    "JAVA_OPTS",
+    "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "GRADLE_OPTS",
+    "GRADLE_USER_HOME",
+];
+
+/// Build a `Command` for JVM tools (gradle/gradlew/java) with dangerous
+/// env vars stripped. See issue #36.
+pub fn secure_jvm_command(name: &str) -> Command {
+    let mut cmd = resolved_command(name);
+    for var in JVM_DANGEROUS_ENVS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// .NET env vars that load arbitrary assemblies at CLR startup.
+const DOTNET_DANGEROUS_ENVS: &[&str] = &[
+    "DOTNET_STARTUP_HOOKS",
+    "DOTNET_ADDITIONAL_DEPS",
+    "DOTNET_SHARED_STORE",
+    "DOTNET_CLI_HOME",
+    "NUGET_PACKAGES",
+];
+
+/// Build a `Command` for the dotnet CLI with dangerous env vars stripped.
+/// See issue #36.
+pub fn secure_dotnet_command(name: &str) -> Command {
+    let mut cmd = resolved_command(name);
+    for var in DOTNET_DANGEROUS_ENVS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Go env vars that influence build/test toolchain behavior. `GOFLAGS`
+/// prepends args to every go invocation; `GOPROXY` redirects module
+/// downloads; `CC`/`CXX`/`PKG_CONFIG` swap the compiler driver invoked
+/// during cgo builds (arbitrary binary on PATH → RCE).
+const GO_DANGEROUS_ENVS: &[&str] = &[
+    "GOFLAGS",
+    "GOPATH",
+    "GOROOT",
+    "GOPROXY",
+    "CC",
+    "CXX",
+    "PKG_CONFIG",
+];
+
+/// Build a `Command` for the `go` toolchain with dangerous env vars
+/// stripped. Go wasn't named in issue #36 but the threat model is the
+/// same family (cgo + GOFLAGS).
+pub fn secure_go_command(name: &str) -> Command {
+    let mut cmd = resolved_command(name);
+    for var in GO_DANGEROUS_ENVS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+// ── Per-tool arg deny lists ─────────────────────────────────────────────
+//
+// Each tool exposes flags that read code or config from an attacker-
+// controlled path. We reject these in agent-facing mode and point users
+// at `contextcrawler proxy <tool>` if they really need them.
+
+fn pyrbjvm_deny_message(tool: &str, flag: &str, reason: &str) -> String {
+    format!(
+        "[contextcrawler] refusing to forward '{}' to {} — {} (issue #36). \
+         If you genuinely need it, use: contextcrawler proxy {} <args>",
+        flag, tool, reason, tool
+    )
+}
+
+/// pytest `-p <plugin>` accepts a module name OR a file path. A path
+/// (contains `/` `\` or starts with `.`) is `Kernel.require`-equivalent
+/// on arbitrary user-controlled code. Also reject `--rootdir` (changes
+/// where conftest.py is discovered → arbitrary `conftest.py` import →
+/// RCE) and `--import-mode=importlib` is harmless but `--import-mode`
+/// with other unusual modes can be — the heuristic here only blocks
+/// `--rootdir` outright and only blocks `-p <path>`.
+pub fn check_forbidden_pytest_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+
+        if a == "--rootdir" || a.starts_with("--rootdir=") {
+            return Err(pyrbjvm_deny_message(
+                "pytest",
+                a,
+                "--rootdir redirects conftest.py discovery to an attacker path",
+            ));
+        }
+
+        if a == "-p" {
+            if let Some(next) = args.get(i + 1) {
+                let v = next.as_ref();
+                if looks_like_path(v) {
+                    return Err(pyrbjvm_deny_message(
+                        "pytest",
+                        &format!("-p {}", v),
+                        "-p with a filesystem path loads arbitrary plugin code",
+                    ));
+                }
+            }
+            i += 2;
+            continue;
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
+/// `--config-file` lets mypy read settings (and `mypy_path`, `plugins=`)
+/// from an attacker path. In agent-facing mode we reject outright;
+/// operators run `contextcrawler proxy mypy --config-file ...`.
+pub fn check_forbidden_mypy_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--config-file" || a.starts_with("--config-file=") {
+            return Err(pyrbjvm_deny_message(
+                "mypy",
+                a,
+                "--config-file loads plugin code via mypy.ini plugins=",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// rspec `--require <module>` does `Kernel.require` on arbitrary input.
+pub fn check_forbidden_rspec_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--require" || a == "-r" || a.starts_with("--require=") {
+            return Err(pyrbjvm_deny_message(
+                "rspec",
+                a,
+                "--require / -r loads arbitrary Ruby code at startup",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// rubocop `--require <module>` is also a literal `Kernel.require`.
+pub fn check_forbidden_rubocop_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--require" || a.starts_with("--require=") {
+            return Err(pyrbjvm_deny_message(
+                "rubocop",
+                a,
+                "--require loads arbitrary Ruby code at startup",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// gradle `--init-script <file>` and `-I <file>` evaluate arbitrary
+/// Groovy from the given path at every Gradle invocation.
+pub fn check_forbidden_gradle_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+        if a == "--init-script"
+            || a.starts_with("--init-script=")
+            || a == "-I"
+        {
+            return Err(pyrbjvm_deny_message(
+                "gradle",
+                a,
+                "--init-script / -I evaluates arbitrary Groovy at startup",
+            ));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// pip `--index-url` / `--extra-index-url` enable dependency-confusion
+/// attacks: the resolver fetches an attacker-controlled package whose
+/// `setup.py` executes during install (RCE).
+pub fn check_forbidden_pip_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--index-url"
+            || a == "-i"
+            || a == "--extra-index-url"
+            || a.starts_with("--index-url=")
+            || a.starts_with("--extra-index-url=")
+        {
+            return Err(pyrbjvm_deny_message(
+                "pip",
+                a,
+                "--index-url / --extra-index-url enable dependency-confusion → setup.py RCE",
+            ));
+        }
+    }
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod secure_pyrbjvmdotnet_tests {
+    use super::*;
+
+    // ── env-stripping helpers ─────────────────────────────────────────
+
+    #[test]
+    fn python_command_lists_cover_known_vectors() {
+        for v in [
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTHONHOME",
+            "PYTHONUSERBASE",
+            "PIP_CONFIG_FILE",
+            "PIP_TARGET",
+            "PIP_PREFIX",
+        ] {
+            assert!(
+                PYTHON_DANGEROUS_ENVS.contains(&v),
+                "PYTHON_DANGEROUS_ENVS missing {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn ruby_command_lists_cover_known_vectors() {
+        for v in [
+            "RUBYOPT",
+            "RUBYLIB",
+            "BUNDLE_GEMFILE",
+            "BUNDLE_PATH",
+            "GEM_HOME",
+            "GEM_PATH",
+        ] {
+            assert!(RUBY_DANGEROUS_ENVS.contains(&v));
+        }
+    }
+
+    #[test]
+    fn jvm_command_lists_cover_known_vectors() {
+        for v in [
+            "JAVA_OPTS",
+            "JAVA_TOOL_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "GRADLE_OPTS",
+            "GRADLE_USER_HOME",
+        ] {
+            assert!(JVM_DANGEROUS_ENVS.contains(&v));
+        }
+    }
+
+    #[test]
+    fn dotnet_command_lists_cover_known_vectors() {
+        for v in [
+            "DOTNET_STARTUP_HOOKS",
+            "DOTNET_ADDITIONAL_DEPS",
+            "DOTNET_SHARED_STORE",
+            "DOTNET_CLI_HOME",
+            "NUGET_PACKAGES",
+        ] {
+            assert!(DOTNET_DANGEROUS_ENVS.contains(&v));
+        }
+    }
+
+    #[test]
+    fn go_command_lists_cover_known_vectors() {
+        for v in ["GOFLAGS", "GOPATH", "GOROOT", "GOPROXY", "CC", "CXX", "PKG_CONFIG"] {
+            assert!(GO_DANGEROUS_ENVS.contains(&v));
+        }
+    }
+
+    // The builders themselves should at least produce a Command that
+    // can be inspected — std::process::Command doesn't expose its env
+    // mutations directly, so we just smoke-test construction.
+    #[test]
+    fn builders_construct_without_panic() {
+        let _ = secure_python_command("python3");
+        let _ = secure_ruby_command("ruby");
+        let _ = secure_jvm_command("gradle");
+        let _ = secure_dotnet_command("dotnet");
+        let _ = secure_go_command("go");
+    }
+
+    // ── pytest deny ──────────────────────────────────────────────────
+
+    #[test]
+    fn pytest_rejects_p_with_path() {
+        assert!(check_forbidden_pytest_args(&["-p", "/tmp/evil.py"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p", "./local.py"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-p", r"C:\evil\plugin.py"]).is_err());
+    }
+
+    #[test]
+    fn pytest_allows_p_with_module_name() {
+        assert!(check_forbidden_pytest_args(&["-p", "no:cacheprovider"]).is_ok());
+        assert!(check_forbidden_pytest_args(&["-p", "myplugin"]).is_ok());
+    }
+
+    #[test]
+    fn pytest_rejects_rootdir() {
+        assert!(check_forbidden_pytest_args(&["--rootdir", "/tmp"]).is_err());
+        assert!(check_forbidden_pytest_args(&["--rootdir=/tmp"]).is_err());
+    }
+
+    #[test]
+    fn pytest_allows_normal_args() {
+        assert!(check_forbidden_pytest_args(&["-q", "--tb=short", "tests/"]).is_ok());
+        assert!(check_forbidden_pytest_args(&["--version"]).is_ok());
+    }
+
+    // ── mypy deny ────────────────────────────────────────────────────
+
+    #[test]
+    fn mypy_rejects_config_file() {
+        assert!(check_forbidden_mypy_args(&["--config-file", "evil.ini"]).is_err());
+        assert!(check_forbidden_mypy_args(&["--config-file=evil.ini"]).is_err());
+    }
+
+    #[test]
+    fn mypy_allows_normal_args() {
+        assert!(check_forbidden_mypy_args(&["--strict", "src/"]).is_ok());
+        assert!(check_forbidden_mypy_args(&["--version"]).is_ok());
+    }
+
+    // ── rspec / rubocop deny ─────────────────────────────────────────
+
+    #[test]
+    fn rspec_rejects_require() {
+        assert!(check_forbidden_rspec_args(&["--require", "/tmp/evil.rb"]).is_err());
+        assert!(check_forbidden_rspec_args(&["-r", "/tmp/evil.rb"]).is_err());
+        assert!(check_forbidden_rspec_args(&["--require=/tmp/evil.rb"]).is_err());
+    }
+
+    #[test]
+    fn rspec_allows_normal_args() {
+        assert!(check_forbidden_rspec_args(&["--format", "documentation"]).is_ok());
+    }
+
+    #[test]
+    fn rubocop_rejects_require() {
+        assert!(check_forbidden_rubocop_args(&["--require", "/tmp/evil.rb"]).is_err());
+        assert!(check_forbidden_rubocop_args(&["--require=/tmp/evil.rb"]).is_err());
+    }
+
+    #[test]
+    fn rubocop_allows_normal_args() {
+        assert!(check_forbidden_rubocop_args(&["--format", "json"]).is_ok());
+        // rubocop's short `-r` means --display-only-correctable in some
+        // versions; we don't block bare -r here.
+        assert!(check_forbidden_rubocop_args(&["-r"]).is_ok());
+    }
+
+    // ── gradle deny ──────────────────────────────────────────────────
+
+    #[test]
+    fn gradle_rejects_init_script() {
+        assert!(check_forbidden_gradle_args(&["--init-script", "evil.gradle"]).is_err());
+        assert!(check_forbidden_gradle_args(&["--init-script=evil.gradle"]).is_err());
+        assert!(check_forbidden_gradle_args(&["-I", "evil.gradle"]).is_err());
+    }
+
+    #[test]
+    fn gradle_allows_normal_args() {
+        assert!(check_forbidden_gradle_args(&["assembleDebug"]).is_ok());
+        assert!(check_forbidden_gradle_args(&["--info", "test"]).is_ok());
+    }
+
+    // ── pip deny ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pip_rejects_index_url() {
+        assert!(check_forbidden_pip_args(&["install", "--index-url", "http://evil"]).is_err());
+        assert!(check_forbidden_pip_args(&["install", "--index-url=http://evil"]).is_err());
+        assert!(check_forbidden_pip_args(&["install", "-i", "http://evil"]).is_err());
+        assert!(
+            check_forbidden_pip_args(&["install", "--extra-index-url", "http://evil"]).is_err()
+        );
+    }
+
+    #[test]
+    fn pip_allows_normal_args() {
+        assert!(check_forbidden_pip_args(&["install", "requests"]).is_ok());
+        assert!(check_forbidden_pip_args(&["list", "--format=json"]).is_ok());
+    }
+
+    // ── error message ────────────────────────────────────────────────
+
+    #[test]
+    fn error_messages_mention_escape_hatch() {
+        let e = check_forbidden_pytest_args(&["--rootdir", "/x"]).unwrap_err();
+        assert!(e.contains("contextcrawler proxy pytest"));
+        assert!(e.contains("#36"));
+
+        let e = check_forbidden_pip_args(&["install", "--index-url", "http://x"]).unwrap_err();
+        assert!(e.contains("contextcrawler proxy pip"));
+
+        let e = check_forbidden_gradle_args(&["-I", "evil"]).unwrap_err();
+        assert!(e.contains("contextcrawler proxy gradle"));
+    }
+
+    // ── looks_like_path heuristic ────────────────────────────────────
+
+    #[test]
+    fn path_heuristic_recognizes_paths() {
+        assert!(looks_like_path("/abs/path.py"));
+        assert!(looks_like_path("./rel.py"));
+        assert!(looks_like_path("../rel.py"));
+        assert!(looks_like_path(r"C:\win\path.py"));
+    }
+
+    #[test]
+    fn path_heuristic_passes_modules() {
+        assert!(!looks_like_path("mymodule"));
+        assert!(!looks_like_path("no:cacheprovider"));
+        assert!(!looks_like_path("pytest_asyncio"));
     }
 }
