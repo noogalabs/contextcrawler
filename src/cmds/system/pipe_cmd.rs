@@ -194,7 +194,7 @@ fn identity_filter(input: &str) -> String {
 fn apply_filter(filter_fn: fn(&str) -> String, input: &str) -> String {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter_fn(input)))
         .unwrap_or_else(|_| {
-            eprintln!("[rtk] warning: filter panicked — passing through raw output");
+            eprintln!("[contextcrawler] warning: filter panicked — passing through raw output");
             input.to_string()
         })
 }

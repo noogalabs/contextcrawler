@@ -718,7 +718,7 @@ fn rewrite_segment_inner(
         // #508: warn on stderr so agents learn to stop overusing it
         if env_prefix.contains("RTK_DISABLED=") {
             eprintln!(
-                "[rtk] RTK_DISABLED=1 detected — skipping filter for this command. \
+                "[contextcrawler] RTK_DISABLED=1 detected — skipping filter for this command. \
                  Remove RTK_DISABLED=1 to restore token savings."
             );
             return None;

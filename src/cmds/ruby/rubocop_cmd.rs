@@ -107,7 +107,7 @@ fn filter_rubocop_json(output: &str) -> String {
     let rubocop = match parsed {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[rtk] rubocop: JSON parse failed ({})", e);
+            eprintln!("[contextcrawler] rubocop: JSON parse failed ({})", e);
             return crate::core::utils::fallback_tail(output, "rubocop (JSON parse error)", 5);
         }
     };

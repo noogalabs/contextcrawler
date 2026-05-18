@@ -221,11 +221,11 @@ pub fn exit_code_from_output(output: &std::process::Output, label: &str) -> i32 
             {
                 use std::os::unix::process::ExitStatusExt;
                 if let Some(sig) = output.status.signal() {
-                    eprintln!("[rtk] {}: process terminated by signal {}", label, sig);
+                    eprintln!("[contextcrawler] {}: process terminated by signal {}", label, sig);
                     return 128 + sig;
                 }
             }
-            eprintln!("[rtk] {}: process terminated by signal", label);
+            eprintln!("[contextcrawler] {}: process terminated by signal", label);
             1
         }
     }
@@ -242,11 +242,11 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> 
             {
                 use std::os::unix::process::ExitStatusExt;
                 if let Some(sig) = status.signal() {
-                    eprintln!("[rtk] {}: process terminated by signal {}", label, sig);
+                    eprintln!("[contextcrawler] {}: process terminated by signal {}", label, sig);
                     return 128 + sig;
                 }
             }
-            eprintln!("[rtk] {}: process terminated by signal", label);
+            eprintln!("[contextcrawler] {}: process terminated by signal", label);
             1
         }
     }
@@ -256,7 +256,7 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> 
 /// when filter parsing fails. Logs a diagnostic to stderr.
 pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
     eprintln!(
-        "[rtk] {}: output format not recognized, showing last {} lines",
+        "[contextcrawler] {}: output format not recognized, showing last {} lines",
         label, n
     );
     let lines: Vec<&str> = output.lines().collect();
