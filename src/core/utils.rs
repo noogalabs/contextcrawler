@@ -775,13 +775,20 @@ mod policy_registry_tests {
         }
     }
 
+    /// Serializes tests that mutate process-global env (codex P3 catch on
+    /// the original #39 draft — without this, parallel test execution can
+    /// observe these vars and leak them into unrelated subprocess tests).
+    static GLOBAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn secure_command_with_policy_strips_env() {
+        // Serialize against other env-mutating tests in the same binary.
+        let _guard = GLOBAL_ENV_LOCK.lock().expect("env lock poisoned");
+
         // Set a representative universal var, the per-tool extra, and a
         // BASH_FUNC_* dynamic match. After secure_command_with_policy
         // builds the Command, those must NOT appear in its env, while
         // an unrelated var passed in via .env() survives.
-        // SAFETY: tests in the same binary may share env; use unique names.
         unsafe {
             std::env::set_var("LD_PRELOAD", "/tmp/evil.so");
             std::env::set_var("ECHO_EXTRA_STRIP", "1");
