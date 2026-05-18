@@ -119,7 +119,7 @@ fn load_permission_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
         };
         let Ok(json) = serde_json::from_str::<Value>(&content) else {
             eprintln!(
-                "[rtk] warning: failed to parse permissions from {}",
+                "[contextcrawler] warning: failed to parse permissions from {}",
                 path.display()
             );
             continue;

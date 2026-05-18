@@ -369,7 +369,7 @@ enum Commands {
         #[arg(long = "claude-md", group = "mode")]
         claude_md: bool,
 
-        /// Hook only, no RTK.md
+        /// Hook only, no CONTEXTCRAWLER.md
         #[arg(long = "hook-only", group = "mode")]
         hook_only: bool,
 
@@ -385,7 +385,7 @@ enum Commands {
         #[arg(long)]
         uninstall: bool,
 
-        /// Target Codex CLI (uses AGENTS.md + RTK.md, no Claude hook patching)
+        /// Target Codex CLI (uses AGENTS.md + CONTEXTCRAWLER.md, no Claude hook patching)
         #[arg(long)]
         codex: bool,
 
@@ -1260,7 +1260,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             Err(e) => {
                 // Command not found — same behaviour as no-TOML path
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
-                eprintln!("[rtk: {}]", e);
+                eprintln!("[contextcrawler: {}]", e);
                 Ok(127)
             }
         }
@@ -1284,7 +1284,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             Err(e) => {
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
                 // Command not found or other OS error — single message, no duplicate Clap error
-                eprintln!("[rtk: {}]", e);
+                eprintln!("[contextcrawler: {}]", e);
                 Ok(127)
             }
         }
@@ -1364,7 +1364,7 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
                     _ => unreachable!(),
                 };
                 let msg = format!(
-                    "[rtk] warning: --filter is not yet supported for pnpm {}, filters preceding the subcommand will be ignored",
+                    "[contextcrawler] warning: --filter is not yet supported for pnpm {}, filters preceding the subcommand will be ignored",
                     cmd_name
                 );
                 return Some(msg);
@@ -3443,7 +3443,7 @@ mod tests {
                 let warning = validate_pnpm_filters(&filter, &command).unwrap();
 
                 assert_eq!(filter, vec!["@app1", "@app2"]);
-                assert_eq!(warning, "[rtk] warning: --filter is not yet supported for pnpm tsc, filters preceding the subcommand will be ignored")
+                assert_eq!(warning, "[contextcrawler] warning: --filter is not yet supported for pnpm tsc, filters preceding the subcommand will be ignored")
             }
             _ => panic!("Expected Pnpm Build command"),
         }

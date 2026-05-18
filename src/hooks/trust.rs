@@ -104,7 +104,7 @@ fn env_override_status() -> Option<TrustStatus> {
             return Some(TrustStatus::EnvOverride);
         }
         eprintln!(
-            "[rtk] WARNING: RTK_TRUST_PROJECT_FILTERS=1 ignored (CI environment not detected)"
+            "[contextcrawler] WARNING: RTK_TRUST_PROJECT_FILTERS=1 ignored (CI environment not detected)"
         );
     }
     None
@@ -129,7 +129,7 @@ pub fn check_trust_bytes(filter_path: &Path, bytes: &[u8]) -> Result<TrustStatus
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "[rtk] WARNING: trust store unreadable ({}), treating all filters as untrusted",
+                "[contextcrawler] WARNING: trust store unreadable ({}), treating all filters as untrusted",
                 e
             );
             TrustStore::default()
@@ -171,7 +171,7 @@ pub fn check_trust(filter_path: &Path) -> Result<TrustStatus> {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "[rtk] WARNING: trust store unreadable ({}), treating all filters as untrusted",
+                "[contextcrawler] WARNING: trust store unreadable ({}), treating all filters as untrusted",
                 e
             );
             TrustStore::default()

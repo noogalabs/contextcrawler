@@ -375,7 +375,7 @@ pub fn run_streaming(
                             raw_stderr.push('\n');
                         } else {
                             capped_err = true;
-                            eprintln!("[rtk] warning: stderr exceeds 10 MiB — capture truncated");
+                            eprintln!("[contextcrawler] warning: stderr exceeds 10 MiB — capture truncated");
                         }
                     }
                 } else if !capped_out {
@@ -384,7 +384,7 @@ pub fn run_streaming(
                         raw_stdout.push('\n');
                     } else {
                         capped_out = true;
-                        eprintln!("[rtk] warning: stdout exceeds 10 MiB — filter input truncated");
+                        eprintln!("[contextcrawler] warning: stdout exceeds 10 MiB — filter input truncated");
                     }
                 }
                 filter_fd_is_stderr = is_stderr;
@@ -445,7 +445,7 @@ pub fn run_streaming(
                         } else if !capped_out {
                             capped_out = true;
                             eprintln!(
-                                "[rtk] warning: output exceeds 10 MiB — filter input truncated"
+                                "[contextcrawler] warning: output exceeds 10 MiB — filter input truncated"
                             );
                         }
                     }
@@ -453,7 +453,7 @@ pub fn run_streaming(
                         filter_fn(&raw_stdout)
                     }))
                     .unwrap_or_else(|_| {
-                        eprintln!("[rtk] warning: filter panicked — passing through raw output");
+                        eprintln!("[contextcrawler] warning: filter panicked — passing through raw output");
                         raw_stdout.clone()
                     });
                     match write!(out, "{}", filtered) {
@@ -470,7 +470,7 @@ pub fn run_streaming(
                         } else if !capped_out {
                             capped_out = true;
                             eprintln!(
-                                "[rtk] warning: output exceeds 10 MiB — filter input truncated"
+                                "[contextcrawler] warning: output exceeds 10 MiB — filter input truncated"
                             );
                         }
                     }
@@ -480,7 +480,7 @@ pub fn run_streaming(
         }
 
         raw_stderr = stderr_thread.join().unwrap_or_else(|e| {
-            eprintln!("[rtk] warning: stderr reader thread panicked: {:?}", e);
+            eprintln!("[contextcrawler] warning: stderr reader thread panicked: {:?}", e);
             String::new()
         });
     }

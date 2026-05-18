@@ -205,16 +205,16 @@ impl TomlFilterRegistry {
                         let content = String::from_utf8_lossy(&bytes);
                         match Self::parse_and_compile(&content, "project") {
                             Ok(f) => filters.extend(f),
-                            Err(e) => eprintln!("[rtk] warning: .rtk/filters.toml: {}", e),
+                            Err(e) => eprintln!("[contextcrawler] warning: .rtk/filters.toml: {}", e),
                         }
                     }
                     crate::hooks::trust::TrustStatus::Untrusted => {
-                        eprintln!("[rtk] WARNING: untrusted project filters (.rtk/filters.toml)");
-                        eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
+                        eprintln!("[contextcrawler] WARNING: untrusted project filters (.rtk/filters.toml)");
+                        eprintln!("[contextcrawler] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
                     }
                     crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
-                        eprintln!("[rtk] WARNING: .rtk/filters.toml changed since trusted.");
-                        eprintln!("[rtk] Filters NOT applied. Run `contextcrawler trust` to re-review.");
+                        eprintln!("[contextcrawler] WARNING: .rtk/filters.toml changed since trusted.");
+                        eprintln!("[contextcrawler] Filters NOT applied. Run `contextcrawler trust` to re-review.");
                     }
                 }
             }
@@ -244,26 +244,26 @@ impl TomlFilterRegistry {
                             match Self::parse_and_compile(&content, "user-global") {
                                 Ok(f) => filters.extend(f),
                                 Err(e) => {
-                                    eprintln!("[rtk] warning: {}: {}", global_path.display(), e)
+                                    eprintln!("[contextcrawler] warning: {}: {}", global_path.display(), e)
                                 }
                             }
                         }
                         crate::hooks::trust::TrustStatus::Untrusted => {
                             eprintln!(
-                                "[rtk] WARNING: untrusted user-global filters ({})",
+                                "[contextcrawler] WARNING: untrusted user-global filters ({})",
                                 global_path.display()
                             );
                             eprintln!(
-                                "[rtk] Filters NOT applied. Run `contextcrawler trust --global` to review and enable."
+                                "[contextcrawler] Filters NOT applied. Run `contextcrawler trust --global` to review and enable."
                             );
                         }
                         crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
                             eprintln!(
-                                "[rtk] WARNING: {} changed since trusted.",
+                                "[contextcrawler] WARNING: {} changed since trusted.",
                                 global_path.display()
                             );
                             eprintln!(
-                                "[rtk] Filters NOT applied. Run `contextcrawler trust --global` to re-review."
+                                "[contextcrawler] Filters NOT applied. Run `contextcrawler trust --global` to re-review."
                             );
                         }
                     }
@@ -275,7 +275,7 @@ impl TomlFilterRegistry {
         let builtin = BUILTIN_TOML;
         match Self::parse_and_compile(builtin, "builtin") {
             Ok(f) => filters.extend(f),
-            Err(e) => eprintln!("[rtk] warning: builtin filters: {}", e),
+            Err(e) => eprintln!("[contextcrawler] warning: builtin filters: {}", e),
         }
 
         TomlFilterRegistry { filters }
@@ -296,7 +296,7 @@ impl TomlFilterRegistry {
         for (name, def) in file.filters {
             match compile_filter(name.clone(), def) {
                 Ok(f) => compiled.push(f),
-                Err(e) => eprintln!("[rtk] warning: filter '{}' in {}: {}", name, source, e),
+                Err(e) => eprintln!("[contextcrawler] warning: filter '{}' in {}: {}", name, source, e),
             }
         }
         Ok(compiled)
@@ -372,7 +372,7 @@ fn compile_filter(name: String, def: TomlFilterDef) -> Result<CompiledFilter, St
     for cmd in RUST_HANDLED_COMMANDS {
         if match_regex.is_match(cmd) {
             eprintln!(
-                "[rtk] warning: filter '{}' match_command matches '{}' which is already \
+                "[contextcrawler] warning: filter '{}' match_command matches '{}' which is already \
                  handled by a Rust module — this filter will never activate for that command",
                 name, cmd
             );
@@ -620,7 +620,7 @@ pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
                 }
             }
             _ => {
-                eprintln!("[rtk] WARNING: untrusted project filters skipped in verify");
+                eprintln!("[contextcrawler] WARNING: untrusted project filters skipped in verify");
             }
         }
     }
@@ -650,7 +650,7 @@ fn collect_test_outcomes(
     let file: TomlFilterFile = match toml::from_str(content) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("[rtk] warning: TOML parse error during verify: {}", e);
+            eprintln!("[contextcrawler] warning: TOML parse error during verify: {}", e);
             return;
         }
     };
@@ -663,7 +663,7 @@ fn collect_test_outcomes(
             Ok(f) => {
                 compiled_filters.insert(name, f);
             }
-            Err(e) => eprintln!("[rtk] warning: filter '{}' compilation error: {}", name, e),
+            Err(e) => eprintln!("[contextcrawler] warning: filter '{}' compilation error: {}", name, e),
         }
     }
 
@@ -681,7 +681,7 @@ fn collect_test_outcomes(
             Some(f) => f,
             None => {
                 eprintln!(
-                    "[rtk] warning: [[tests.{}]] references unknown filter",
+                    "[contextcrawler] warning: [[tests.{}]] references unknown filter",
                     filter_name
                 );
                 continue;
@@ -713,7 +713,7 @@ fn collect_test_outcomes(
 pub fn find_matching_filter(command: &str) -> Option<&'static CompiledFilter> {
     if std::env::var("RTK_TOML_DEBUG").is_ok() {
         eprintln!(
-            "[rtk:toml] looking up filter for: {:?} ({} filters loaded)",
+            "[contextcrawler:toml] looking up filter for: {:?} ({} filters loaded)",
             command,
             REGISTRY.filters.len()
         );
@@ -721,8 +721,8 @@ pub fn find_matching_filter(command: &str) -> Option<&'static CompiledFilter> {
     let result = find_filter_in(command, &REGISTRY.filters);
     if std::env::var("RTK_TOML_DEBUG").is_ok() {
         match result {
-            Some(f) => eprintln!("[rtk:toml] matched filter: '{}'", f.name),
-            None => eprintln!("[rtk:toml] no filter matched — passthrough"),
+            Some(f) => eprintln!("[contextcrawler:toml] matched filter: '{}'", f.name),
+            None => eprintln!("[contextcrawler:toml] no filter matched — passthrough"),
         }
     }
     result
