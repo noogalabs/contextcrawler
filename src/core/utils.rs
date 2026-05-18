@@ -1051,6 +1051,166 @@ pub fn check_args_with_policy<S: AsRef<str>>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Cargo wrapper hardening (issue #34)
+// ---------------------------------------------------------------------------
+//
+// Cargo has a sprawling collection of env vars and `--config` keys that
+// cause it to spawn arbitrary executables during otherwise innocuous
+// invocations: `RUSTC_WRAPPER`, `CARGO_TARGET_<TRIPLE>_RUNNER`,
+// `--config build.rustc-wrapper=...`, etc. A tainted parent process (or
+// an attacker who can sneak a flag past an agent) can therefore turn any
+// `contextcrawler cargo ...` call into local code execution.
+//
+// Mirrors the rg/grep hardening pattern from issue #32: strip the
+// dangerous env vars before spawn, reject the dangerous `--config` keys
+// in argv, and leave an explicit escape hatch via `contextcrawler proxy
+// cargo ...` for users who genuinely need them.
+
+/// Cargo env vars that name an executable cargo will spawn during a build
+/// or other invocation. Each one is a confirmed local-code-execution
+/// vector when set on the parent process. See issue #34.
+const FORBIDDEN_CARGO_ENV_EXACT: &[&str] = &[
+    // rustc wrappers — replace the compiler invocation entirely.
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC",
+    // Compile-time tooling that runs build scripts / linker phases.
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CC",
+    "CXX",
+    "PKG_CONFIG",
+    // Cargo home redirects where credentials / config.toml live —
+    // letting a parent override this lets them inject a config.toml
+    // containing target.*.runner = "...".
+    "CARGO_HOME",
+    // Switches network fetch to spawn `git` (and through it ssh / askpass).
+    "CARGO_NET_GIT_FETCH_WITH_CLI",
+];
+
+/// Returns true if `name` matches the `CARGO_TARGET_<TRIPLE>_RUNNER` or
+/// `CARGO_TARGET_<TRIPLE>_LINKER` family (case-insensitive). These set
+/// the runner/linker for a given target triple and so name an arbitrary
+/// executable that cargo will spawn.
+fn is_cargo_target_runner_or_linker(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if !upper.starts_with("CARGO_TARGET_") {
+        return false;
+    }
+    upper.ends_with("_RUNNER") || upper.ends_with("_LINKER")
+}
+
+/// Build a Command for invoking `cargo` with the dangerous env vars
+/// stripped from the inherited environment. Without this, any process
+/// that has e.g. `RUSTC_WRAPPER=/tmp/evil.sh` set in its env can hijack
+/// every `contextcrawler cargo ...` invocation — cargo will run the
+/// wrapper for every compiler call. Confirmed RCE; see issue #34.
+///
+/// All cargo call sites in `src/cmds/rust/cargo_cmd.rs` should use this
+/// instead of the raw `resolved_command("cargo")` so the hardening
+/// applies uniformly across `build` / `test` / `check` / `clippy` /
+/// `install` / `nextest` / passthrough.
+pub fn secure_cargo_command() -> Command {
+    let mut cmd = resolved_command("cargo");
+    for name in FORBIDDEN_CARGO_ENV_EXACT {
+        cmd.env_remove(name);
+    }
+    // Dynamic strip: `CARGO_TARGET_<TRIPLE>_RUNNER` / `_LINKER` are an
+    // open-ended family (any triple cargo knows about) so we have to
+    // enumerate the current env and match by pattern.
+    let dynamic: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| is_cargo_target_runner_or_linker(k))
+        .collect();
+    for name in dynamic {
+        cmd.env_remove(name);
+    }
+    cmd
+}
+
+/// Cargo `--config` keys that hand cargo an arbitrary executable to run
+/// during the build. Each entry is matched case-insensitively against
+/// the key half of a `K=V` pair. The `target.*.runner` /
+/// `target.*.linker` entries use a literal `*` wildcard for the triple.
+const FORBIDDEN_CARGO_CONFIG_KEYS: &[&str] = &[
+    "target.*.runner",
+    "target.*.linker",
+    "build.rustc-wrapper",
+    "build.rustc",
+    "net.git-fetch-with-cli",
+    "registries.*.credential-provider",
+];
+
+/// Match a single cargo `--config` key against the deny patterns.
+/// Patterns use a literal `*` to mean "any single dotted segment" (no
+/// dots inside the wildcard match), case-insensitive on both sides.
+fn cargo_config_key_is_forbidden(key: &str) -> bool {
+    let key_lc = key.to_ascii_lowercase();
+    FORBIDDEN_CARGO_CONFIG_KEYS
+        .iter()
+        .any(|pat| cargo_config_pattern_matches(&pat.to_ascii_lowercase(), &key_lc))
+}
+
+/// Glob-match a single `--config` key against a deny pattern. `*` in
+/// the pattern matches one dotted segment (no embedded dots). Both
+/// inputs MUST already be lowercase.
+fn cargo_config_pattern_matches(pattern: &str, key: &str) -> bool {
+    let pat_parts: Vec<&str> = pattern.split('.').collect();
+    let key_parts: Vec<&str> = key.split('.').collect();
+    if pat_parts.len() != key_parts.len() {
+        return false;
+    }
+    pat_parts
+        .iter()
+        .zip(key_parts.iter())
+        .all(|(p, k)| *p == "*" || p == k)
+}
+
+/// Scan args for any `--config K=V` (or `--config=K=V`) whose key
+/// matches the cargo deny list. Returns `Err` with a user-facing
+/// explanation that names the offending key and points at the escape
+/// hatch. See issue #34.
+pub fn check_forbidden_cargo_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+
+        // `--config=K=V` (or `--config=K`) — split once on '='.
+        if let Some(rest) = a.strip_prefix("--config=") {
+            if let Some(key) = config_key_from_kv(rest) {
+                if cargo_config_key_is_forbidden(key) {
+                    return Err(cargo_deny_message(&format!("--config={}", rest)));
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // `--config K=V` — value is in the next arg.
+        if a == "--config" {
+            if let Some(next) = args.get(i + 1) {
+                let kv = next.as_ref();
+                if let Some(key) = config_key_from_kv(kv) {
+                    if cargo_config_key_is_forbidden(key) {
+                        return Err(cargo_deny_message(&format!("--config {}", kv)));
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            // Bare `--config` with no value — let cargo surface the error.
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
 fn policy_deny_message(tool: &str, offending: &str) -> String {
     format!(
         "[contextcrawler] refusing to forward '{}' to {} \u{2014} flag is on \
@@ -1058,6 +1218,209 @@ fn policy_deny_message(tool: &str, offending: &str) -> String {
          contextcrawler proxy {} <args>",
         offending, tool, tool
     )
+}
+
+
+/// Extract the `K` from a `K=V` (or `K="V"`) string. Returns `None` if
+/// there is no `=` (e.g. the value is a TOML table reference, which
+/// cargo allows — we don't try to deny those here).
+fn config_key_from_kv(kv: &str) -> Option<&str> {
+    kv.split_once('=').map(|(k, _)| k.trim())
+}
+
+fn cargo_deny_message(offending: &str) -> String {
+    format!(
+        "[contextcrawler] refusing to forward '{}' to cargo — this key \
+         lets cargo spawn an arbitrary executable during the build \
+         (issue #34). If you genuinely need it, use: \
+         contextcrawler proxy cargo <args>",
+        offending
+    )
+}
+
+#[cfg(test)]
+mod secure_cargo_tests {
+    use super::*;
+
+    #[test]
+    fn secure_cargo_command_strips_known_env_vars() {
+        // Set every var in the deny list to a sentinel value, build the
+        // command, and verify cargo would see them all removed. We can't
+        // observe `Command`'s env directly without nightly APIs, so we
+        // round-trip through `get_envs()`.
+        for name in FORBIDDEN_CARGO_ENV_EXACT {
+            std::env::set_var(name, "/tmp/evil-marker");
+        }
+        std::env::set_var("CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER", "/tmp/evil-runner");
+        std::env::set_var("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", "/tmp/evil-linker");
+
+        let cmd = secure_cargo_command();
+
+        // get_envs() yields (key, Option<value>) where None means "remove".
+        let removed: std::collections::HashSet<String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for name in FORBIDDEN_CARGO_ENV_EXACT {
+            assert!(
+                removed.contains(*name),
+                "{} should be env_remove()'d but isn't (got: {:?})",
+                name,
+                removed
+            );
+        }
+        assert!(
+            removed.contains("CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER"),
+            "dynamic CARGO_TARGET_*_RUNNER not stripped"
+        );
+        assert!(
+            removed.contains("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"),
+            "dynamic CARGO_TARGET_*_LINKER not stripped"
+        );
+
+        // Cleanup so we don't poison the rest of the suite.
+        for name in FORBIDDEN_CARGO_ENV_EXACT {
+            std::env::remove_var(name);
+        }
+        std::env::remove_var("CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER");
+        std::env::remove_var("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+    }
+
+    #[test]
+    fn rejects_target_runner_config() {
+        let r = check_forbidden_cargo_args(&[
+            "--config",
+            "target.x86_64-apple-darwin.runner=\"evil\"",
+            "build",
+        ]);
+        assert!(r.is_err(), "must reject --config target.*.runner");
+        assert!(r.unwrap_err().contains("target.x86_64-apple-darwin.runner"));
+    }
+
+    #[test]
+    fn rejects_target_linker_config_equals_form() {
+        let r = check_forbidden_cargo_args(&[
+            "--config=target.aarch64-unknown-linux-gnu.linker=\"evil\"",
+            "build",
+        ]);
+        assert!(r.is_err(), "must reject --config=target.*.linker");
+    }
+
+    #[test]
+    fn rejects_build_rustc_wrapper_config() {
+        assert!(check_forbidden_cargo_args(&[
+            "--config",
+            "build.rustc-wrapper=\"/tmp/evil\"",
+            "build",
+        ])
+        .is_err());
+        assert!(check_forbidden_cargo_args(&[
+            "--config=build.rustc-wrapper=\"/tmp/evil\"",
+            "build",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_build_rustc_config() {
+        assert!(check_forbidden_cargo_args(&[
+            "--config",
+            "build.rustc=\"/tmp/evil-rustc\"",
+            "build",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_net_git_fetch_with_cli_config() {
+        assert!(check_forbidden_cargo_args(&[
+            "--config",
+            "net.git-fetch-with-cli=true",
+            "build",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_registries_credential_provider_config() {
+        assert!(check_forbidden_cargo_args(&[
+            "--config",
+            "registries.my-registry.credential-provider=\"/tmp/evil\"",
+            "build",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn deny_match_is_case_insensitive() {
+        assert!(check_forbidden_cargo_args(&[
+            "--config",
+            "TARGET.X86_64-APPLE-DARWIN.RUNNER=\"evil\"",
+            "build",
+        ])
+        .is_err());
+        assert!(check_forbidden_cargo_args(&[
+            "--config=Build.Rustc-Wrapper=\"/tmp/evil\"",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn allows_benign_args() {
+        assert!(check_forbidden_cargo_args(&["--version"]).is_ok());
+        assert!(check_forbidden_cargo_args(&["check"]).is_ok());
+        assert!(check_forbidden_cargo_args(&["build"]).is_ok());
+        assert!(check_forbidden_cargo_args(&["build", "--release"]).is_ok());
+        assert!(check_forbidden_cargo_args(&["test", "--lib", "--", "--nocapture"]).is_ok());
+    }
+
+    #[test]
+    fn allows_benign_config_keys() {
+        // --config is the right flag, the key just isn't on the deny list.
+        assert!(check_forbidden_cargo_args(&[
+            "--config",
+            "profile.release.opt-level=3",
+            "build",
+        ])
+        .is_ok());
+        assert!(check_forbidden_cargo_args(&[
+            "--config=term.verbose=true",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn error_message_mentions_escape_hatch_and_issue() {
+        let err = check_forbidden_cargo_args(&[
+            "--config",
+            "build.rustc-wrapper=\"/tmp/evil\"",
+        ])
+        .unwrap_err();
+        assert!(err.contains("contextcrawler proxy cargo"));
+        assert!(err.contains("#34"));
+    }
+
+    #[test]
+    fn pattern_matcher_respects_dotted_segments() {
+        // `target.*.runner` must NOT match a key with extra dots in the
+        // wildcard segment (cargo doesn't allow them there anyway, but
+        // the matcher should still be strict).
+        assert!(!cargo_config_pattern_matches(
+            "target.*.runner",
+            "target.x86_64.apple.darwin.runner"
+        ));
+        assert!(cargo_config_pattern_matches(
+            "target.*.runner",
+            "target.x86_64-apple-darwin.runner"
+        ));
+    }
 }
 
 /// Extract short name from AWS ARN.

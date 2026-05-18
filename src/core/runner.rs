@@ -184,6 +184,30 @@ pub fn run_passthrough(tool: &str, args: &[std::ffi::OsString], verbose: u8) -> 
     )
 }
 
+/// Same as `run_passthrough`, but the caller supplies a pre-built
+/// `Command`. Used by hardened wrappers (e.g. cargo, issue #34) that
+/// need to pre-strip env vars before the spawn — `resolved_command(tool)`
+/// alone doesn't suffice once any subprocess hardening is required.
+pub fn run_passthrough_cmd(
+    mut cmd: Command,
+    tool: &str,
+    args: &[std::ffi::OsString],
+    verbose: u8,
+) -> Result<i32> {
+    if verbose > 0 {
+        eprintln!("{} passthrough: {:?}", tool, args);
+    }
+    cmd.args(args);
+    let args_str = tracking::args_display(args);
+    run(
+        cmd,
+        tool,
+        &args_str,
+        RunMode::Passthrough,
+        RunOptions::default(),
+    )
+}
+
 pub fn run_streamed(
     cmd: Command,
     tool_name: &str,
