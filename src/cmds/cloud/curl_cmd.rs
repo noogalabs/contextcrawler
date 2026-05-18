@@ -8,7 +8,10 @@
 
 use crate::core::tee::force_tee_hint;
 use crate::core::tracking;
-use crate::core::{stream::exec_capture, utils::resolved_command};
+use crate::core::{
+    stream::exec_capture,
+    utils::{check_forbidden_curl_args, secure_curl_command},
+};
 use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::io::IsTerminal;
@@ -17,7 +20,15 @@ const MAX_RESPONSE_SIZE: usize = 500;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
-    let mut cmd = resolved_command("curl");
+
+    if let Err(msg) = check_forbidden_curl_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // `secure_curl_command` strips CURL_HOME so a tainted parent env can't
+    // inject curl flags via .curlrc on every invocation. See issue #38.
+    let mut cmd = secure_curl_command();
     cmd.arg("-s"); // Silent mode (no progress bar)
 
     for arg in args {

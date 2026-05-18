@@ -3,7 +3,10 @@
 use crate::core::runner::{self, RunOptions};
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::resolved_command;
+use crate::core::utils::{
+    check_forbidden_docker_args, check_forbidden_kubectl_args, secure_docker_command,
+    secure_kubectl_command,
+};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::ffi::OsString;
@@ -54,11 +57,11 @@ where
 fn docker_ps(_verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let raw = exec_capture(resolved_command("docker").args(["ps"]))
+    let raw = exec_capture(secure_docker_command().args(["ps"]))
         .map(|r| r.stdout)
         .unwrap_or_default();
 
-    let result = exec_capture(resolved_command("docker").args([
+    let result = exec_capture(secure_docker_command().args([
         "ps",
         "--format",
         "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}",
@@ -118,11 +121,11 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
 fn docker_images(_verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let raw = exec_capture(resolved_command("docker").args(["images"]))
+    let raw = exec_capture(secure_docker_command().args(["images"]))
         .map(|r| r.stdout)
         .unwrap_or_default();
 
-    let result = exec_capture(resolved_command("docker").args([
+    let result = exec_capture(secure_docker_command().args([
         "images",
         "--format",
         "{{.Repository}}:{{.Tag}}\t{{.Size}}",
@@ -202,7 +205,12 @@ fn docker_logs(args: &[String], _verbose: u8) -> Result<i32> {
         return Ok(0);
     }
 
-    let mut cmd = resolved_command("docker");
+    if let Err(msg) = check_forbidden_docker_args(&args[1..]) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    let mut cmd = secure_docker_command();
     cmd.args(["logs", "--tail", "100", container]);
 
     let label = format!("logs {}", container);
@@ -222,7 +230,11 @@ fn docker_logs(args: &[String], _verbose: u8) -> Result<i32> {
 }
 
 fn kubectl_pods(args: &[String], _verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("kubectl");
+    if let Err(msg) = check_forbidden_kubectl_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    let mut cmd = secure_kubectl_command();
     cmd.args(["get", "pods", "-o", "json"]);
     for arg in args {
         cmd.arg(arg);
@@ -301,7 +313,11 @@ fn format_kubectl_pods(json: &Value) -> String {
 }
 
 fn kubectl_services(args: &[String], _verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("kubectl");
+    if let Err(msg) = check_forbidden_kubectl_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    let mut cmd = secure_kubectl_command();
     cmd.args(["get", "services", "-o", "json"]);
     for arg in args {
         cmd.arg(arg);
@@ -359,7 +375,14 @@ fn kubectl_logs(args: &[String], _verbose: u8) -> Result<i32> {
         return Ok(0);
     }
 
-    let mut cmd = resolved_command("kubectl");
+    // Validate the flag tail (skip the positional pod name — it's never a
+    // forbidden flag and the subcommand-deny check would misfire on it).
+    if let Err(msg) = check_forbidden_kubectl_args(&args[1..]) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    let mut cmd = secure_kubectl_command();
     cmd.args(["logs", "--tail", "100", pod]);
     for arg in args.iter().skip(1) {
         cmd.arg(arg);
@@ -519,7 +542,16 @@ fn compact_ports(ports: &str) -> String {
 }
 
 pub fn run_docker_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
-    crate::core::runner::run_passthrough("docker", args, verbose)
+    // Per issue #38: validate args + spawn with DOCKER_CONFIG / DOCKER_HOST /
+    // DOCKER_CONTEXT / DOCKER_CLI_PLUGIN_EXTRA_DIRS stripped so a tainted
+    // parent env can't redirect docker to an attacker daemon or load attacker
+    // plugins.
+    let str_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Err(msg) = check_forbidden_docker_args(&str_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    crate::core::runner::run_passthrough_cmd(secure_docker_command(), "docker", args, verbose)
 }
 
 /// Run `docker compose ps` with compact output
@@ -527,7 +559,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
     // Raw output for token tracking
-    let raw_result = exec_capture(resolved_command("docker").args(["compose", "ps"]))
+    let raw_result = exec_capture(secure_docker_command().args(["compose", "ps"]))
         .context("Failed to run docker compose ps")?;
 
     if !raw_result.success() {
@@ -537,7 +569,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
     let raw = raw_result.stdout;
 
     // Structured output for parsing (same pattern as docker_ps)
-    let result = exec_capture(resolved_command("docker").args([
+    let result = exec_capture(secure_docker_command().args([
         "compose",
         "ps",
         "--format",
@@ -562,7 +594,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
 }
 
 pub fn run_compose_logs(service: Option<&str>, tail: u32, verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("docker");
+    let mut cmd = secure_docker_command();
     let tail_str = tail.to_string();
     cmd.args(["compose", "logs", "--tail", &tail_str]);
     if let Some(svc) = service {
@@ -585,7 +617,7 @@ pub fn run_compose_logs(service: Option<&str>, tail: u32, verbose: u8) -> Result
 }
 
 pub fn run_compose_build(service: Option<&str>, verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("docker");
+    let mut cmd = secure_docker_command();
     cmd.args(["compose", "build"]);
     if let Some(svc) = service {
         cmd.arg(svc);
@@ -609,7 +641,22 @@ pub fn run_compose_build(service: Option<&str>, verbose: u8) -> Result<i32> {
 pub fn run_compose_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
     let mut combined = vec![OsString::from("compose")];
     combined.extend_from_slice(args);
-    crate::core::runner::run_passthrough("docker", &combined, verbose)
+    // Validate the docker-level flags (compose subcommand args are validated
+    // against the docker deny-list since they share the same flag namespace).
+    let str_args: Vec<String> = combined
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Err(msg) = check_forbidden_docker_args(&str_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    crate::core::runner::run_passthrough_cmd(
+        secure_docker_command(),
+        "docker",
+        &combined,
+        verbose,
+    )
 }
 
 pub fn run_kubectl_get(args: &[String], verbose: u8) -> Result<i32> {
@@ -652,7 +699,16 @@ fn run_kubectl_get_passthrough(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub fn run_kubectl_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
-    crate::core::runner::run_passthrough("kubectl", args, verbose)
+    // Per issue #38: reject `--kubeconfig` + the exec/port-forward/cp pivots,
+    // and spawn with KUBECONFIG / KUBE_EDITOR / etc. stripped so a tainted
+    // parent env can't redirect every kubectl call to an attacker apiserver
+    // or hijack `kubectl edit`.
+    let str_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Err(msg) = check_forbidden_kubectl_args(&str_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    crate::core::runner::run_passthrough_cmd(secure_kubectl_command(), "kubectl", args, verbose)
 }
 
 #[cfg(test)]

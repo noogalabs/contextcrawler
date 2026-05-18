@@ -1175,6 +1175,94 @@ const RTK_META_COMMANDS: &[&str] = &[
     "security",
 ];
 
+/// Cloud CLI hardening guard for the clap-fallback path. Returns `Some(code)`
+/// when the deny-list rejected the invocation (caller should exit with
+/// `code`). Returns `None` when the tool either isn't one we harden or the
+/// args are clean — caller then continues with the normal fallback.
+///
+/// We don't actually re-execute the tool here; we only validate and short-
+/// circuit on rejection. The actual execution still runs through the
+/// fallback's normal `resolved_command(...)` path, but we mutate the
+/// process env so the strip applies via inheritance. This is the same
+/// effect as `secure_kubectl_command()` since `resolved_command` builds on
+/// top of inherited env.
+fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
+    use core::utils::{
+        check_forbidden_aws_args, check_forbidden_curl_args, check_forbidden_docker_args,
+        check_forbidden_kubectl_args, check_forbidden_psql_args, check_forbidden_wget_args,
+    };
+
+    // Match on the basename so absolute paths (/usr/local/bin/kubectl) still resolve.
+    let basename = std::path::Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+
+    // Env strip vars per tool — duplicated from utils::*_STRIP_ENV. Kept in
+    // sync via the unit tests in `secure_cloud_tests`. We mutate the parent
+    // env here because the fallback path spawns via Command::new which
+    // inherits env wholesale; we can't intercept the spawn site without
+    // restructuring the fallback flow.
+    let (check_result, strip_vars): (Result<(), String>, &[&str]) = match basename {
+        "kubectl" => (
+            check_forbidden_kubectl_args(args),
+            &[
+                "KUBECONFIG",
+                "KUBE_EDITOR",
+                "KUBECTL_EXTERNAL_DIFF",
+                "EDITOR",
+                "VISUAL",
+                "MANPAGER",
+                "PAGER",
+            ],
+        ),
+        "docker" => (
+            check_forbidden_docker_args(args),
+            &[
+                "DOCKER_CONFIG",
+                "DOCKER_CLI_PLUGIN_EXTRA_DIRS",
+                "DOCKER_HOST",
+                "DOCKER_CONTEXT",
+            ],
+        ),
+        "aws" => (
+            check_forbidden_aws_args(args),
+            &[
+                "AWS_CONFIG_FILE",
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "AWS_PLUGIN_PATH",
+            ],
+        ),
+        "psql" => (
+            check_forbidden_psql_args(args),
+            &["PSQLRC", "PSQL_HISTORY", "PGSERVICEFILE", "PGPASSFILE"],
+        ),
+        "curl" => (check_forbidden_curl_args(args), &["CURL_HOME"]),
+        "wget" => (check_forbidden_wget_args(args), &["WGETRC"]),
+        _ => return None,
+    };
+
+    if let Err(msg) = check_result {
+        eprintln!("{}", msg);
+        return Some(2);
+    }
+
+    // Strip per-tool env vars from THIS process so the child inherits the
+    // cleaned env. Safe because the fallback path exits the process right
+    // after the spawn — no other code observes the cleared vars.
+    //
+    // SAFETY: std::env::remove_var is unsafe in newer std as of Rust 1.x
+    // due to multi-threaded env races. Contextcrawler is single-threaded
+    // up to this point (CLI parse + dispatch).
+    for var in strip_vars {
+        // SAFETY: see comment above — single-threaded at this dispatch point.
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+    None
+}
+
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1187,6 +1275,15 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     // e.g. `rtk gain --badtypo` should show Clap's error, not try to run `gain` from $PATH.
     if RTK_META_COMMANDS.contains(&args[0].as_str()) {
         parse_error.exit();
+    }
+
+    // Cloud CLI hardening (issue #38): when the fallback spawns a tool we've
+    // hardened, route the args through the per-tool deny-list and spawn with
+    // the per-tool env strip. Without this, any clap-confusing arg like
+    // `kubectl --kubeconfig <evil>` would bypass our hardening because it
+    // takes the fallback path instead of the Kubectl subcommand path.
+    if let Some(code) = cloud_fallback_hardening(&args[0], &args[1..]) {
+        return Ok(code);
     }
 
     let raw_command = args.join(" ");

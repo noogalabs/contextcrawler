@@ -4,7 +4,7 @@
 //! and produces compact tab-separated or key=value output.
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::resolved_command;
+use crate::core::utils::{check_forbidden_psql_args, secure_psql_command};
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -24,7 +24,14 @@ lazy_static! {
 // - On success: tracking raw includes stderr (previously stdout-only, but stderr is empty on success)
 // - Tee hint uses merged stdout+stderr as raw (was stdout-only)
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("psql");
+    if let Err(msg) = check_forbidden_psql_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    // `secure_psql_command` strips PSQLRC / PSQL_HISTORY / PGSERVICEFILE /
+    // PGPASSFILE so a tainted parent env can't inject SQL or redirect auth.
+    // See issue #38.
+    let mut cmd = secure_psql_command();
     for arg in args {
         cmd.arg(arg);
     }
