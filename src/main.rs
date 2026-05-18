@@ -1190,6 +1190,8 @@ fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
     use core::utils::{
         check_forbidden_aws_args, check_forbidden_curl_args, check_forbidden_docker_args,
         check_forbidden_kubectl_args, check_forbidden_psql_args, check_forbidden_wget_args,
+        secure_aws_command, secure_curl_command, secure_docker_command,
+        secure_kubectl_command, secure_psql_command, secure_wget_command,
     };
 
     // Match on the basename so absolute paths (/usr/local/bin/kubectl) still resolve.
@@ -1198,47 +1200,16 @@ fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
         .and_then(|s| s.to_str())
         .unwrap_or(tool);
 
-    // Env strip vars per tool — duplicated from utils::*_STRIP_ENV. Kept in
-    // sync via the unit tests in `secure_cloud_tests`. We mutate the parent
-    // env here because the fallback path spawns via Command::new which
-    // inherits env wholesale; we can't intercept the spawn site without
-    // restructuring the fallback flow.
-    let (check_result, strip_vars): (Result<(), String>, &[&str]) = match basename {
-        "kubectl" => (
-            check_forbidden_kubectl_args(args),
-            &[
-                "KUBECONFIG",
-                "KUBE_EDITOR",
-                "KUBECTL_EXTERNAL_DIFF",
-                "EDITOR",
-                "VISUAL",
-                "MANPAGER",
-                "PAGER",
-            ],
-        ),
-        "docker" => (
-            check_forbidden_docker_args(args),
-            &[
-                "DOCKER_CONFIG",
-                "DOCKER_CLI_PLUGIN_EXTRA_DIRS",
-                "DOCKER_HOST",
-                "DOCKER_CONTEXT",
-            ],
-        ),
-        "aws" => (
-            check_forbidden_aws_args(args),
-            &[
-                "AWS_CONFIG_FILE",
-                "AWS_SHARED_CREDENTIALS_FILE",
-                "AWS_PLUGIN_PATH",
-            ],
-        ),
-        "psql" => (
-            check_forbidden_psql_args(args),
-            &["PSQLRC", "PSQL_HISTORY", "PGSERVICEFILE", "PGPASSFILE"],
-        ),
-        "curl" => (check_forbidden_curl_args(args), &["CURL_HOME"]),
-        "wget" => (check_forbidden_wget_args(args), &["WGETRC"]),
+    // Look up the deny-check + secure Command builder for this tool.
+    // Returning Some((check, builder)) means "this is a cloud tool we
+    // harden"; None means "fall through to the normal fallback".
+    let (check_result, mut cmd): (Result<(), String>, std::process::Command) = match basename {
+        "kubectl" => (check_forbidden_kubectl_args(args), secure_kubectl_command()),
+        "docker" => (check_forbidden_docker_args(args), secure_docker_command()),
+        "aws" => (check_forbidden_aws_args(args), secure_aws_command()),
+        "psql" => (check_forbidden_psql_args(args), secure_psql_command()),
+        "curl" => (check_forbidden_curl_args(args), secure_curl_command()),
+        "wget" => (check_forbidden_wget_args(args), secure_wget_command()),
         _ => return None,
     };
 
@@ -1247,24 +1218,24 @@ fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
         return Some(2);
     }
 
-    // NOTE (codex F9 pre-release review, 2026-05-18): previous versions
-    // of this function called `unsafe { std::env::remove_var(...) }`
-    // here, claiming "single-threaded at CLI dispatch". That was
-    // unsound: `maybe_ping()` at run_cli's top spawns a telemetry
-    // thread BEFORE we reach this dispatch point, so env mutation
-    // here races against `std::env::vars()` in that live thread. Per
-    // Rust 1.81+ contract on `env::remove_var`, that's UB.
-    //
-    // We now rely on the per-tool `secure_*_command` helpers
-    // (PRs #42/#43/#44/#46/#47) wired into every `Commands::*`
-    // dispatch path. Those use `Command::env_remove` (safe) on the
-    // spawned child only. The fallback path here is rare — only fires
-    // when clap can't parse the user's invocation — and an unhardened
-    // fallback is an accepted residual surface (file a follow-up to
-    // route the fallback through a hardened Command if it matters
-    // in practice).
-    let _ = strip_vars; // silence unused-binding warning
-    None
+    // Spawn the hardened command directly here instead of falling back to
+    // the normal `resolved_command(...)` path. The secure_*_command
+    // helpers apply UNIVERSAL_ENV_STRIP + per-tool env_remove on the
+    // spawned child only (Command::env_remove is safe; no process-wide
+    // env mutation). This closes the regression codex P1 flagged on the
+    // first F9 fix attempt: simply removing the unsafe `env::remove_var`
+    // dropped the hardening for this path; spawning here keeps it.
+    cmd.args(args);
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+    match cmd.status() {
+        Ok(status) => Some(status.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("[contextcrawler] failed to spawn {}: {}", basename, e);
+            Some(127)
+        }
+    }
 }
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
