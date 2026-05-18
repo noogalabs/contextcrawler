@@ -1,11 +1,16 @@
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::resolved_command;
+use crate::core::utils::{check_forbidden_wget_args, secure_wget_command};
 use anyhow::{Context, Result};
 
 /// Compact wget - strips progress bars, shows only result
 pub fn run(url: &str, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+
+    if let Err(msg) = check_forbidden_wget_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
 
     if verbose > 0 {
         eprintln!("wget: {}", url);
@@ -20,7 +25,9 @@ pub fn run(url: &str, args: &[String], verbose: u8) -> Result<i32> {
     }
     cmd_args.push(url);
 
-    let mut cmd = resolved_command("wget");
+    // `secure_wget_command` strips WGETRC so a tainted parent env can't
+    // inject wget directives into every invocation. See issue #38.
+    let mut cmd = secure_wget_command();
     cmd.args(&cmd_args);
     let result = exec_capture(&mut cmd).context("Failed to run wget")?;
 
@@ -52,6 +59,11 @@ pub fn run(url: &str, args: &[String], verbose: u8) -> Result<i32> {
 pub fn run_stdout(url: &str, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
+    if let Err(msg) = check_forbidden_wget_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     if verbose > 0 {
         eprintln!("wget: {} -> stdout", url);
     }
@@ -62,7 +74,7 @@ pub fn run_stdout(url: &str, args: &[String], verbose: u8) -> Result<i32> {
     }
     cmd_args.push(url);
 
-    let mut cmd = resolved_command("wget");
+    let mut cmd = secure_wget_command();
     cmd.args(&cmd_args);
     let result = exec_capture(&mut cmd).context("Failed to run wget")?;
 

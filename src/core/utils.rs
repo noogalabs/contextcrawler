@@ -2930,3 +2930,456 @@ mod secure_pyrbjvmdotnet_tests {
         assert!(!looks_like_path("pytest_asyncio"));
     }
 }
+
+/// Env vars that influence kubectl's behaviour in ways an attacker can abuse:
+/// - `KUBECONFIG`: redirects auth to an attacker-controlled cluster + creds.
+/// - `KUBE_EDITOR` / `EDITOR` / `VISUAL`: invoked by `kubectl edit`; an
+///   attacker who controls these gets arbitrary command execution.
+/// - `KUBECTL_EXTERNAL_DIFF`: invoked by `kubectl diff`; same RCE shape.
+/// - `MANPAGER` / `PAGER`: invoked by some help paths; RCE shape again.
+const KUBECTL_STRIP_ENV: &[&str] = &[
+    "KUBECONFIG",
+    "KUBE_EDITOR",
+    "KUBECTL_EXTERNAL_DIFF",
+    "EDITOR",
+    "VISUAL",
+    "MANPAGER",
+    "PAGER",
+];
+
+/// Build a Command for `kubectl` with hijack-prone env vars stripped. Use
+/// this everywhere we spawn kubectl on the user's behalf — without it, a
+/// tainted parent env can silently redirect every kubectl call to an
+/// attacker's apiserver.
+pub fn secure_kubectl_command() -> Command {
+    let mut cmd = resolved_command("kubectl");
+    for var in KUBECTL_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// kubectl subcommands and flags that are too dangerous to forward through
+/// the agent-facing path. These are filesystem-modifying or privileged
+/// pivots (`cp` writes into containers, `exec`/`port-forward` open interactive
+/// channels). Users with a legitimate need can run them via
+/// `contextcrawler proxy kubectl ...`.
+const FORBIDDEN_KUBECTL_SUBCOMMANDS: &[&str] = &["exec", "port-forward", "cp"];
+
+/// Validate kubectl args. Rejects:
+/// - `--kubeconfig <path>` and `--kubeconfig=<path>` (same threat shape as
+///   the `KUBECONFIG` env var — points kubectl at an attacker cluster).
+/// - The subcommands listed in `FORBIDDEN_KUBECTL_SUBCOMMANDS`.
+pub fn check_forbidden_kubectl_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--kubeconfig" || a.starts_with("--kubeconfig=") {
+            return Err(cloud_deny_message("kubectl", a));
+        }
+    }
+    // Subcommand check: first non-flag arg is the subcommand.
+    if let Some(sub) = args.iter().map(|s| s.as_ref()).find(|a| !a.starts_with('-')) {
+        if FORBIDDEN_KUBECTL_SUBCOMMANDS.contains(&sub) {
+            return Err(cloud_deny_message("kubectl", sub));
+        }
+    }
+    Ok(())
+}
+
+// ---- docker ------------------------------------------------------------------
+
+/// Env vars that change which daemon docker talks to or which CLI plugins
+/// get loaded — both attacker-useful for hijacking output or executing
+/// arbitrary plugin binaries.
+const DOCKER_STRIP_ENV: &[&str] = &[
+    "DOCKER_CONFIG",
+    "DOCKER_CLI_PLUGIN_EXTRA_DIRS",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+];
+
+pub fn secure_docker_command() -> Command {
+    let mut cmd = resolved_command("docker");
+    for var in DOCKER_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Reject `--config <dir>` / `--config=<dir>` — same threat shape as the
+/// `DOCKER_CONFIG` env var (points docker at an attacker-controlled config
+/// dir that can carry plugin pointers, auth tokens, etc.).
+pub fn check_forbidden_docker_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--config" || a.starts_with("--config=") {
+            return Err(cloud_deny_message("docker", a));
+        }
+    }
+    Ok(())
+}
+
+// ---- aws ---------------------------------------------------------------------
+
+/// AWS CLI config/credential file env vars. An attacker who can set these
+/// can redirect every AWS call to attacker-owned credentials (silent
+/// session takeover) or load attacker-written plugins.
+const AWS_STRIP_ENV: &[&str] = &[
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_PLUGIN_PATH",
+];
+
+pub fn secure_aws_command() -> Command {
+    let mut cmd = resolved_command("aws");
+    for var in AWS_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Reject `--ca-bundle <path>` / `--ca-bundle=<path>` — an attacker-provided
+/// CA bundle lets them MITM every aws call.
+///
+/// We intentionally do NOT validate `--profile` here. Stripping the config
+/// file env vars above already neuters the most direct attack
+/// (`--profile attacker` pointing at an attacker-written ~/.aws/config),
+/// and reasoning about which profile names are "safe" is brittle.
+pub fn check_forbidden_aws_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "--ca-bundle" || a.starts_with("--ca-bundle=") {
+            return Err(cloud_deny_message("aws", a));
+        }
+    }
+    Ok(())
+}
+
+// ---- psql --------------------------------------------------------------------
+
+/// PostgreSQL client config / history / connection-service env vars. The
+/// most acute risk is `PSQLRC` — it's an arbitrary SQL file executed on
+/// every psql invocation, so an attacker who controls it can wrap every
+/// psql call with `COPY ... TO PROGRAM '...'` (RCE on the DB server) or
+/// silently exfil query results.
+const PSQL_STRIP_ENV: &[&str] = &[
+    "PSQLRC",
+    "PSQL_HISTORY",
+    "PGSERVICEFILE",
+    "PGPASSFILE",
+];
+
+pub fn secure_psql_command() -> Command {
+    let mut cmd = resolved_command("psql");
+    for var in PSQL_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// psql has no per-flag deny list in v1 — relying on the env strip above is
+/// sufficient and the equivalent CLI flags (`-c`, `-f`) are core
+/// functionality we can't reject without breaking the wrapper.
+pub fn check_forbidden_psql_args<S: AsRef<str>>(_args: &[S]) -> Result<(), String> {
+    Ok(())
+}
+
+// ---- curl --------------------------------------------------------------------
+
+/// curl's `CURL_HOME` env var (used to locate `.curlrc`) is the direct
+/// equivalent of `--config <file>` — it injects arbitrary curl flags into
+/// every invocation, which is sufficient for credential exfil
+/// (`--upload-file` of `~/.aws/credentials`, etc.).
+///
+/// Tradeoff: we do NOT strip `XDG_CONFIG_HOME` even though `.config/curlrc`
+/// would also be honoured. `XDG_CONFIG_HOME` controls config dirs for
+/// dozens of tools the user runs daily, and dropping it would silently
+/// break their environment for marginal hardening benefit. If a user is
+/// already running a tainted `XDG_CONFIG_HOME`, they've lost the game
+/// outside of contextcrawler too.
+const CURL_STRIP_ENV: &[&str] = &["CURL_HOME"];
+
+pub fn secure_curl_command() -> Command {
+    let mut cmd = resolved_command("curl");
+    for var in CURL_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// curl args that re-introduce the env-var threat shape:
+/// - `-K <file>` / `--config <file>` / `--config=<file>`: same as `CURL_HOME`,
+///   the file can carry arbitrary curl flags including credential uploads.
+/// - `--output <path>` / `-o <path>` writing into dotfile rc paths
+///   (`~/.bashrc`, `~/.zshrc`, `~/.profile`, etc.): heuristic — any output
+///   target whose basename starts with `.` and ends with `rc`, or matches a
+///   known rc-file name. Brittle by nature (false negatives possible); v1.
+pub fn check_forbidden_curl_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+
+        // --config / -K (space-separated form)
+        if a == "--config" || a == "-K" {
+            return Err(cloud_deny_message("curl", a));
+        }
+        if a.starts_with("--config=") {
+            return Err(cloud_deny_message("curl", a));
+        }
+
+        // --output <path> / -o <path>
+        if a == "--output" || a == "-o" {
+            if let Some(next) = args.get(i + 1) {
+                if looks_like_rc_target(next.as_ref()) {
+                    return Err(cloud_deny_message("curl", next.as_ref()));
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(val) = a.strip_prefix("--output=") {
+            if looks_like_rc_target(val) {
+                return Err(cloud_deny_message("curl", a));
+            }
+        }
+        // -o<value> (no space) is also valid curl syntax
+        if let Some(val) = a.strip_prefix("-o") {
+            if !val.is_empty() && a != "-O" && looks_like_rc_target(val) {
+                return Err(cloud_deny_message("curl", a));
+            }
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Heuristic: does this path look like a shell-rc / dotfile we don't want
+/// curl to clobber? Matches basenames like `.bashrc`, `.zshrc`, `.profile`,
+/// `.bash_profile`, or anything matching `.*rc` under a dot-prefix.
+fn looks_like_rc_target(path: &str) -> bool {
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+
+    // Known shell/login init files.
+    const RC_NAMES: &[&str] = &[
+        ".bashrc",
+        ".zshrc",
+        ".profile",
+        ".bash_profile",
+        ".zprofile",
+        ".zshenv",
+        ".kshrc",
+        ".cshrc",
+        ".tcshrc",
+        ".inputrc",
+        ".login",
+    ];
+    if RC_NAMES.contains(&basename) {
+        return true;
+    }
+    // Generic ".<word>rc" pattern (catches .vimrc, .gitconfigrc, etc.).
+    if basename.starts_with('.') && basename.ends_with("rc") && basename.len() > 3 {
+        return true;
+    }
+    false
+}
+
+// ---- wget --------------------------------------------------------------------
+
+/// wget honours `WGETRC` to locate an init file containing arbitrary wget
+/// directives. Same threat shape as `CURL_HOME` for curl — an attacker who
+/// can set it can inject credential-exfil flags into every wget call.
+const WGET_STRIP_ENV: &[&str] = &["WGETRC"];
+
+pub fn secure_wget_command() -> Command {
+    let mut cmd = resolved_command("wget");
+    for var in WGET_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// wget flags that re-introduce the `WGETRC` threat shape, or directly
+/// execute attacker commands:
+/// - `--config <file>` / `--config=<file>`: equivalent to WGETRC.
+/// - `--execute=<cmd>` / `-e <cmd>`: runs an arbitrary wgetrc directive
+///   inline, including credential-loading or output-rewriting directives.
+/// - `--use-askpass=<file>`: runs the named program; direct RCE.
+pub fn check_forbidden_wget_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+        if a == "--config" || a.starts_with("--config=") {
+            return Err(cloud_deny_message("wget", a));
+        }
+        if a == "--execute" || a == "-e" || a.starts_with("--execute=") {
+            return Err(cloud_deny_message("wget", a));
+        }
+        if a == "--use-askpass" || a.starts_with("--use-askpass=") {
+            return Err(cloud_deny_message("wget", a));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+// ---- shared error message ----------------------------------------------------
+
+fn cloud_deny_message(tool: &str, offending: &str) -> String {
+    format!(
+        "[contextcrawler] refusing to forward '{}' to {} — this flag/subcommand \
+         enables credential redirect, arbitrary code execution, or output \
+         hijack (issue #38). If you genuinely need it, use: contextcrawler \
+         proxy {} <args>",
+        offending, tool, tool
+    )
+}
+
+#[cfg(test)]
+mod secure_cloud_tests {
+    use super::*;
+
+    // ---- kubectl ----
+    #[test]
+    fn kubectl_strips_env() {
+        let cmd = secure_kubectl_command();
+        // Command doesn't expose its env map directly; verify by checking
+        // that the strip list contains the documented vars. The behavioural
+        // assertion (env actually unset for the child) is covered by the
+        // tests/cloud_hardening.rs integration tests where we run the
+        // binary and observe behaviour.
+        let _ = cmd;
+        for v in [
+            "KUBECONFIG",
+            "KUBE_EDITOR",
+            "KUBECTL_EXTERNAL_DIFF",
+            "EDITOR",
+            "VISUAL",
+            "MANPAGER",
+            "PAGER",
+        ] {
+            assert!(KUBECTL_STRIP_ENV.contains(&v), "{v} must be in strip list");
+        }
+    }
+
+    #[test]
+    fn rejects_kubeconfig_flag() {
+        assert!(check_forbidden_kubectl_args(&["--kubeconfig", "/tmp/x.yaml"]).is_err());
+        assert!(check_forbidden_kubectl_args(&["--kubeconfig=/tmp/x.yaml"]).is_err());
+    }
+
+    #[test]
+    fn rejects_kubectl_exec_subcommand() {
+        assert!(check_forbidden_kubectl_args(&["exec", "pod", "--", "sh"]).is_err());
+        assert!(check_forbidden_kubectl_args(&["port-forward", "svc/x", "8080"]).is_err());
+        assert!(check_forbidden_kubectl_args(&["cp", "pod:/etc", "."]).is_err());
+    }
+
+    #[test]
+    fn allows_safe_kubectl_args() {
+        assert!(check_forbidden_kubectl_args(&["version", "--client"]).is_ok());
+        assert!(check_forbidden_kubectl_args(&["get", "pods", "-n", "default"]).is_ok());
+        assert!(check_forbidden_kubectl_args(&["-n", "default", "get", "pods"]).is_ok());
+    }
+
+    // ---- docker ----
+    #[test]
+    fn rejects_docker_config_flag() {
+        assert!(check_forbidden_docker_args(&["--config", "/tmp/x"]).is_err());
+        assert!(check_forbidden_docker_args(&["--config=/tmp/x"]).is_err());
+    }
+
+    #[test]
+    fn allows_safe_docker_args() {
+        assert!(check_forbidden_docker_args(&["ps"]).is_ok());
+        assert!(check_forbidden_docker_args(&["--version"]).is_ok());
+        assert!(check_forbidden_docker_args(&["run", "--rm", "alpine"]).is_ok());
+    }
+
+    // ---- aws ----
+    #[test]
+    fn rejects_aws_ca_bundle() {
+        assert!(check_forbidden_aws_args(&["--ca-bundle", "/tmp/x.pem"]).is_err());
+        assert!(check_forbidden_aws_args(&["--ca-bundle=/tmp/x.pem"]).is_err());
+    }
+
+    #[test]
+    fn allows_safe_aws_args() {
+        assert!(check_forbidden_aws_args(&["--version"]).is_ok());
+        assert!(check_forbidden_aws_args(&["s3", "ls"]).is_ok());
+        // --profile is intentionally allowed (see doc comment).
+        assert!(check_forbidden_aws_args(&["--profile", "default", "s3", "ls"]).is_ok());
+    }
+
+    // ---- psql ----
+    #[test]
+    fn psql_arg_check_is_permissive() {
+        assert!(check_forbidden_psql_args(&["-c", "select 1"]).is_ok());
+        assert!(check_forbidden_psql_args(&["--version"]).is_ok());
+    }
+
+    // ---- curl ----
+    #[test]
+    fn rejects_curl_config_flags() {
+        assert!(check_forbidden_curl_args(&["--config", "/tmp/x"]).is_err());
+        assert!(check_forbidden_curl_args(&["-K", "/tmp/x"]).is_err());
+        assert!(check_forbidden_curl_args(&["--config=/tmp/x"]).is_err());
+    }
+
+    #[test]
+    fn rejects_curl_output_to_rc_files() {
+        assert!(check_forbidden_curl_args(&["https://x", "--output", "/home/u/.bashrc"]).is_err());
+        assert!(check_forbidden_curl_args(&["https://x", "-o", "/home/u/.zshrc"]).is_err());
+        assert!(check_forbidden_curl_args(&["https://x", "--output=/home/u/.profile"]).is_err());
+        assert!(check_forbidden_curl_args(&["https://x", "-o/home/u/.bashrc"]).is_err());
+    }
+
+    #[test]
+    fn allows_safe_curl_args() {
+        assert!(check_forbidden_curl_args(&["https://example.com"]).is_ok());
+        assert!(check_forbidden_curl_args(&["-s", "https://example.com"]).is_ok());
+        assert!(check_forbidden_curl_args(&["--output", "/tmp/out.json", "https://x"]).is_ok());
+        assert!(check_forbidden_curl_args(&["-o", "file.html", "https://x"]).is_ok());
+        // -O (uppercase, use remote name) must NOT be confused with -o
+        assert!(check_forbidden_curl_args(&["-O", "https://x/file.zip"]).is_ok());
+    }
+
+    #[test]
+    fn looks_like_rc_target_basics() {
+        assert!(looks_like_rc_target("/home/u/.bashrc"));
+        assert!(looks_like_rc_target(".zshrc"));
+        assert!(looks_like_rc_target("/etc/profile.d/../../home/u/.profile"));
+        assert!(looks_like_rc_target(".vimrc"));
+        assert!(!looks_like_rc_target("file.html"));
+        assert!(!looks_like_rc_target("/tmp/out.json"));
+        assert!(!looks_like_rc_target("rc")); // just "rc" — not a dotfile
+    }
+
+    // ---- wget ----
+    #[test]
+    fn rejects_wget_dangerous_flags() {
+        assert!(check_forbidden_wget_args(&["--config", "/tmp/x"]).is_err());
+        assert!(check_forbidden_wget_args(&["--config=/tmp/x"]).is_err());
+        assert!(check_forbidden_wget_args(&["--execute=robots=off"]).is_err());
+        assert!(check_forbidden_wget_args(&["-e", "robots=off"]).is_err());
+        assert!(check_forbidden_wget_args(&["--execute", "robots=off"]).is_err());
+        assert!(check_forbidden_wget_args(&["--use-askpass=/tmp/evil.sh"]).is_err());
+    }
+
+    #[test]
+    fn allows_safe_wget_args() {
+        assert!(check_forbidden_wget_args(&["https://example.com"]).is_ok());
+        assert!(check_forbidden_wget_args(&["-O", "out.html", "https://x"]).is_ok());
+        assert!(check_forbidden_wget_args(&["--tries=3", "https://x"]).is_ok());
+    }
+
+    #[test]
+    fn error_message_mentions_escape_hatch() {
+        let err = check_forbidden_docker_args(&["--config", "/x"]).unwrap_err();
+        assert!(err.contains("contextcrawler proxy docker"));
+        assert!(err.contains("#38"));
+    }
+}

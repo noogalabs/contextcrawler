@@ -6,8 +6,8 @@
 use crate::core::tee::force_tee_hint;
 use crate::core::tracking;
 use crate::core::utils::{
-    exit_code_from_output, exit_code_from_status, human_bytes, join_with_overflow,
-    resolved_command, shorten_arn, truncate_iso_date,
+    check_forbidden_aws_args, exit_code_from_output, exit_code_from_status, human_bytes,
+    join_with_overflow, secure_aws_command, shorten_arn, truncate_iso_date,
 };
 use crate::json_cmd;
 use anyhow::{Context, Result};
@@ -44,6 +44,18 @@ impl FilterResult {
 
 /// Run an AWS CLI command with token-optimized output
 pub fn run(subcommand: &str, args: &[String], verbose: u8) -> Result<i32> {
+    // Per issue #38: reject `--ca-bundle` (MITM vector). The aws Command
+    // builder also strips AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE /
+    // AWS_PLUGIN_PATH so a tainted parent env can't redirect auth.
+    if let Err(msg) = check_forbidden_aws_args(&[subcommand.to_string()]) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+    if let Err(msg) = check_forbidden_aws_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     // Build the full sub-path: e.g. "sts" + ["get-caller-identity"] -> "sts get-caller-identity"
     let full_sub = if args.is_empty() {
         subcommand.to_string()
@@ -218,7 +230,7 @@ fn is_structured_operation(args: &[String]) -> bool {
 fn run_generic(subcommand: &str, args: &[String], verbose: u8, full_sub: &str) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = resolved_command("aws");
+    let mut cmd = secure_aws_command();
     cmd.arg(subcommand);
 
     let mut has_output_flag = false;
@@ -282,7 +294,7 @@ fn run_aws_json(
     extra_args: &[String],
     verbose: u8,
 ) -> Result<(String, String, std::process::ExitStatus)> {
-    let mut cmd = resolved_command("aws");
+    let mut cmd = secure_aws_command();
     for arg in sub_args {
         cmd.arg(arg);
     }
@@ -379,7 +391,7 @@ fn run_aws_filtered(
 fn run_s3_ls(extra_args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = resolved_command("aws");
+    let mut cmd = secure_aws_command();
     cmd.args(["s3", "ls"]);
     for arg in extra_args {
         cmd.arg(arg);
@@ -430,7 +442,7 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
     let rtk_label = format!("rtk aws s3 {}", operation);
     let slug = format!("aws_s3_{}", operation);
 
-    let mut cmd = resolved_command("aws");
+    let mut cmd = secure_aws_command();
     cmd.args(["s3", operation]);
     for arg in extra_args {
         cmd.arg(arg);
