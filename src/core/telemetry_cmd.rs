@@ -54,9 +54,8 @@ fn run_status() -> Result<()> {
     }
 
     println!();
-    println!("Upstream data controller: RTK AI Labs <contact@rtk-ai.app>");
-    println!("Upstream policy: https://github.com/rtk-ai/rtk/blob/main/docs/TELEMETRY.md");
-    println!("ContextCrawler inherits the upstream pipeline as-is; no ContextCrawler-specific endpoint.");
+    println!("Data controller: RTK AI Labs, contact@rtk-ai.app");
+    println!("Details: https://github.com/rtk-ai/rtk/blob/master/docs/TELEMETRY.md");
 
     Ok(())
 }
@@ -70,11 +69,11 @@ fn run_enable() -> Result<()> {
         );
     }
 
-    eprintln!("ContextCrawler inherits rtk's anonymous telemetry pipeline (once per day).");
+    eprintln!("RTK collects anonymous usage metrics once per day to improve filters.");
     eprintln!();
     eprintln!("  What:    command names (not arguments), token savings, OS, version");
-    eprintln!("  Who:     upstream — RTK AI Labs <contact@rtk-ai.app>");
-    eprintln!("  Details: https://github.com/rtk-ai/rtk/blob/main/docs/TELEMETRY.md");
+    eprintln!("  Who:     RTK AI Labs, contact@rtk-ai.app");
+    eprintln!("  Details: https://github.com/rtk-ai/rtk/blob/master/docs/TELEMETRY.md");
     eprintln!();
     eprint!("Enable anonymous telemetry? [y/N] ");
 
@@ -149,7 +148,7 @@ fn run_forget() -> Result<()> {
             }
             Err(e) => {
                 eprintln!("rtk: could not reach server: {}", e);
-                eprintln!("  To complete erasure on the upstream pipeline, email contact@rtk-ai.app");
+                eprintln!("  To complete erasure, email contact@rtk-ai.app");
                 eprintln!("  with your device hash: {}", hash);
             }
         }

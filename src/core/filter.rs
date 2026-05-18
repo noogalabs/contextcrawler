@@ -69,7 +69,8 @@ impl Language {
             "rb" => Language::Ruby,
             "sh" | "bash" | "zsh" => Language::Shell,
             "json" | "jsonc" | "json5" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv"
-            | "graphql" | "gql" | "sql" | "md" | "markdown" | "txt" | "env" | "lock" => {
+            | "graphql" | "gql" | "sql" | "md" | "markdown" | "txt" | "env" | "lock"
+            | "xcstrings" | "geojson" | "ipynb" | "webmanifest" | "code-workspace" => {
                 Language::Data
             }
             _ => Language::Unknown,
@@ -388,6 +389,11 @@ mod tests {
     #[test]
     fn test_language_detection_data_formats() {
         assert_eq!(Language::from_extension("json"), Language::Data);
+        assert_eq!(Language::from_extension("xcstrings"), Language::Data);
+        assert_eq!(Language::from_extension("geojson"), Language::Data);
+        assert_eq!(Language::from_extension("ipynb"), Language::Data);
+        assert_eq!(Language::from_extension("webmanifest"), Language::Data);
+        assert_eq!(Language::from_extension("code-workspace"), Language::Data);
         assert_eq!(Language::from_extension("yaml"), Language::Data);
         assert_eq!(Language::from_extension("yml"), Language::Data);
         assert_eq!(Language::from_extension("toml"), Language::Data);

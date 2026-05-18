@@ -1,7 +1,6 @@
 //! Filters Docker and kubectl output into compact summaries.
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::strip_ansi;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
@@ -67,7 +66,7 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
     .context("Failed to run docker ps")?;
 
     if !result.success() {
-        eprint!("{}", strip_ansi(&result.stderr));
+        eprint!("{}", result.stderr);
         timer.track("docker ps", "rtk docker ps", &raw, &raw);
         return Ok(result.exit_code);
     }
@@ -131,7 +130,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
     .context("Failed to run docker images")?;
 
     if !result.success() {
-        eprint!("{}", strip_ansi(&result.stderr));
+        eprint!("{}", result.stderr);
         timer.track("docker images", "rtk docker images", &raw, &raw);
         return Ok(result.exit_code);
     }
@@ -532,7 +531,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
         .context("Failed to run docker compose ps")?;
 
     if !raw_result.success() {
-        eprintln!("{}", strip_ansi(&raw_result.stderr));
+        eprintln!("{}", raw_result.stderr);
         return Ok(raw_result.exit_code);
     }
     let raw = raw_result.stdout;
@@ -547,7 +546,7 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
     .context("Failed to run docker compose ps --format")?;
 
     if !result.success() {
-        eprintln!("{}", strip_ansi(&result.stderr));
+        eprintln!("{}", result.stderr);
         return Ok(result.exit_code);
     }
     let structured = result.stdout;
@@ -562,9 +561,10 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
     Ok(0)
 }
 
-pub fn run_compose_logs(service: Option<&str>, verbose: u8) -> Result<i32> {
+pub fn run_compose_logs(service: Option<&str>, tail: u32, verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("docker");
-    cmd.args(["compose", "logs", "--tail", "100"]);
+    let tail_str = tail.to_string();
+    cmd.args(["compose", "logs", "--tail", &tail_str]);
     if let Some(svc) = service {
         cmd.arg(svc);
     }
@@ -610,6 +610,45 @@ pub fn run_compose_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
     let mut combined = vec![OsString::from("compose")];
     combined.extend_from_slice(args);
     crate::core::runner::run_passthrough("docker", &combined, verbose)
+}
+
+pub fn run_kubectl_get(args: &[String], verbose: u8) -> Result<i32> {
+    match kubectl_get_target(args) {
+        Some(("pods", rest)) => run(ContainerCmd::KubectlPods, rest, verbose),
+        Some(("services", rest)) => run(ContainerCmd::KubectlServices, rest, verbose),
+        _ => run_kubectl_get_passthrough(args, verbose),
+    }
+}
+
+fn kubectl_get_target(args: &[String]) -> Option<(&'static str, &[String])> {
+    let resource = args.first()?.as_str();
+    let rest = &args[1..];
+    if kubectl_get_requests_raw_output(rest) {
+        return None;
+    }
+
+    match resource {
+        "po" | "pod" | "pods" => Some(("pods", rest)),
+        "svc" | "service" | "services" => Some(("services", rest)),
+        _ => None,
+    }
+}
+
+fn kubectl_get_requests_raw_output(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-o" | "--output" | "-w" | "--watch" | "--show-labels" | "--show-kind"
+        ) || arg.starts_with("-o")
+            || arg.starts_with("--output=")
+    })
+}
+
+fn run_kubectl_get_passthrough(args: &[String], verbose: u8) -> Result<i32> {
+    let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("get"))
+        .chain(args.iter().map(|arg| OsString::from(arg.as_str())))
+        .collect();
+    run_kubectl_passthrough(&passthrough_args, verbose)
 }
 
 pub fn run_kubectl_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
@@ -751,5 +790,55 @@ api-1  | Connected to database";
     fn test_compact_ports_many() {
         let result = compact_ports("0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp, 0.0.0.0:8080->8080/tcp, 0.0.0.0:9090->9090/tcp");
         assert!(result.contains("..."), "should truncate for >3 ports");
+    }
+
+    #[test]
+    fn test_kubectl_get_target_pods_aliases() {
+        for resource in ["po", "pod", "pods"] {
+            let args = vec![resource.to_string(), "-n".to_string(), "default".to_string()];
+
+            assert_eq!(
+                kubectl_get_target(&args),
+                Some(("pods", &args[1..])),
+                "failed for {resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kubectl_get_target_services_aliases() {
+        for resource in ["svc", "service", "services"] {
+            let args = vec![resource.to_string(), "-A".to_string()];
+
+            assert_eq!(
+                kubectl_get_target(&args),
+                Some(("services", &args[1..])),
+                "failed for {resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kubectl_get_target_unsupported_resource() {
+        let args = vec!["deployments".to_string()];
+
+        assert_eq!(kubectl_get_target(&args), None);
+    }
+
+    #[test]
+    fn test_kubectl_get_target_respects_output_flags() {
+        for output_flag in ["-o", "-owide", "--output", "--output=json"] {
+            let args = vec![
+                "pods".to_string(),
+                output_flag.to_string(),
+                "wide".to_string(),
+            ];
+
+            assert_eq!(
+                kubectl_get_target(&args),
+                None,
+                "should pass through {output_flag}"
+            );
+        }
     }
 }

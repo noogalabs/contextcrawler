@@ -4,7 +4,6 @@
 //! Specialized filters for high-frequency commands (STS, S3, EC2, ECS, RDS, CloudFormation).
 
 use crate::core::tee::force_tee_hint;
-use crate::core::utils::strip_ansi;
 use crate::core::tracking;
 use crate::core::utils::{
     exit_code_from_output, exit_code_from_status, human_bytes, join_with_overflow,
@@ -252,7 +251,7 @@ fn run_generic(subcommand: &str, args: &[String], verbose: u8, full_sub: &str) -
             &stderr,
             &stderr,
         );
-        eprintln!("{}", strip_ansi(&stderr).trim());
+        eprintln!("{}", stderr.trim());
         return Ok(crate::core::utils::exit_code_from_output(&output, "aws"));
     }
 
@@ -318,7 +317,7 @@ fn run_aws_json(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if !output.status.success() {
-        eprintln!("{}", strip_ansi(&stderr).trim());
+        eprintln!("{}", stderr.trim());
     }
 
     Ok((stdout, stderr, output.status))
@@ -350,7 +349,7 @@ fn run_aws_filtered(
         if let Some(hint) = crate::core::tee::tee_and_hint(&raw, &slug, exit_code) {
             eprintln!("{}\n{}", stderr.trim(), hint);
         } else {
-            eprintln!("{}", strip_ansi(&stderr).trim());
+            eprintln!("{}", stderr.trim());
         }
         timer.track(&cmd_label, &rtk_label, &raw, &stderr);
         return Ok(exit_code);
@@ -365,12 +364,12 @@ fn run_aws_filtered(
         if let Some(hint) = crate::core::tee::force_tee_hint(&raw, &slug) {
             println!("{}\n{}", result.text, hint);
         } else {
-            println!("{}", strip_ansi(&result.text));
+            println!("{}", result.text);
         }
     } else if let Some(hint) = crate::core::tee::tee_and_hint(&raw, &slug, 0) {
         println!("{}\n{}", result.text, hint);
     } else {
-        println!("{}", strip_ansi(&result.text));
+        println!("{}", result.text);
     }
 
     timer.track(&cmd_label, &rtk_label, &raw, &result.text);
@@ -403,7 +402,7 @@ fn run_s3_ls(extra_args: &[String], verbose: u8) -> Result<i32> {
         if let Some(hint) = crate::core::tee::tee_and_hint(&raw, "aws_s3_ls", exit_code) {
             eprintln!("{}\n{}", stderr.trim(), hint);
         } else {
-            eprintln!("{}", strip_ansi(&stderr).trim());
+            eprintln!("{}", stderr.trim());
         }
         timer.track("aws s3 ls", "rtk aws s3 ls", &raw, &stderr);
         return Ok(exit_code);
@@ -414,10 +413,10 @@ fn run_s3_ls(extra_args: &[String], verbose: u8) -> Result<i32> {
         if let Some(hint) = crate::core::tee::force_tee_hint(&raw, "aws_s3_ls") {
             println!("{}\n{}", result.text, hint);
         } else {
-            println!("{}", strip_ansi(&result.text));
+            println!("{}", result.text);
         }
     } else {
-        println!("{}", strip_ansi(&result.text));
+        println!("{}", result.text);
     }
 
     timer.track("aws s3 ls", "rtk aws s3 ls", &raw, &result.text);
@@ -456,7 +455,7 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
         if let Some(hint) = crate::core::tee::tee_and_hint(&raw, &slug, exit_code) {
             eprintln!("{}\n{}", stderr.trim(), hint);
         } else {
-            eprintln!("{}", strip_ansi(&stderr).trim());
+            eprintln!("{}", stderr.trim());
         }
         timer.track(&cmd_label, &rtk_label, &raw, &stderr);
         return Ok(exit_code);
@@ -467,10 +466,10 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
         if let Some(hint) = force_tee_hint(&raw, &slug) {
             println!("{}\n{}", result.text, hint);
         } else {
-            println!("{}", strip_ansi(&result.text));
+            println!("{}", result.text);
         }
     } else {
-        println!("{}", strip_ansi(&result.text));
+        println!("{}", result.text);
     }
 
     timer.track(&cmd_label, &rtk_label, &raw, &result.text);

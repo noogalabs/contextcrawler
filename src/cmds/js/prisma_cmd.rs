@@ -2,7 +2,7 @@
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{resolved_command, strip_ansi, tool_exists};
+use crate::core::utils::{resolved_command, tool_exists};
 use anyhow::{Context, Result};
 use std::process::Command;
 
@@ -60,10 +60,10 @@ fn run_generate(args: &[String], verbose: u8) -> Result<i32> {
 
     if !result.success() {
         if !result.stdout.trim().is_empty() {
-            eprint!("{}", strip_ansi(&result.stdout));
+            eprint!("{}", result.stdout);
         }
         if !result.stderr.trim().is_empty() {
-            eprint!("{}", strip_ansi(&result.stderr));
+            eprint!("{}", result.stderr);
         }
         timer.track("prisma generate", "rtk prisma generate", &raw, &raw);
         return Ok(result.exit_code);
@@ -114,10 +114,10 @@ fn run_migrate(subcommand: MigrateSubcommand, args: &[String], verbose: u8) -> R
 
     if !result.success() {
         if !result.stdout.trim().is_empty() {
-            eprint!("{}", strip_ansi(&result.stdout));
+            eprint!("{}", result.stdout);
         }
         if !result.stderr.trim().is_empty() {
-            eprint!("{}", strip_ansi(&result.stderr));
+            eprint!("{}", result.stderr);
         }
         timer.track(cmd_name, &format!("rtk {}", cmd_name), &raw, &raw);
         return Ok(result.exit_code);
@@ -155,10 +155,10 @@ fn run_db_push(args: &[String], verbose: u8) -> Result<i32> {
 
     if !result.success() {
         if !result.stdout.trim().is_empty() {
-            eprint!("{}", strip_ansi(&result.stdout));
+            eprint!("{}", result.stdout);
         }
         if !result.stderr.trim().is_empty() {
-            eprint!("{}", strip_ansi(&result.stderr));
+            eprint!("{}", result.stderr);
         }
         timer.track("prisma db push", "rtk prisma db push", &raw, &raw);
         return Ok(result.exit_code);

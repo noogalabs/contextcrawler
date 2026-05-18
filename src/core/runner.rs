@@ -1,7 +1,6 @@
 //! Shared command execution skeleton for filter modules.
 
 use anyhow::{Context, Result};
-use crate::core::utils::strip_ansi;
 use std::process::Command;
 
 use crate::core::stream::{self, FilterMode, StdinMode, StreamFilter};
@@ -81,10 +80,10 @@ pub fn run(
 
             if opts.skip_filter_on_failure && exit_code != 0 {
                 if !result.raw_stdout.trim().is_empty() {
-                    print!("{}", strip_ansi(&result.raw_stdout));
+                    print!("{}", result.raw_stdout);
                 }
                 if !result.raw_stderr.trim().is_empty() {
-                    eprint!("{}", strip_ansi(&result.raw_stderr));
+                    eprint!("{}", result.raw_stderr);
                 }
                 timer.track(&cmd_label, &format!("rtk {}", cmd_label), raw, raw);
                 return Ok(exit_code);
@@ -96,9 +95,6 @@ pub fn run(
                 raw
             };
             let filtered = filter_fn(text_to_filter);
-            // ===== contextzip-downstream: error compression post-processor begin =====
-            let filtered = crate::core::error_cmd::compress_errors(&filtered);
-            // ===== contextzip-downstream: error compression post-processor end =====
 
             if let Some(label) = opts.tee_label {
                 print_with_hint(&filtered, raw, label, exit_code);

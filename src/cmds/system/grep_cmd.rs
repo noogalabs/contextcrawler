@@ -1,12 +1,12 @@
 //! Filters grep output by grouping matches by file.
 
 use crate::core::config;
-use crate::core::utils::strip_ansi;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::ffi::OsString;
 use std::collections::HashMap;
 
 #[allow(clippy::too_many_arguments)]
@@ -59,9 +59,9 @@ pub fn run(
 
     // Passthrough output flags that produce output that is already small.
     if has_format_flag(extra_args) {
-        print!("{}", strip_ansi(&result.stdout));
+        print!("{}", result.stdout);
         if !result.stderr.is_empty() {
-            eprint!("{}", strip_ansi(&result.stderr).trim());
+            eprint!("{}", result.stderr.trim());
         }
 
         let args_display = if extra_args.is_empty() {
@@ -83,7 +83,7 @@ pub fn run(
     if result.stdout.trim().is_empty() {
         // Show stderr for errors (bad regex, missing file, etc.)
         if exit_code == 2 && !result.stderr.trim().is_empty() {
-            eprintln!("{}", strip_ansi(&result.stderr).trim());
+            eprintln!("{}", result.stderr.trim());
         }
         let msg = format!("0 matches for '{}'", pattern);
         println!("{}", msg);
@@ -167,21 +167,34 @@ pub fn run(
     Ok(exit_code)
 }
 
+pub(crate) fn has_format_flag_raw(args: &[OsString]) -> bool {
+    args.iter()
+        .any(|arg| is_format_flag(&arg.to_string_lossy()))
+}
+
 fn has_format_flag(extra_args: &[String]) -> bool {
-    extra_args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "-c" | "--count"
-                | "-l"
-                | "--files-with-matches"
-                | "-L"
-                | "--files-without-match"
-                | "-o"
-                | "--only-matching"
-                | "-Z"
-                | "--null"
-        )
-    })
+    extra_args.iter().any(|arg| is_format_flag(arg))
+}
+
+fn is_format_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--count"
+            | "--files-with-matches"
+            | "--files-without-match"
+            | "--only-matching"
+            | "--null"
+    ) || is_short_format_flag_bundle(arg)
+}
+
+fn is_short_format_flag_bundle(arg: &str) -> bool {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() < 2 {
+        return false;
+    }
+
+    arg.chars()
+        .skip(1)
+        .any(|c| matches!(c, 'c' | 'l' | 'L' | 'o' | 'Z'))
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -372,6 +385,29 @@ mod tests {
             "-A".to_string(),
             "3".to_string(),
         ]));
+    }
+
+    #[test]
+    fn test_raw_format_flag_detection() {
+        assert!(has_format_flag_raw(&[OsString::from("-c")]));
+        assert!(has_format_flag_raw(&[OsString::from("-ci")]));
+        assert!(has_format_flag_raw(&[OsString::from("-cE")]));
+        assert!(has_format_flag_raw(&[OsString::from("-cn")]));
+        assert!(has_format_flag_raw(&[OsString::from("-cv")]));
+        assert!(has_format_flag_raw(&[OsString::from("-l")]));
+        assert!(has_format_flag_raw(&[OsString::from("-L")]));
+        assert!(has_format_flag_raw(&[OsString::from("-o")]));
+        assert!(has_format_flag_raw(&[OsString::from("-Z")]));
+
+        assert!(has_format_flag_raw(&[OsString::from("--count")]));
+        assert!(has_format_flag_raw(&[OsString::from("--files-with-matches")]));
+        assert!(has_format_flag_raw(&[OsString::from("--files-without-match")]));
+        assert!(has_format_flag_raw(&[OsString::from("--only-matching")]));
+        assert!(has_format_flag_raw(&[OsString::from("--null")]));
+
+        assert!(!has_format_flag_raw(&[OsString::from("-rn")]));
+        assert!(!has_format_flag_raw(&[OsString::from("--recursive")]));
+        assert!(!has_format_flag_raw(&[OsString::from("-iw")]));
     }
 
     // Verify line numbers are always enabled in rg invocation (grep_cmd.rs:24).

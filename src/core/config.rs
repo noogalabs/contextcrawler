@@ -21,6 +21,8 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub read: ReadConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -29,6 +31,28 @@ pub struct HooksConfig {
     /// Survives `rtk init -g` re-runs since config.toml is user-owned.
     #[serde(default)]
     pub exclude_commands: Vec<String>,
+
+    /// Wrapper prefixes that should be transparently stripped before routing
+    /// to a filter, then re-prepended on the rewrite. For example, with
+    /// `transparent_prefixes = ["docker exec mycontainer"]`, the command
+    /// `docker exec mycontainer git status` rewrites to
+    /// `docker exec mycontainer rtk git status` instead of passing through
+    /// unrewritten.
+    ///
+    /// Useful for any per-project env wrapper that sits in front of every
+    /// command — e.g. `docker exec mycontainer`, `direnv exec .`, `poetry run`,
+    /// or `bundle exec`.
+    ///
+    /// Matching is literal, not pattern-based. Configure the exact concrete
+    /// prefix you actually use, such as `docker exec mycontainer`.
+    ///
+    /// Extends the built-in `SHELL_PREFIX_BUILTINS` list (`noglob`, `command`,
+    /// `builtin`, `exec`, `nocorrect`) with user- or organization-specific
+    /// wrappers. Matching is strict: a configured prefix `"foo bar"` matches
+    /// a command that starts with `"foo bar "` (or strictly equals `"foo bar"`),
+    /// not anything else.
+    #[serde(default)]
+    pub transparent_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,9 +147,34 @@ impl Default for LimitsConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadConfig {
+    /// Token threshold before the unknown-extension fallback window is used.
+    pub token_threshold: usize,
+    /// Lines to keep from the start of a large unknown-extension file.
+    pub head_lines: usize,
+    /// Lines to keep from the end of a large unknown-extension file.
+    pub tail_lines: usize,
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self {
+            token_threshold: 5_000,
+            head_lines: 80,
+            tail_lines: 20,
+        }
+    }
+}
+
 /// Get limits config. Falls back to defaults if config can't be loaded.
 pub fn limits() -> LimitsConfig {
     Config::load().map(|c| c.limits).unwrap_or_default()
+}
+
+/// Get read config. Falls back to defaults if config can't be loaded.
+pub fn read() -> ReadConfig {
+    Config::load().map(|c| c.read).unwrap_or_default()
 }
 
 impl Config {
@@ -201,6 +250,32 @@ exclude_commands = ["curl", "gh"]
     fn test_hooks_config_default_empty() {
         let config = Config::default();
         assert!(config.hooks.exclude_commands.is_empty());
+        assert!(config.hooks.transparent_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_hooks_config_transparent_prefixes_deserialize() {
+        let toml = r#"
+[hooks]
+transparent_prefixes = ["direnv exec .", "nix develop --command"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert_eq!(
+            config.hooks.transparent_prefixes,
+            vec!["direnv exec .", "nix develop --command"]
+        );
+    }
+
+    #[test]
+    fn test_hooks_config_transparent_prefixes_missing_is_empty() {
+        // Older configs that predate this field must still parse.
+        let toml = r#"
+[hooks]
+exclude_commands = ["curl"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert_eq!(config.hooks.exclude_commands, vec!["curl"]);
+        assert!(config.hooks.transparent_prefixes.is_empty());
     }
 
     #[test]
@@ -247,5 +322,27 @@ consent_date = "2026-04-10T12:00:00Z"
             config.telemetry.consent_date.as_deref(),
             Some("2026-04-10T12:00:00Z")
         );
+    }
+
+    #[test]
+    fn test_read_config_default_values() {
+        let config = Config::default();
+        assert_eq!(config.read.token_threshold, 5_000);
+        assert_eq!(config.read.head_lines, 80);
+        assert_eq!(config.read.tail_lines, 20);
+    }
+
+    #[test]
+    fn test_read_config_deserialize() {
+        let toml = r#"
+[read]
+token_threshold = 1234
+head_lines = 12
+tail_lines = 34
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert_eq!(config.read.token_threshold, 1234);
+        assert_eq!(config.read.head_lines, 12);
+        assert_eq!(config.read.tail_lines, 34);
     }
 }
