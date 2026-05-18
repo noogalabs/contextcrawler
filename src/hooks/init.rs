@@ -59,11 +59,21 @@ schema_version = 1
 # max_lines = 40
 "#;
 
-const RTK_MD: &str = "RTK.md";
+// The slim instructions file is named CONTEXTCRAWLER.md (not RTK.md) so it
+// matches the downstream tool name on disk. Commit bcddd06 silently reverted
+// this to "RTK.md" during the upstream rebase; see issue #19 and the
+// `test_rtk_md_constant_pinned_to_contextcrawler_filename` regression test.
+const RTK_MD: &str = "CONTEXTCRAWLER.md";
 const CLAUDE_MD: &str = "CLAUDE.md";
 const AGENTS_MD: &str = "AGENTS.md";
-const RTK_MD_REF: &str = "@RTK.md";
+const RTK_MD_REF: &str = "@CONTEXTCRAWLER.md";
 const GEMINI_MD: &str = "GEMINI.md";
+
+/// Legacy file names that should be cleaned up if found, both on disk and as
+/// `@<name>` references in AGENTS.md / CLAUDE.md. Add to this list whenever
+/// a rename happens so users running `init` after the change don't end up
+/// with duplicate orphan files.
+const LEGACY_RTK_MD_FILES: &[&str] = &["RTK.md"];
 
 const RTK_BLOCK_START: &str = "<!-- rtk-instructions";
 const RTK_BLOCK_END: &str = "<!-- /rtk-instructions -->";
@@ -2334,7 +2344,21 @@ fn run_codex_mode_with_paths(
     write_if_changed(&rtk_md_path, RTK_SLIM_CODEX, RTK_MD, ctx)?;
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, ctx)?;
 
+    // Clean up legacy filenames (e.g. RTK.md left behind by the regressed
+    // bcddd06 commit) so users upgrading don't end up with two duplicate
+    // imports in AGENTS.md and a stale orphan file on disk. See issue #19.
+    let cleaned_legacy = cleanup_legacy_codex_files(
+        &agents_md_path,
+        rtk_md_path
+            .parent()
+            .context("RTK.md path missing parent directory")?,
+        ctx,
+    )?;
+
     if !dry_run {
+        for note in &cleaned_legacy {
+            println!("  cleaned legacy artifact: {}", note);
+        }
         println!("\nContextCrawler configured for Codex CLI.\n");
         println!("  RTK.md:    {}", rtk_md_path.display());
         if added_ref {
@@ -2462,11 +2486,12 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
         return Ok(migrated);
     }
 
-    // Add @RTK.md
+    // Add the @-reference. Must use RTK_MD_REF (not a hardcoded literal) so
+    // this stays in lock-step with the constant — see #19.
     let new_content = if content.is_empty() {
-        "@RTK.md\n".to_string()
+        format!("{}\n", RTK_MD_REF)
     } else {
-        format!("{}\n\n@RTK.md\n", content.trim())
+        format!("{}\n\n{}\n", content.trim(), RTK_MD_REF)
     };
 
     if dry_run {
@@ -2721,6 +2746,94 @@ fn resolve_hermes_home_from_env(
 
 fn codex_rtk_md_ref(codex_dir: &Path) -> String {
     format!("@{}", codex_dir.join(RTK_MD).display())
+}
+
+/// Remove orphan files and stale @-references left behind by a previous
+/// rename of the slim instructions file (see issue #19). Returns a list of
+/// human-readable notes describing what was cleaned, for printing by the
+/// caller. Idempotent — safe to run when nothing legacy exists.
+fn cleanup_legacy_codex_files(
+    agents_md_path: &Path,
+    codex_dir: &Path,
+    ctx: InitContext,
+) -> Result<Vec<String>> {
+    let InitContext { dry_run, .. } = ctx;
+    let mut notes = Vec::new();
+
+    let canonical = codex_dir.join(RTK_MD);
+    for legacy in LEGACY_RTK_MD_FILES {
+        let legacy_path = codex_dir.join(legacy);
+        // Don't remove the canonical file even if it happens to share a name.
+        if legacy_path == canonical {
+            continue;
+        }
+        if legacy_path.exists() {
+            if !dry_run {
+                fs::remove_file(&legacy_path).with_context(|| {
+                    format!("Failed to remove legacy file: {}", legacy_path.display())
+                })?;
+            }
+            notes.push(format!("removed orphan {}", legacy_path.display()));
+        }
+    }
+
+    // Strip stale `@<legacy>` reference lines from AGENTS.md so the agent
+    // doesn't keep loading both the old and new files.
+    if agents_md_path.exists() {
+        let content = fs::read_to_string(agents_md_path).with_context(|| {
+            format!("Failed to read AGENTS.md: {}", agents_md_path.display())
+        })?;
+        let mut new_content = content.clone();
+        for legacy in LEGACY_RTK_MD_FILES {
+            // Match both relative `@RTK.md` and absolute `@/path/to/RTK.md`.
+            let relative_ref = format!("@{}", legacy);
+            let absolute_ref = format!("@{}", codex_dir.join(legacy).display());
+            for needle in [relative_ref.as_str(), absolute_ref.as_str()] {
+                let stripped = strip_at_reference_line(&new_content, needle);
+                if stripped != new_content {
+                    new_content = stripped;
+                    notes.push(format!("removed `{}` reference from AGENTS.md", needle));
+                }
+            }
+        }
+        if new_content != content && !dry_run {
+            fs::write(agents_md_path, new_content).with_context(|| {
+                format!("Failed to write AGENTS.md: {}", agents_md_path.display())
+            })?;
+        }
+    }
+
+    Ok(notes)
+}
+
+/// Remove any line whose trimmed content equals `needle`. Preserves the
+/// surrounding blank-line structure (collapses one of the bordering blank
+/// lines if both sides are blank) so the file doesn't accumulate extra
+/// vertical space across repeated cleanups.
+fn strip_at_reference_line(content: &str, needle: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == needle {
+            // Skip this line. If the previous and next lines are both blank,
+            // also skip one of them to avoid leaving a double blank.
+            let prev_blank = out.last().is_some_and(|l| l.trim().is_empty());
+            let next_blank = lines.get(i + 1).is_some_and(|l| l.trim().is_empty());
+            if prev_blank && next_blank {
+                i += 1; // skip the redundant trailing blank line too
+            }
+            i += 1;
+            continue;
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    let mut result = out.join("\n");
+    if content.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn resolve_opencode_dir() -> Result<PathBuf> {
@@ -3929,10 +4042,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let claude_md = temp.path().join("CLAUDE.md");
 
-        fs::write(&claude_md, "# My stuff\n\n@RTK.md\n").unwrap();
+        fs::write(&claude_md, format!("# My stuff\n\n{}\n", RTK_MD_REF)).unwrap();
 
         let content = fs::read_to_string(&claude_md).unwrap();
-        let count = content.matches("@RTK.md").count();
+        let count = content.matches(RTK_MD_REF).count();
         assert_eq!(count, 1);
     }
 
@@ -3949,7 +4062,7 @@ mod tests {
         assert!(!second_added);
 
         let content = fs::read_to_string(&agents_md).unwrap();
-        assert_eq!(content.matches("@RTK.md").count(), 1);
+        assert_eq!(content.matches(RTK_MD_REF).count(), 1);
     }
 
     #[test]
@@ -4061,7 +4174,7 @@ mod tests {
 
         assert!(added);
         let content = fs::read_to_string(&agents_md).unwrap();
-        assert_eq!(content, "@RTK.md\n");
+        assert_eq!(content, format!("{}\n", RTK_MD_REF));
     }
 
     #[test]
@@ -4082,7 +4195,7 @@ mod tests {
         assert!(added);
         let content = fs::read_to_string(&agents_md).unwrap();
         assert!(!content.contains("old"));
-        assert_eq!(content.matches("@RTK.md").count(), 1);
+        assert_eq!(content.matches(RTK_MD_REF).count(), 1);
     }
 
     #[test]
@@ -4573,7 +4686,10 @@ mod tests {
     fn test_run_codex_mode_global_writes_absolute_reference_to_codex_dir() {
         let temp = TempDir::new().unwrap();
         let agents_md = temp.path().join("AGENTS.md");
-        let rtk_md = temp.path().join("RTK.md");
+        // Use the constant so the fixture filename tracks any future rename
+        // — and so cleanup_legacy_codex_files (which removes RTK.md) doesn't
+        // delete our test fixture.
+        let rtk_md = temp.path().join(RTK_MD);
 
         run_codex_mode_with_paths(
             agents_md.clone(),
@@ -4589,6 +4705,108 @@ mod tests {
             fs::read_to_string(&agents_md).unwrap(),
             format!("{}\n", codex_rtk_md_ref(temp.path()))
         );
+    }
+
+    #[test]
+    fn test_rtk_md_constant_pinned_to_contextcrawler_filename() {
+        // REGRESSION GUARD (issue #19). The downstream rebrand requires the
+        // slim instructions file to be named CONTEXTCRAWLER.md so it matches
+        // the tool name on disk. Commit bcddd06 silently flipped this back
+        // to "RTK.md" during the upstream rebase and the rebrand sweep
+        // missed it, breaking every existing user's `init -g --codex` and
+        // leaving orphan files behind. If you're changing this assertion,
+        // you're probably re-introducing the regression — read #19 first.
+        assert_eq!(
+            RTK_MD,
+            "CONTEXTCRAWLER.md",
+            "filename regression: see issue #19"
+        );
+        assert_eq!(
+            RTK_MD_REF,
+            "@CONTEXTCRAWLER.md",
+            "filename regression: see issue #19"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_legacy_codex_files_removes_orphan_rtk_md() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        let legacy_rtk_md = temp.path().join("RTK.md");
+        fs::write(&legacy_rtk_md, "old content").unwrap();
+        fs::write(
+            &agents_md,
+            format!(
+                "# header\n\n@{}\n\n@{}\n",
+                legacy_rtk_md.display(),
+                temp.path().join("CONTEXTCRAWLER.md").display()
+            ),
+        )
+        .unwrap();
+
+        let notes = cleanup_legacy_codex_files(
+            &agents_md,
+            temp.path(),
+            InitContext::default(),
+        )
+        .unwrap();
+
+        assert!(!legacy_rtk_md.exists(), "legacy RTK.md should be removed");
+        let after = fs::read_to_string(&agents_md).unwrap();
+        assert!(
+            !after.contains(&format!("@{}", legacy_rtk_md.display())),
+            "absolute @RTK.md reference should be stripped, got:\n{}",
+            after
+        );
+        assert!(
+            after.contains(&format!("@{}", temp.path().join("CONTEXTCRAWLER.md").display())),
+            "canonical @CONTEXTCRAWLER.md reference should be preserved"
+        );
+        assert!(notes.iter().any(|n| n.contains("removed orphan")));
+        assert!(notes.iter().any(|n| n.contains("AGENTS.md")));
+    }
+
+    #[test]
+    fn test_cleanup_legacy_codex_files_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        fs::write(&agents_md, "# header\n").unwrap();
+
+        let notes = cleanup_legacy_codex_files(
+            &agents_md,
+            temp.path(),
+            InitContext::default(),
+        )
+        .unwrap();
+
+        assert!(notes.is_empty(), "no-op cleanup should report nothing");
+        assert_eq!(fs::read_to_string(&agents_md).unwrap(), "# header\n");
+    }
+
+    #[test]
+    fn test_cleanup_legacy_codex_files_handles_relative_at_ref() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        // Some older installs used a relative `@RTK.md` rather than the
+        // absolute path. Both forms must be stripped.
+        fs::write(&agents_md, "# header\n\n@RTK.md\n").unwrap();
+
+        let _ = cleanup_legacy_codex_files(
+            &agents_md,
+            temp.path(),
+            InitContext::default(),
+        )
+        .unwrap();
+
+        let after = fs::read_to_string(&agents_md).unwrap();
+        assert!(!after.contains("@RTK.md"), "relative @RTK.md must be stripped");
+    }
+
+    #[test]
+    fn test_strip_at_reference_line_collapses_surrounding_blanks() {
+        let content = "alpha\n\n@RTK.md\n\nbeta\n";
+        let out = strip_at_reference_line(content, "@RTK.md");
+        assert_eq!(out, "alpha\n\nbeta\n");
     }
 
     #[test]
@@ -4636,9 +4854,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let codex_dir = temp.path();
         let agents_md = codex_dir.join("AGENTS.md");
-        let rtk_md = codex_dir.join("RTK.md");
+        let rtk_md = codex_dir.join(RTK_MD);
 
-        fs::write(&agents_md, "# Team rules\n\n@RTK.md\n").unwrap();
+        fs::write(&agents_md, format!("# Team rules\n\n{}\n", RTK_MD_REF)).unwrap();
         fs::write(&rtk_md, "codex config").unwrap();
 
         let removed_first = uninstall_codex_at(codex_dir, InitContext::default()).unwrap();
@@ -4649,7 +4867,7 @@ mod tests {
         assert!(!rtk_md.exists());
 
         let content = fs::read_to_string(&agents_md).unwrap();
-        assert!(!content.contains("@RTK.md"));
+        assert!(!content.contains(RTK_MD_REF));
         assert!(content.contains("# Team rules"));
     }
 
@@ -4658,7 +4876,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let codex_dir = temp.path();
         let agents_md = codex_dir.join("AGENTS.md");
-        let rtk_md = codex_dir.join("RTK.md");
+        let rtk_md = codex_dir.join(RTK_MD);
         let absolute_ref = codex_rtk_md_ref(codex_dir);
 
         fs::write(&agents_md, format!("# Team rules\n\n{}\n", absolute_ref)).unwrap();
