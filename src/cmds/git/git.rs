@@ -4,7 +4,7 @@ use crate::core::stream::{
     self, exec_capture, CaptureResult, FilterMode, LineHandler, LineStreamFilter, StdinMode,
 };
 use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, exit_code_from_status, resolved_command};
+use crate::core::utils::{exit_code_from_output, exit_code_from_status, secure_git_command};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
@@ -29,7 +29,11 @@ pub enum GitCommand {
 /// Create a git Command with global options (e.g. -C, -c, --git-dir, --work-tree)
 /// prepended before any subcommand arguments.
 fn git_cmd(global_args: &[String]) -> Command {
-    let mut cmd = resolved_command("git");
+    // `secure_git_command` strips GIT_EXTERNAL_DIFF / GIT_SSH_COMMAND /
+    // GIT_CONFIG_GLOBAL / GIT_CONFIG_COUNT-+-KEY_<n>-+-VALUE_<n> / etc.
+    // from the inherited env so a tainted parent can't hijack this
+    // invocation into exec'ing an attacker-supplied binary. See issue #35.
+    let mut cmd = secure_git_command();
     for arg in global_args {
         cmd.arg(arg);
     }
@@ -1848,13 +1852,21 @@ mod tests {
     #[test]
     fn test_git_cmd_c_locale_sets_stable_env() {
         let cmd = git_cmd_c_locale(&[]);
+        // `get_envs()` returns BOTH set entries (Some) and removed entries
+        // (None — from the env_remove calls inside secure_git_command).
+        // Filter to only the set entries so this test focuses on what
+        // git_cmd_c_locale *adds*, not what the hardening *strips*. The
+        // strip behaviour is covered exhaustively in
+        // `core::utils::secure_git_tests::secure_git_command_strips_all_listed_env_vars`.
         let envs: Vec<_> = cmd
             .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().to_string(),
-                    value.expect("env value").to_string_lossy().to_string(),
-                )
+            .filter_map(|(key, value)| {
+                value.map(|v| {
+                    (
+                        key.to_string_lossy().to_string(),
+                        v.to_string_lossy().to_string(),
+                    )
+                })
             })
             .collect();
         assert!(envs.contains(&("LC_ALL".to_string(), "C".to_string())));
