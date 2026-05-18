@@ -13,6 +13,7 @@ use crate::hooks::constants::{
 
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND,
+    LEGACY_CURSOR_HOOK_COMMAND,
     GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
     HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY,
     REWRITE_HOOK_FILE, SETTINGS_JSON,
@@ -3081,7 +3082,13 @@ fn cursor_hook_already_present(root: &serde_json::Value) -> bool {
         entry
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_FILE) || cmd == CURSOR_HOOK_COMMAND)
+            .is_some_and(|cmd| {
+                // Match the legacy command too so users who installed before
+                // the rebrand get correctly detected/removed.
+                cmd.contains(REWRITE_HOOK_FILE)
+                    || cmd == CURSOR_HOOK_COMMAND
+                    || cmd == LEGACY_CURSOR_HOOK_COMMAND
+            })
     })
 }
 
@@ -3255,7 +3262,13 @@ fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
         !entry
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_FILE) || cmd == CURSOR_HOOK_COMMAND)
+            .is_some_and(|cmd| {
+                // Match the legacy command too so users who installed before
+                // the rebrand get correctly detected/removed.
+                cmd.contains(REWRITE_HOOK_FILE)
+                    || cmd == CURSOR_HOOK_COMMAND
+                    || cmd == LEGACY_CURSOR_HOOK_COMMAND
+            })
     });
 
     pre_tool_use.len() < original_len

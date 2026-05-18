@@ -981,6 +981,13 @@ pub const UNIVERSAL_ENV_STRIP: &[&str] = &[
 /// is whole-string equality, `arg_deny_prefix` is `starts_with`, and
 /// `arg_deny_short_letters_in_bundle` rejects letters appearing inside
 /// a single-`-` all-alphabetic bundle (e.g. `-cz` for `z`).
+// Scaffolding for the planned policy-driven refactor (see module header
+// comment above). All four items below are intentionally unused in
+// production today — they're the worked-target the per-tool secure_*
+// helpers will migrate onto. Annotated with #[allow(dead_code)] so the
+// cleanup of orphan modules elsewhere in the tree doesn't get masked
+// by these intentional-unused warnings.
+#[allow(dead_code)]
 pub struct ToolPolicy {
     pub name: &'static str,
     pub env_strip: &'static [&'static str],
@@ -994,6 +1001,7 @@ pub struct ToolPolicy {
 /// removes any inherited env var matching the dynamic prefixes
 /// `BASH_FUNC_*` and `DYLD_*` (the latter is a belt-and-braces against
 /// macOS adding new `DYLD_*` knobs we haven't enumerated above).
+#[allow(dead_code)]
 pub fn secure_command_with_policy(policy: &ToolPolicy) -> Command {
     let mut cmd = resolved_command(policy.name);
     apply_universal_env_strip(&mut cmd);
@@ -1028,6 +1036,7 @@ pub(crate) fn apply_universal_env_strip(cmd: &mut Command) {
 /// against the three deny lists in `policy` and returns a user-facing
 /// error string on the first violation. Bundle detection mirrors the
 /// rg-specific helper for consistency.
+#[allow(dead_code)]
 pub fn check_args_with_policy<S: AsRef<str>>(
     policy: &ToolPolicy,
     args: &[S],
@@ -1218,6 +1227,7 @@ pub fn check_forbidden_cargo_args<S: AsRef<str>>(args: &[S]) -> Result<(), Strin
     Ok(())
 }
 
+#[allow(dead_code)]
 fn policy_deny_message(tool: &str, offending: &str) -> String {
     format!(
         "[contextcrawler] refusing to forward '{}' to {} \u{2014} flag is on \

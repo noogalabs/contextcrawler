@@ -3,7 +3,12 @@
 use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{check_forbidden_rg_args, resolved_command, secure_rg_command};
+use crate::core::utils::{check_forbidden_rg_args, secure_rg_command};
+// `resolved_command` is unused in production (replaced by secure_rg_command)
+// but the test mod uses it as a baseline — gate the import to tests so the
+// production binary doesn't warn.
+#[cfg(test)]
+use crate::core::utils::resolved_command;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::ffi::OsString;
@@ -181,6 +186,12 @@ pub fn run(
     Ok(exit_code)
 }
 
+// `has_format_flag_raw` is the OsString-typed sibling of the existing
+// `grep_format_flag_present(&[String])` used by main.rs. Currently only
+// exercised by the unit tests below; keep it so we have one helper per
+// arg-type without forcing callers to allocate a Vec<String>. Annotate
+// to silence dead_code without losing the safety net of the assertions.
+#[allow(dead_code)]
 pub(crate) fn has_format_flag_raw(args: &[OsString]) -> bool {
     args.iter()
         .any(|arg| is_format_flag(&arg.to_string_lossy()))

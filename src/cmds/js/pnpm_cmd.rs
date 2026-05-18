@@ -359,7 +359,7 @@ fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
 
     timer.track(
         &format!("pnpm list --depth={}", depth),
-        &format!("rtk pnpm list --depth={}", depth),
+        &format!("rtk pnpm list --depth={}", depth), // branding-lint: allow legacy
         &result.stdout,
         &filtered,
     );

@@ -4,8 +4,7 @@ use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::{
-    check_forbidden_node_args, package_manager_exec, resolved_command, truncate,
-    secure_python_command,
+    check_forbidden_node_args, package_manager_exec, secure_python_command, truncate,
 };
 use crate::mypy_cmd;
 use crate::ruff_cmd;
