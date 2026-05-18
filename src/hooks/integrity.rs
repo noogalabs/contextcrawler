@@ -12,7 +12,9 @@
 //!
 //! Reference: SA-2025-RTK-001 (Finding F-01)
 
-use super::constants::{CLAUDE_DIR, HOOKS_SUBDIR, REWRITE_HOOK_FILE};
+use super::constants::{
+    CLAUDE_DIR, CLAUDE_HOOK_COMMAND, HOOKS_SUBDIR, LEGACY_CLAUDE_HOOK_COMMAND, REWRITE_HOOK_FILE,
+};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -214,9 +216,23 @@ pub fn run_verify(verbose: u8) -> Result<()> {
         let settings_path = home.join(CLAUDE_DIR).join("settings.json");
         if settings_path.exists() {
             let content = fs::read_to_string(&settings_path).unwrap_or_default();
-            if content.contains("rtk hook claude") {
+            // Accept either the current `contextcrawler hook claude` or the
+            // legacy `rtk hook claude` registration. Wiring both constants
+            // here also retires the dead-code warnings on the LEGACY_*
+            // constants and fixes a latent bug: the previous literal-only
+            // check missed installations using the current command, so
+            // freshly-installed users saw "hook not installed" even after
+            // a successful `contextcrawler init -g`.
+            let matched_command = if content.contains(CLAUDE_HOOK_COMMAND) {
+                Some(CLAUDE_HOOK_COMMAND)
+            } else if content.contains(LEGACY_CLAUDE_HOOK_COMMAND) {
+                Some(LEGACY_CLAUDE_HOOK_COMMAND)
+            } else {
+                None
+            };
+            if let Some(cmd) = matched_command {
                 println!("PASS  native binary hook registered in settings.json");
-                println!("      command: rtk hook claude");
+                println!("      command: {}", cmd);
                 println!("      (no script file — integrity check not applicable)");
                 return Ok(());
             }

@@ -1470,8 +1470,12 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     Ok(0)
 }
 
-/// Back-compat wrapper. Existing callers (including tests) pass `output` only
-/// and want the `-a`-mode behavior (mixed local + `remotes/`-prefixed).
+/// Back-compat wrapper. The existing `filter_branch_output` tests pass `output`
+/// only and want the `-a`-mode behavior (mixed local + `remotes/`-prefixed).
+/// Annotate as dead_code because the production call site was updated to use
+/// `filter_branch_output_with_mode` directly (issue #55), but the tests still
+/// exercise this signature as a regression check on the back-compat surface.
+#[allow(dead_code)]
 fn filter_branch_output(output: &str) -> String {
     filter_branch_output_with_mode(output, false)
 }

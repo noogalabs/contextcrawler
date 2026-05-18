@@ -1563,6 +1563,11 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
 /// a private IP can still slip through via `--max-redirs`. The proper fix
 /// is per-redirect-hop validation which would replace curl with a Rust
 /// HTTP client we control end-to-end — tracked in docs/ROADMAP.md.
+// Preserved for future SSRF wiring (was previously used by the contextzip
+// web_cmd.rs that's been removed). Re-wire from curl/wget filter or a
+// future Rust HTTP client; the IP classification logic is the expensive
+// part to re-derive and is worth keeping in tree.
+#[allow(dead_code)]
 fn web_ssrf_block_reason(ip: &std::net::IpAddr) -> Option<&'static str> {
     use std::net::IpAddr;
     if ip.is_loopback() {
