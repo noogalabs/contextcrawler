@@ -2,7 +2,7 @@
 
 use crate::core::runner;
 use crate::core::stream::{BlockHandler, BlockStreamFilter, StreamFilter};
-use crate::core::utils::{resolved_command, truncate};
+use crate::core::utils::{check_forbidden_cargo_args, secure_cargo_command, truncate};
 use anyhow::Result;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -287,10 +287,23 @@ fn run_cargo_filtered<F>(
 where
     F: Fn(&str) -> String,
 {
-    let mut cmd = resolved_command("cargo");
+    let restored_args = restore_double_dash(args);
+
+    // Reject `--config target.*.runner=...`, `--config build.rustc-wrapper=...`
+    // and friends before they reach cargo — each one lets cargo spawn an
+    // arbitrary executable during the build (issue #34). The subcommand
+    // itself is hardcoded so it doesn't need scanning.
+    if let Err(msg) = check_forbidden_cargo_args(&restored_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // `secure_cargo_command` strips RUSTC_WRAPPER / CARGO_TARGET_*_RUNNER
+    // / RUSTFLAGS / CARGO_HOME / etc. from the inherited env so a tainted
+    // parent can't hijack this invocation. See issue #34.
+    let mut cmd = secure_cargo_command();
     cmd.arg(subcommand);
 
-    let restored_args = restore_double_dash(args);
     for arg in &restored_args {
         cmd.arg(arg);
     }
@@ -314,10 +327,17 @@ fn run_cargo_streamed(
     verbose: u8,
     filter: Box<dyn StreamFilter>,
 ) -> Result<i32> {
-    let mut cmd = resolved_command("cargo");
+    let restored_args = restore_double_dash(args);
+
+    // See run_cargo_filtered above — same deny-list + env strip for #34.
+    if let Err(msg) = check_forbidden_cargo_args(&restored_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    let mut cmd = secure_cargo_command();
     cmd.arg(subcommand);
 
-    let restored_args = restore_double_dash(args);
     for arg in &restored_args {
         cmd.arg(arg);
     }
@@ -1215,7 +1235,21 @@ fn filter_cargo_clippy(output: &str) -> String {
 }
 
 pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
-    crate::core::runner::run_passthrough("cargo", args, verbose)
+    // Scan the arg list as best-effort strings — argv coming in as
+    // OsString may not be valid UTF-8 on weird filesystems, but
+    // `--config K=V` payloads are always ASCII so `to_string_lossy()`
+    // is safe for the deny-list check. See issue #34.
+    let args_for_check: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Err(msg) = check_forbidden_cargo_args(&args_for_check) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    let cmd = secure_cargo_command();
+    crate::core::runner::run_passthrough_cmd(cmd, "cargo", args, verbose)
 }
 
 #[cfg(test)]
