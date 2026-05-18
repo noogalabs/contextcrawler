@@ -1,16 +1,26 @@
 //! Filters mypy type-checking output, grouping errors by file.
 
 use crate::core::runner;
-use crate::core::utils::{resolved_command, strip_ansi, tool_exists, truncate};
+use crate::core::utils::{
+    check_forbidden_mypy_args, secure_python_command, strip_ansi, tool_exists, truncate,
+};
 use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Reject `--config-file <path>` — mypy.ini supports `plugins=` which
+    // imports arbitrary Python modules at startup. See issue #36.
+    if let Err(msg) = check_forbidden_mypy_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // Strip PYTHONPATH / PYTHONSTARTUP / PIP_* from inherited env.
     let mut cmd = if tool_exists("mypy") {
-        resolved_command("mypy")
+        secure_python_command("mypy")
     } else {
-        let mut c = resolved_command("python3");
+        let mut c = secure_python_command("python3");
         c.arg("-m").arg("mypy");
         c
     };

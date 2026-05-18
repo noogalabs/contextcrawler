@@ -6,7 +6,7 @@
 //! to parse.
 
 use crate::core::runner;
-use crate::core::utils::ruby_exec;
+use crate::core::utils::{check_forbidden_rubocop_args, ruby_exec};
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -51,6 +51,14 @@ struct RubocopSummary {
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Reject `--require <module>` — literal Kernel.require on arbitrary
+    // path runs attacker Ruby. See issue #36.
+    if let Err(msg) = check_forbidden_rubocop_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // `ruby_exec` is env-hardened.
     let mut cmd = ruby_exec("rubocop");
 
     let is_autocorrect = args

@@ -1,7 +1,9 @@
 //! Filters pytest output to show only failures and the summary line.
 
 use crate::core::runner;
-use crate::core::utils::{resolved_command, tool_exists, truncate};
+use crate::core::utils::{
+    check_forbidden_pytest_args, secure_python_command, tool_exists, truncate,
+};
 use anyhow::Result;
 
 #[derive(Debug, PartialEq)]
@@ -13,10 +15,20 @@ enum ParseState {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Reject pytest flags that load arbitrary user-controlled code
+    // (`-p /path/to/plugin.py`, `--rootdir <attacker-path>`). See #36.
+    if let Err(msg) = check_forbidden_pytest_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
+    // `secure_python_command` strips PYTHONPATH / PYTHONSTARTUP / PIP_*
+    // from the inherited env so a tainted parent can't sideload a
+    // sitecustomize.py / startup script / pip index. See issue #36.
     let mut cmd = if tool_exists("pytest") {
-        resolved_command("pytest")
+        secure_python_command("pytest")
     } else {
-        let mut c = resolved_command("python");
+        let mut c = secure_python_command("python");
         c.arg("-m").arg("pytest");
         c
     };
