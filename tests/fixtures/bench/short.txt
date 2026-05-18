@@ -1,0 +1,4 @@
+hello world
+this is a tiny file
+that should pass through the read filter
+with effectively no cap firing
