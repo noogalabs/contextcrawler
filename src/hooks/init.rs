@@ -3179,7 +3179,7 @@ fn remove_legacy_cursor_hook_entries_from_json(root: &mut serde_json::Value) -> 
     pre_tool_use.len() < original_len
 }
 
-/// Remove Cursor RTK artifacts: hook script + hooks.json entry
+/// Remove Cursor ContextCrawler artifacts: hook script + hooks.json entry
 fn remove_cursor_hooks(ctx: InitContext) -> Result<Vec<String>> {
     let InitContext { verbose, dry_run } = ctx;
     let cursor_dir = resolve_cursor_dir()?;
@@ -3582,7 +3582,7 @@ fn show_codex_config() -> Result<()> {
     println!("\nUsage:");
     println!("  contextcrawler init --codex     # Configure local AGENTS.md + CONTEXTCRAWLER.md");
     println!("  contextcrawler init -g --codex  # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/CONTEXTCRAWLER.md (or ~/.codex/)");
-    println!("  contextcrawler init -g --codex --uninstall  # Remove global Codex RTK artifacts");
+    println!("  contextcrawler init -g --codex --uninstall  # Remove global Codex ContextCrawler artifacts");
 
     Ok(())
 }

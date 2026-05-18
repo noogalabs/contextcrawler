@@ -5,8 +5,8 @@
 //! Tirith pre-execution gate.
 //!
 //! Subprocess-calls `tirith check --format json` and parses the verdict.
-//! Used by both the legacy `rtk rewrite` path (`hooks::rewrite_cmd`) and
-//! the modern `rtk hook claude` path (`hooks::hook_cmd`) so the gate is
+//! Used by both the `contextcrawler rewrite` path (`hooks::rewrite_cmd`) and
+//! the `contextcrawler hook claude` path (`hooks::hook_cmd`) so the gate is
 //! consistent regardless of which integration the user runs.
 //!
 //! Subprocess-only invocation; no statically-linked AGPL code.

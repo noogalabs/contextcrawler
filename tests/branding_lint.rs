@@ -32,6 +32,27 @@ const FORBIDDEN_TOKENS: &[(&str, &str)] = &[
     ("rtk instructions", "init message — use \"contextcrawler instructions\" (post-v0.1.8 user report)"),
     ("\"rtk: ", "error prefix in unstructured stderr — use \"contextcrawler: \" (post-v0.1.8 user report)"),
     ("rtk telemetry", "CLI command in user-facing text — use \"contextcrawler telemetry\" (post-v0.1.8 user report)"),
+    // Branding sweep round 3 (user-reported, 2026-05-18). Clap doc comments
+    // (///) leak into `--help` output, which is high-visibility surface. The
+    // specific phrases below were found in `--help` after the v0.1.8 deploy.
+    ("RTK savings", "clap doc comment — use \"ContextCrawler savings\" (branding sweep round 3)"),
+    ("RTK adoption", "clap doc comment — use \"ContextCrawler adoption\" (branding sweep round 3)"),
+    ("RTK equivalent", "clap doc comment — use \"ContextCrawler equivalent\" (branding sweep round 3)"),
+    ("RTK artifacts", "clap doc comment — use \"ContextCrawler artifacts\" (branding sweep round 3)"),
+    ("RTK and native", "clap doc comment — use \"ContextCrawler and native\" (branding sweep round 3)"),
+    ("(rtk)", "in-line attribution — use \"(contextcrawler)\" (branding sweep round 3)"),
+    // The clap example `$(rtk rewrite ...)` in help text was rebranded
+    // alongside the rewrite docstring; pin to prevent re-introduction.
+    ("$(rtk ", "shell example in clap docs — use \"$(contextcrawler\" (branding sweep round 3)"),
+    ("`rtk rewrite", "CLI example in clap docs — use \"`contextcrawler rewrite\" (branding sweep round 3)"),
+    ("rtk find:", "find filter error prefix — use \"contextcrawler find:\" (branding sweep round 3)"),
+    // NOTE: `format!("rtk ...")` literals inside `rewrite_command` are
+    // INTENTIONAL — they're the rewritten-command strings the hook
+    // executes, and the hook caller historically expects the `rtk` prefix.
+    // Changing them is a correctness-tier scope (separate issue, not
+    // branding). Tracking labels stored in the SQLite DB also stay `rtk `
+    // prefixed to preserve historical analytics. Both categories are NOT
+    // in FORBIDDEN_TOKENS to avoid false positives on legitimate output.
 ];
 
 /// Per-line allowlist marker. A line ending with this comment is exempt.
