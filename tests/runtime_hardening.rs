@@ -174,9 +174,11 @@ fn pytest_minus_p_with_path_is_rejected() {
         &[],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Per #49: pytest `-p` denies now cite #49 directly (issue-aware
+    // pyrbjvm_deny_message_with_issue) rather than the umbrella #36.
     assert!(
-        stderr.contains("refusing to forward") && stderr.contains("#36"),
-        "pytest -p /tmp/evil_plugin.py should be rejected. stderr={}",
+        stderr.contains("refusing to forward") && stderr.contains("#49"),
+        "pytest -p /tmp/evil_plugin.py should be rejected with #49. stderr={}",
         stderr
     );
     assert_eq!(out.status.code(), Some(2));
@@ -277,6 +279,75 @@ fn pytest_version_still_works() {
         "normal `pytest --version` got rejected. stderr={}",
         stderr
     );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// pytest -p bypass coverage (issue #49)
+// ════════════════════════════════════════════════════════════════════
+// These tests don't need pytest installed — the deny check runs in our
+// process before any spawn. We assert exit code 2 + the deny message.
+
+#[test]
+fn pytest_p_bare_relative_path_is_rejected() {
+    // Pre-fix bypass: `subdir/plugin.py` had no leading `./` so the old
+    // `looks_like_path` heuristic missed it. Now any `/` or `\` in the
+    // value rejects.
+    let out = run_with_env(&["pytest", "-p", "subdir/plugin.py"], &[]);
+    assert_eq!(out.status.code(), Some(2), "expected deny exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "expected deny message; got: {}",
+        stderr
+    );
+    // Pin the issue ref: pytest `-p` denies cite #49, not the umbrella
+    // #36 used by other pyrbjvmdotnet checks.
+    assert!(
+        stderr.contains("#49"),
+        "expected #49 in deny message; got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn pytest_p_glued_form_is_rejected() {
+    // `-pVALUE` (no space) and `-p=VALUE` — argparse-accepted forms that
+    // bypassed the old `a == "-p"` exact-equality check.
+    let out = run_with_env(&["pytest", "-psubdir/plugin.py"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    let out2 = run_with_env(&["pytest", "-p=/tmp/evil.py"], &[]);
+    assert_eq!(out2.status.code(), Some(2));
+}
+
+#[test]
+fn pytest_p_bare_py_extension_is_rejected() {
+    // `plugin.py` with no path separator at all — pytest loads it from
+    // cwd as a file. A Python module name never ends in `.py`.
+    let out = run_with_env(&["pytest", "-p", "plugin.py"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn pytest_p_legitimate_module_names_still_allowed() {
+    // Negative case: deny check should NOT fire for legitimate plugin
+    // specifiers. We can't necessarily run pytest here, but we can
+    // assert the deny message is absent (whether the underlying spawn
+    // succeeds or not depends on whether pytest is installed).
+    for value in &[
+        "no:cacheprovider",
+        "myplugin",
+        "mypackage.testplugin",
+        "a.b.c",
+    ] {
+        let out = run_with_env(&["pytest", "-p", value], &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("refusing to forward"),
+            "legitimate `pytest -p {}` got rejected. stderr={}",
+            value,
+            stderr
+        );
+    }
 }
 
 #[test]
