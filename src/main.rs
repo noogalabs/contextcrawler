@@ -268,7 +268,7 @@ enum Commands {
 
     /// Find files with compact tree output (accepts native find flags like -name, -type)
     Find {
-        /// All find arguments (supports both RTK and native find syntax)
+        /// All find arguments (supports both ContextCrawler and native find syntax)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -381,7 +381,7 @@ enum Commands {
         #[arg(long = "no-patch", group = "patch")]
         no_patch: bool,
 
-        /// Remove RTK artifacts for the selected assistant mode
+        /// Remove ContextCrawler artifacts for the selected assistant mode
         #[arg(long)]
         uninstall: bool,
 
@@ -460,7 +460,7 @@ enum Commands {
         yes: bool,
     },
 
-    /// Claude Code economics: spending (ccusage) vs savings (rtk) analysis
+    /// Claude Code economics: spending (ccusage) vs savings (contextcrawler) analysis
     CcEconomics {
         /// Show detailed daily breakdown
         #[arg(short, long)]
@@ -575,7 +575,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Discover missed RTK savings from Claude Code history
+    /// Discover missed ContextCrawler savings from Claude Code history
     Discover {
         /// Filter by project path (substring match)
         #[arg(short, long)]
@@ -599,7 +599,7 @@ enum Commands {
         codex: bool,
     },
 
-    /// Show RTK adoption across Claude Code sessions
+    /// Show ContextCrawler adoption across Claude Code sessions
     Session {},
 
     /// Manage telemetry consent and data (RGPD/GDPR)
@@ -785,16 +785,16 @@ enum Commands {
         since: u64,
     },
 
-    /// Rewrite a raw command to its RTK equivalent (single source of truth for hooks)
+    /// Rewrite a raw command to its ContextCrawler equivalent (single source of truth for hooks)
     ///
     /// Exits 0 and prints the rewritten command if supported.
-    /// Exits 1 with no output if the command has no RTK equivalent.
+    /// Exits 1 with no output if the command has no ContextCrawler equivalent.
     ///
     /// Used by Claude Code, Gemini CLI, and other LLM hooks:
-    ///   REWRITTEN=$(rtk rewrite "$CMD") || exit 0
+    ///   REWRITTEN=$(contextcrawler rewrite "$CMD") || exit 0
     Rewrite {
         /// Raw command to rewrite (e.g. "git status", "cargo test && git push")
-        /// Accepts multiple args: `rtk rewrite ls -al` is equivalent to `rtk rewrite "ls -al"`
+        /// Accepts multiple args: `contextcrawler rewrite ls -al` is equivalent to `contextcrawler rewrite "ls -al"`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -3521,22 +3521,24 @@ mod tests {
 
     #[test]
     fn test_rewrite_clap_multi_args() {
-        // This is the bug KuSh reported: `rtk rewrite ls -al` failed because
-        // Clap rejected `-al` as an unknown flag. With trailing_var_arg + allow_hyphen_values,
-        // multiple args are accepted and joined into a single command string.
+        // Originally reported (pre-rebrand) as `rewrite ls -al` failing because
+        // Clap rejected `-al` as an unknown flag. With trailing_var_arg +
+        // allow_hyphen_values, multiple args are accepted and joined into a
+        // single command string. argv[0] in the test fixtures is the current
+        // binary name — clap ignores it anyway.
         let cases = vec![
-            vec!["rtk", "rewrite", "ls", "-al"],
-            vec!["rtk", "rewrite", "git", "status"],
-            vec!["rtk", "rewrite", "npm", "exec"],
-            vec!["rtk", "rewrite", "cargo", "test"],
-            vec!["rtk", "rewrite", "du", "-sh", "."],
-            vec!["rtk", "rewrite", "head", "-50", "file.txt"],
+            vec!["contextcrawler", "rewrite", "ls", "-al"],
+            vec!["contextcrawler", "rewrite", "git", "status"],
+            vec!["contextcrawler", "rewrite", "npm", "exec"],
+            vec!["contextcrawler", "rewrite", "cargo", "test"],
+            vec!["contextcrawler", "rewrite", "du", "-sh", "."],
+            vec!["contextcrawler", "rewrite", "head", "-50", "file.txt"],
         ];
         for args in &cases {
             let result = Cli::try_parse_from(args.iter());
             assert!(
                 result.is_ok(),
-                "rtk rewrite {:?} should parse (was failing before trailing_var_arg fix)",
+                "contextcrawler rewrite {:?} should parse (was failing before trailing_var_arg fix)",
                 &args[2..]
             );
             if let Ok(cli) = result {
@@ -3552,8 +3554,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_clap_quoted_single_arg() {
-        // Quoted form: `rtk rewrite "git status"` — single arg containing spaces
-        let result = Cli::try_parse_from(["rtk", "rewrite", "git status"]);
+        // Quoted form: `contextcrawler rewrite "git status"` — single arg containing spaces
+        let result = Cli::try_parse_from(["contextcrawler", "rewrite", "git status"]);
         assert!(result.is_ok());
         if let Ok(cli) = result {
             match cli.command {

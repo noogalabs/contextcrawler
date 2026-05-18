@@ -14,23 +14,23 @@ use super::supply_chain_gate;
 use super::tirith_gate;
 // ===== contextzip-downstream: Tirith pre-execution gate end =====
 
-/// Run the `rtk rewrite` command.
+/// Run the `contextcrawler rewrite` command.
 ///
-/// Prints the RTK-rewritten command to stdout and exits with a code that tells
+/// Prints the ContextCrawler-rewritten command to stdout and exits with a code that tells
 /// the caller how to handle permissions:
 ///
-/// | Exit | Stdout   | Meaning                                                      |
-/// |------|----------|--------------------------------------------------------------|
-/// | 0    | rewritten| Rewrite allowed — hook may auto-allow the rewritten command. |
-/// | 1    | (none)   | No RTK equivalent — hook passes through unchanged.           |
-/// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.  |
-/// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt.|
+/// | Exit | Stdout   | Meaning                                                       |
+/// |------|----------|---------------------------------------------------------------|
+/// | 0    | rewritten| Rewrite allowed — hook may auto-allow the rewritten command.  |
+/// | 1    | (none)   | No ContextCrawler equivalent — hook passes through unchanged. |
+/// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.   |
+/// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt. |
 pub fn run(cmd: &str) -> anyhow::Result<()> {
     let (excluded, transparent_prefixes) = crate::core::config::Config::load()
         .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
         .unwrap_or_default();
 
-    // SECURITY: check deny/ask BEFORE rewrite so non-RTK commands are also covered.
+    // SECURITY: check deny/ask BEFORE rewrite so non-wrappable commands are also covered.
     let verdict = check_command(cmd);
 
     if verdict == PermissionVerdict::Deny {
@@ -84,7 +84,7 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
             PermissionVerdict::Deny => unreachable!(),
         },
         None => {
-            // No RTK equivalent. Exit 1 = passthrough.
+            // No ContextCrawler equivalent. Exit 1 = passthrough.
             // Claude Code independently evaluates its own ask rules on the original cmd.
             std::process::exit(1);
         }
@@ -121,7 +121,7 @@ mod tests {
     ///
     /// The bash hook (.claude/hooks/rtk-rewrite.sh) interprets exit codes as:
     ///   0 → auto-allow (sets permissionDecision: "allow")
-    ///   1 → passthrough (no RTK equivalent)
+    ///   1 → passthrough (no ContextCrawler equivalent)
     ///   2 → deny (let Claude Code handle natively)
     ///   3 → ask (rewrite but omit permissionDecision, forcing user prompt)
     ///

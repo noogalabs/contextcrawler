@@ -132,7 +132,7 @@ fn parse_native_find_args(args: &[String]) -> Result<FindArgs> {
                 }
             }
             flag if flag.starts_with('-') => {
-                eprintln!("rtk find: unknown flag '{}', ignored", flag);
+                eprintln!("contextcrawler find: unknown flag '{}', ignored", flag);
             }
             _ => {}
         }
