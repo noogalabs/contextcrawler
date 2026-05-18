@@ -3,7 +3,7 @@
 use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::resolved_command;
+use crate::core::utils::{check_forbidden_rg_args, resolved_command, secure_rg_command};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::ffi::OsString;
@@ -26,10 +26,20 @@ pub fn run(
         eprintln!("grep: '{}' in {}", pattern, path);
     }
 
+    // Reject `--pre`, `--pre-glob`, `--search-zip` / `-z` before they reach
+    // rg — they enable arbitrary code execution per file. See issue #32.
+    if let Err(msg) = check_forbidden_rg_args(extra_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     // Fix: convert BRE alternation \| → | for rg (which uses PCRE-style regex)
     let rg_pattern = pattern.replace(r"\|", "|");
 
-    let mut rg_cmd = resolved_command("rg");
+    // `secure_rg_command` strips RIPGREP_CONFIG_PATH/_FILE from the inherited
+    // env so a tainted parent can't hijack this invocation via a config file
+    // containing `--pre`. See issue #32.
+    let mut rg_cmd = secure_rg_command("rg");
     // --no-ignore-vcs: match grep -r behavior (don't skip .gitignore'd files).
     // Without this, rg returns 0 matches for files in .gitignore, causing
     // false negatives that make AI agents draw wrong conclusions.
@@ -50,7 +60,11 @@ pub fn run(
 
     let result = exec_capture(&mut rg_cmd)
         .or_else(|_| {
-            let mut grep_cmd = resolved_command("grep");
+            // Fallback grep also needs env-sanitisation (env vars are
+            // inherited the same way; grep ignores rg's vars but a future
+            // grep variant could honor similar mechanisms). Use the secure
+            // helper for consistency.
+            let mut grep_cmd = secure_rg_command("grep");
             //When we fall back to grep,include all args, not just -rn.
             grep_cmd.args(["-rn", pattern, path]).args(extra_args);
             exec_capture(&mut grep_cmd)

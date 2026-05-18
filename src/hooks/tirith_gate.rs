@@ -175,6 +175,213 @@ pub fn log_downgrade(cmd: &str, reason: &'static str, tirith_json: Option<&str>)
     }
 }
 
+/// Resolve the Tirith binary path the gate would actually use. Returns
+/// `None` if neither `which tirith` nor `~/.cargo/bin/tirith` finds it.
+/// Used by the `security` dashboard so the user can see exactly which
+/// binary is in play.
+pub fn tirith_binary_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = which::which("tirith") {
+        return Some(p);
+    }
+    let home = dirs::home_dir()?;
+    let cargo_bin = home.join(".cargo/bin/tirith");
+    if cargo_bin.exists() {
+        Some(cargo_bin)
+    } else {
+        None
+    }
+}
+
+/// Returns the path where downgrade events are appended (whether or not
+/// the file exists yet). Mirrors the resolution in `log_downgrade`.
+pub fn downgrades_log_path() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("contextcrawler/downgrades.jsonl"))
+}
+
+/// Read the tail of the downgrades log, returning up to `limit` most
+/// recent records. Each returned `String` is one VALID JSON record
+/// (re-serialised compactly via `serde_json` to ensure parseability),
+/// so multi-line / pretty-printed records get coalesced into single
+/// logical entries.
+///
+/// Naive `content.lines()` splitting would corrupt any record that ever
+/// spans multiple physical lines (today `log_downgrade` writes
+/// single-line JSON, but a future change to pretty-print would silently
+/// break the `--json` dashboard output). Codex P2 catch on the initial
+/// draft of this fix.
+pub fn read_recent_downgrades(limit: usize) -> Vec<String> {
+    let path = match downgrades_log_path() {
+        Some(p) if p.exists() => p,
+        _ => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Walk the file looking for top-level `{...}` balanced regions and
+    // parse each as a JSON value. Any malformed run is skipped — better
+    // to drop one record than corrupt the whole dashboard.
+    let bytes = content.as_bytes();
+    let mut records: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // Find the matching '}' with brace-balance + string-aware scanning
+        // so braces inside JSON string literals don't fool us.
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut end = i;
+        for (j, b) in bytes[i..].iter().enumerate() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if *b == b'\\' {
+                    escaped = true;
+                } else if *b == b'"' {
+                    in_str = false;
+                }
+            } else if *b == b'"' {
+                in_str = true;
+            } else if *b == b'{' {
+                depth += 1;
+            } else if *b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + j + 1;
+                    break;
+                }
+            }
+        }
+        if end > i {
+            let chunk = &content[i..end];
+            // Validate by round-tripping through serde_json. Re-serialised
+            // form is canonical (single-line, compact) so JSON consumers
+            // can rely on one record == one line.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
+                if let Ok(canon) = serde_json::to_string(&v) {
+                    records.push(canon);
+                }
+            }
+            i = end;
+        } else {
+            // Malformed tail — bail out, don't loop forever.
+            break;
+        }
+    }
+
+    let start = records.len().saturating_sub(limit);
+    records[start..].to_vec()
+}
+
+/// `contextcrawler security` dashboard. Renders the current Tirith gate
+/// configuration + recent downgrade events. Two modes:
+/// - default (human-readable): bullet list + tail of the log
+/// - `--json`: machine-readable, suitable for piping into jq
+///
+/// Implements what the CONTEXTCRAWLER.md template has long advertised
+/// ("Tirith defense-in-depth gate dashboard") but which previously had
+/// no actual subcommand backing it — `contextcrawler security` fell
+/// through to macOS's `/usr/bin/security` (keychain tool). See issue #32
+/// for the discovery context.
+pub fn run_security_dashboard(all: bool, json: bool) -> anyhow::Result<i32> {
+    let bin = tirith_binary_path();
+    let disabled =
+        std::env::var("CONTEXTCRAWLER_TIRITH_DISABLED").as_deref() == Ok("1");
+    let required =
+        std::env::var("CONTEXTCRAWLER_TIRITH_REQUIRED").as_deref() == Ok("1");
+    let log_path = downgrades_log_path();
+    let log_exists = log_path.as_ref().is_some_and(|p| p.exists());
+    let limit = if all { usize::MAX } else { 10 };
+    let recent = read_recent_downgrades(limit);
+
+    if json {
+        // Use serde_json for the whole envelope — the previous draft
+        // hand-rolled escaping only covered `\` and `"`, which leaves
+        // control chars (tab, newline) producing invalid JSON when a
+        // path contains them. Codex P3 catch.
+        // Each recent record is ALREADY canonical-form JSON (see
+        // read_recent_downgrades), so we splice it in as a raw value.
+        let parsed_recent: Vec<serde_json::Value> = recent
+            .iter()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect();
+        let envelope = serde_json::json!({
+            "tirith_binary": bin.as_ref().map(|p| p.to_string_lossy()),
+            "installed": bin.is_some(),
+            "gate_disabled": disabled,
+            "gate_required": required,
+            "log_path": log_path.as_ref().map(|p| p.to_string_lossy()),
+            "log_exists": log_exists,
+            "recent_downgrades": parsed_recent,
+        });
+        let rendered = serde_json::to_string_pretty(&envelope)
+            .unwrap_or_else(|_| "{}".to_string());
+        println!("{}", rendered);
+        return Ok(0);
+    }
+
+    println!("ContextCrawler Tirith Gate — Status");
+    println!("════════════════════════════════════════════════════════════");
+    println!();
+    println!("Installation:");
+    match &bin {
+        Some(p) => println!("  [ok] tirith binary: {}", p.display()),
+        None => {
+            println!("  [--] tirith binary: not found (PATH lookup + ~/.cargo/bin/tirith both empty)");
+            println!("       install with: cargo install tirith");
+        }
+    }
+    println!();
+    println!("Gate state:");
+    if disabled {
+        println!("  [!!] DISABLED via CONTEXTCRAWLER_TIRITH_DISABLED=1");
+        println!("       (every command bypasses tirith inspection)");
+    } else if bin.is_none() {
+        println!("  [!!] EFFECTIVELY DISABLED (tirith binary missing)");
+    } else {
+        println!("  [ok] enabled — every hook-routed command is inspected before exec");
+    }
+    if required {
+        println!("  [ok] CONTEXTCRAWLER_TIRITH_REQUIRED=1 (strict mode: tirith failure ≠ allow)");
+    } else {
+        println!("  [--] not required — tirith unavailability falls open (default)");
+    }
+    println!();
+    println!("Downgrade log:");
+    match &log_path {
+        Some(p) => {
+            println!("  path: {}", p.display());
+            println!("  exists: {}", if log_exists { "yes" } else { "no" });
+        }
+        None => println!("  path: unresolvable (no data_local_dir)"),
+    }
+    println!();
+    if recent.is_empty() {
+        println!("Recent downgrade events: (none)");
+    } else {
+        let shown = recent.len();
+        let label = if all {
+            format!("Downgrade events (all {} shown)", shown)
+        } else {
+            format!("Recent downgrade events (last {} of newest)", shown)
+        };
+        println!("{}:", label);
+        for line in &recent {
+            println!("  {}", line);
+        }
+    }
+    println!();
+    println!("Scope note: tirith inspects COMMAND STRINGS only — env-var-driven attacks");
+    println!("(e.g. RIPGREP_CONFIG_PATH hijack, see issue #32) are blocked separately");
+    println!("inside the spawning code path via env_remove + arg deny-list.");
+    Ok(0)
+}
+
 /// Minimal JSON string escape for our log lines.
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);

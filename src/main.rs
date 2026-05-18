@@ -685,6 +685,16 @@ enum Commands {
         require_all: bool,
     },
 
+    /// Tirith defense-in-depth gate status + recent downgrade events
+    Security {
+        /// Show all logged downgrade events, not just the last 10
+        #[arg(long)]
+        all: bool,
+        /// Emit machine-readable JSON instead of the human-readable dashboard
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Ruff linter/formatter with compact output
     Ruff {
         /// Ruff arguments (e.g., check, format --check)
@@ -1162,6 +1172,7 @@ const RTK_META_COMMANDS: &[&str] = &[
     "untrust",
     "session",
     "rewrite",
+    "security",
 ];
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
@@ -1506,11 +1517,21 @@ fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
     let timer = core::tracking::TimedExecution::start();
     let user_args = &args[1..];
 
+    // Reject `--pre`, `--pre-glob`, `--search-zip` / `-z` before they reach
+    // rg — they enable arbitrary code execution per file. See issue #32.
+    if let Err(msg) = core::utils::check_forbidden_rg_args(user_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     // Prefer rg so mixed invocations like `grep -c --glob '*.rs' pat` keep
     // working. If rg isn't on PATH, fall through to system grep.
     let preferred = if which::which("rg").is_ok() { "rg" } else { "grep" };
 
-    let status = core::utils::resolved_command(preferred)
+    // `secure_rg_command` strips RIPGREP_CONFIG_PATH/_FILE from the inherited
+    // env so a tainted parent process can't hijack this rg invocation via
+    // a config file containing `--pre`. See issue #32.
+    let status = core::utils::secure_rg_command(preferred)
         .args(user_args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -2744,6 +2765,10 @@ fn run_cli() -> Result<i32> {
                 hooks::verify_cmd::run(None, require_all)?;
             }
             0
+        }
+
+        Commands::Security { all, json } => {
+            hooks::tirith_gate::run_security_dashboard(all, json)?
         }
     };
 
