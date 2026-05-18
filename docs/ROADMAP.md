@@ -17,8 +17,8 @@ maintain the fork sustainably.
 | v0.1.0 | shipped | First community release |
 | v0.1.1–v0.1.4 | shipped | Branding sweep, hook prefix fix, gate-design notes |
 | **v0.1.5** | **shipped** | **Three downstream-only GHSAs**: shell-exec boundary, ANSI/OSC stripping, credential scrub |
-| **v0.1.6** | **branches ready locally** | Build-path leak, raw-emit sweep, quality baselines, threat model, release runbook, module audits, overnight summary. See `docs/sessions/2026-05-15-overnight.md`. |
-| v0.1.7 | open | Two deferred-from-v0.1.6 fixes: global-filter trust gap (H-3) and tirith subprocess timeout (F-01). Both are invasive enough to deserve their own review cycle. |
+| **v0.1.6** | **shipped 2026-05-15** | Build-path leak, raw-emit sweep, quality baselines, threat model, release runbook, module audits — plus the two items originally deferred to v0.1.7: global-filter trust gap **H-3** (`52b475e` SHA-256 gate + TOCTOU follow-up `97fe98e`) and tirith subprocess timeout **F-01** (`b4c93c3`). Also web SSRF block, supply-chain CVSS hardening, CI trust-token check. See `docs/sessions/2026-05-15-overnight.md`. |
+| v0.1.7 | unscoped | No carry-over from v0.1.6. Reserved for an out-of-band security patch if one needs to ship before a v0.2.0 candidate is ready. |
 
 ## v0.2.0 — minor bump, end-Q3 2026
 
@@ -28,13 +28,15 @@ ship them when one of them is mature, not all at once.
 
 ### Security and trust
 
-- [ ] **Global TOML filter trust check.** Inherit upstream PR #1068
-      or implement equivalent. Move `~/.config/rtk/filters.toml` to
-      the same SHA-256 trust store project-local filters use. Closes
-      H-3 from the 2026-05-15 audit.
-- [ ] **Subprocess timeouts everywhere.** Tirith gate (F-01) is the
-      acute one but every `Command::output()` in `cmds/*` is the same
-      pattern. Audit and apply `wait-timeout` or a pure-std watchdog.
+- [x] ~~**Global TOML filter trust check.**~~ Landed in v0.1.6
+      (`52b475e` + TOCTOU follow-up `97fe98e`). Closed H-3.
+- [ ] **Subprocess timeouts everywhere.** Tirith gate (F-01) was
+      closed in v0.1.6 via `b4c93c3`; analytics `security_cmd` got
+      the same pattern. **Remaining work:** audit every other
+      `Command::output()` / `Command::spawn` site in `src/cmds/*`,
+      `src/core/*`, `src/discover/*` and apply the same
+      `wait-timeout` + `Stdio::null()` (stdin) + stdout-cap pattern.
+      First v0.2.0 work item — see `docs/security/AUDIT-subprocess-timeouts.md`.
 - [ ] **Hash-pin the tirith binary** (optional). Defence in depth for
       the `~/.cargo/bin/tirith` fallback path. Adds operational
       friction; only land if F-03 in the tirith audit becomes a real
