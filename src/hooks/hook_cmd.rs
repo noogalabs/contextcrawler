@@ -107,11 +107,11 @@ fn get_rewritten(cmd: &str) -> Option<String> {
         return None;
     }
 
-    let excluded = crate::core::config::Config::load()
-        .map(|c| c.hooks.exclude_commands)
+    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
         .unwrap_or_default();
 
-    let rewritten = rewrite_command(cmd, &excluded)?;
+    let rewritten = rewrite_command(cmd, &excluded, &transparent_prefixes)?;
 
     if rewritten == cmd {
         return None;
@@ -145,7 +145,7 @@ fn handle_vscode(cmd: &str) -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": PRE_TOOL_USE_KEY,
             "permissionDecision": decision,
-            "permissionDecisionReason": "ContextCrawler auto-rewrite",
+            "permissionDecisionReason": "RTK auto-rewrite",
             "updatedInput": { "command": rewritten }
         }
     });
@@ -211,11 +211,11 @@ pub fn run_gemini() -> Result<()> {
         return Ok(());
     }
 
-    let excluded = crate::core::config::Config::load()
-        .map(|c| c.hooks.exclude_commands)
+    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
         .unwrap_or_default();
 
-    match rewrite_command(cmd, &excluded) {
+    match rewrite_command(cmd, &excluded, &transparent_prefixes) {
         Some(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
             print_rewrite(rewritten);
@@ -335,42 +335,15 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
 
     let mut hook_output = json!({
         "hookEventName": PRE_TOOL_USE_KEY,
-        "permissionDecisionReason": "ContextCrawler auto-rewrite",
+        "permissionDecisionReason": "RTK auto-rewrite",
         "updatedInput": updated_input
     });
 
     if verdict == PermissionVerdict::Allow {
-        // ===== contextzip-downstream: defense-in-depth gates fire here =====
-        // Two gates run before we emit `permissionDecision: "allow"`:
-        //   1. Tirith — shell-syntax inspection (homograph URLs, pipe-to-shell, etc.)
-        //   2. Supply-chain — npm/PyPI package age + OSV.dev CVE check
-        // Either gate blocking causes us to omit permissionDecision so
-        // Claude Code's normal review prompt fires for the original command.
-        //
-        // Gates intentionally only fire on the auto-allow path. If `verdict`
-        // is anything but `Allow`, Claude Code is already going to prompt the
-        // user for review — there's no auto-execution to gate, so the safety
-        // net is unnecessary. As a side effect this means `downgrades.jsonl`
-        // only records events for explicitly-allowlisted command shapes.
-        let tirith_verdict = super::tirith_gate::check(cmd);
-        let tirith_block = super::tirith_gate::should_downgrade(&tirith_verdict);
-
-        let sc_verdict = super::supply_chain_gate::check(cmd);
-        super::supply_chain_gate::log_event(cmd, &sc_verdict);
-        let sc_block = matches!(sc_verdict, super::supply_chain_gate::Verdict::Block(_));
-
-        if let Some((reason, tirith_json)) = tirith_block {
-            super::tirith_gate::log_downgrade(cmd, reason, tirith_json);
-            // Don't insert permissionDecision — let Claude Code prompt.
-        } else if sc_block {
-            // Don't insert permissionDecision — let Claude Code prompt.
-        } else {
-            hook_output
-                .as_object_mut()
-                .unwrap()
-                .insert("permissionDecision".into(), json!("allow"));
-        }
-        // ===== contextzip-downstream: end defense-in-depth gates =====
+        hook_output
+            .as_object_mut()
+            .unwrap()
+            .insert("permissionDecision".into(), json!("allow"));
     }
 
     PayloadAction::Rewrite {
@@ -426,11 +399,23 @@ fn run_claude_inner(input: &str) -> Option<String> {
 
 // ── Cursor native hook ─────────────────────────────────────────
 
+/// Cursor on Windows ships hook payloads with one or more leading
+/// UTF-8 BOMs (`EF BB BF`, sometimes doubled), which serde_json
+/// refuses to parse. Strip them defensively so the rewrite path keeps
+/// working instead of silently returning `{}`.
+fn strip_leading_bom(input: &str) -> &str {
+    let mut s = input;
+    while let Some(rest) = s.strip_prefix('\u{feff}') {
+        s = rest;
+    }
+    s
+}
+
 /// Run the Cursor Agent hook natively.
 pub fn run_cursor() -> Result<()> {
     let input = read_stdin_limited()?;
 
-    let input = input.trim();
+    let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
         let _ = writeln!(io::stdout(), "{{}}");
         return Ok(());
@@ -471,14 +456,20 @@ pub fn run_cursor() -> Result<()> {
         }
     };
 
-    let decision = match verdict {
-        PermissionVerdict::Allow => "allow",
-        _ => "ask",
-    };
+    // Cursor preToolUse currently enforces allow/deny only and can ignore
+    // updated_input when permission is "ask". Use "allow" for rewritten
+    // commands unless the command is explicitly denied above.
+    let decision = "allow";
 
     audit_log("rewrite", &cmd, &rewritten);
 
+    // `continue: true` mirrors the shape of every other Cursor hook
+    // (afterShellExecution, beforeSubmitPrompt, stop, ...). Cursor's
+    // preToolUse panel renders the JSON it received; without this field
+    // the panel collapses to `Output: {}` even though the rewrite ran,
+    // which makes the hook look broken to users.
     let output = json!({
+        "continue": true,
         "permission": decision,
         "updated_input": { "command": rewritten }
     });
@@ -498,6 +489,7 @@ fn run_cursor_inner_with_rules(
     ask_rules: &[String],
     allow_rules: &[String],
 ) -> String {
+    let input = strip_leading_bom(input);
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(_) => return "{}".to_string(),
@@ -519,11 +511,9 @@ fn run_cursor_inner_with_rules(
 
     match get_rewritten(&cmd) {
         Some(rewritten) => {
-            let decision = match verdict {
-                PermissionVerdict::Allow => "allow",
-                _ => "ask",
-            };
+            let decision = "allow";
             let output = json!({
+                "continue": true,
                 "permission": decision,
                 "updated_input": { "command": rewritten }
             });
@@ -536,6 +526,10 @@ fn run_cursor_inner_with_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
+        crate::discover::registry::rewrite_command(cmd, excluded, &[])
+    }
 
     // --- Copilot format detection ---
 
@@ -635,41 +629,38 @@ mod tests {
     #[test]
     fn test_gemini_hook_uses_rewrite_command() {
         assert_eq!(
-            rewrite_command("git status", &[]),
-            Some("contextcrawler git status".into())
-        );
-        assert_eq!(
-            rewrite_command("cargo test", &[]),
-            Some("contextcrawler cargo test".into())
-        );
-        // Legacy `rtk` prefix is still recognized as already-rewritten —
-        // passthrough returns the input unchanged.
-        assert_eq!(
-            rewrite_command("rtk git status", &[]),
+            rewrite_command_no_prefixes("git status", &[]),
             Some("rtk git status".into())
         );
         assert_eq!(
-            rewrite_command("contextcrawler git status", &[]),
-            Some("contextcrawler git status".into())
+            rewrite_command_no_prefixes("cargo test", &[]),
+            Some("rtk cargo test".into())
         );
-        assert_eq!(rewrite_command("cat <<EOF", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("rtk git status", &[]),
+            Some("rtk git status".into())
+        );
+        assert_eq!(rewrite_command_no_prefixes("cat <<EOF", &[]), None);
     }
 
     #[test]
     fn test_gemini_hook_excluded_commands() {
         let excluded = vec!["curl".to_string()];
-        assert_eq!(rewrite_command("curl https://example.com", &excluded), None);
         assert_eq!(
-            rewrite_command("git status", &excluded),
-            Some("contextcrawler git status".into())
+            rewrite_command_no_prefixes("curl https://example.com", &excluded),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git status", &excluded),
+            Some("rtk git status".into())
         );
     }
 
     #[test]
     fn test_gemini_hook_env_prefix_preserved() {
         assert_eq!(
-            rewrite_command("RUST_LOG=debug cargo test", &[]),
-            Some("RUST_LOG=debug contextcrawler cargo test".into())
+            rewrite_command_no_prefixes("RUST_LOG=debug cargo test", &[]),
+            Some("RUST_LOG=debug rtk cargo test".into())
         );
     }
 
@@ -703,7 +694,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "contextcrawler git status");
+        assert_eq!(cmd, "rtk git status");
     }
 
     #[test]
@@ -712,7 +703,7 @@ mod tests {
         let result = run_claude_inner(&input).unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
         let updated = &v["hookSpecificOutput"]["updatedInput"];
-        assert_eq!(updated["command"], "contextcrawler git status");
+        assert_eq!(updated["command"], "rtk git status");
         assert_eq!(updated["timeout"], 30000);
         assert_eq!(updated["description"], "Check repo status");
     }
@@ -755,7 +746,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "GIT_PAGER=cat contextcrawler git status");
+        assert_eq!(cmd, "GIT_PAGER=cat rtk git status");
     }
 
     #[test]
@@ -766,7 +757,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "contextcrawler git add . && contextcrawler cargo test");
+        assert_eq!(cmd, "rtk git add . && rtk cargo test");
     }
 
     #[test]
@@ -778,7 +769,7 @@ mod tests {
         assert_eq!(hook["hookEventName"], PRE_TOOL_USE_KEY);
         // permissionDecision is only set when an explicit allow rule matches;
         // with default-to-ask semantics (no rules configured), it is absent.
-        assert_eq!(hook["permissionDecisionReason"], "ContextCrawler auto-rewrite");
+        assert_eq!(hook["permissionDecisionReason"], "RTK auto-rewrite");
         assert!(hook["updatedInput"].is_object());
         assert!(hook["updatedInput"]["command"].is_string());
     }
@@ -803,10 +794,13 @@ mod tests {
     fn test_cursor_rewrite_flat_format() {
         let result = run_cursor_inner(&cursor_input("git status"));
         let v: Value = serde_json::from_str(&result).unwrap();
-        // Default permission (no explicit allow rule) → "ask"
-        assert_eq!(v["permission"], "ask");
-        assert_eq!(v["updated_input"]["command"], "contextcrawler git status");
+        // Cursor preToolUse expects allow/deny for rewrite application.
+        assert_eq!(v["permission"], "allow");
+        assert_eq!(v["updated_input"]["command"], "rtk git status");
         assert!(v.get("hookSpecificOutput").is_none());
+        // `continue: true` keeps the Cursor preToolUse panel from collapsing
+        // to `Output: {}`; without it the rewrite is invisible to users.
+        assert_eq!(v["continue"], true);
     }
 
     #[test]
@@ -838,7 +832,63 @@ mod tests {
         let result = run_cursor_inner(&cursor_input("cargo test"));
         let v: Value = serde_json::from_str(&result).unwrap();
         assert!(v.get("hookSpecificOutput").is_none());
-        assert_eq!(v["permission"], "ask");
+        assert_eq!(v["permission"], "allow");
+        assert_eq!(v["continue"], true);
+    }
+
+    #[test]
+    fn test_cursor_compound_rewrite_includes_continue() {
+        let cmd = "cd \"/tmp/proj\" && git status";
+        let result = run_cursor_inner(&cursor_input(cmd));
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["continue"], true);
+        assert_eq!(v["permission"], "allow");
+        assert_eq!(
+            v["updated_input"]["command"],
+            "cd \"/tmp/proj\" && rtk git status"
+        );
+    }
+
+    #[test]
+    fn test_cursor_strips_single_utf8_bom() {
+        // Some Cursor builds prepend a single UTF-8 BOM to hook stdin.
+        // serde_json rejects BOM-prefixed input, so without the strip
+        // the hook returned `{}` and the rewrite became a silent no-op.
+        let payload = cursor_input("git status");
+        let with_single_bom = format!("\u{feff}{}", payload);
+        let result = run_cursor_inner(&with_single_bom);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["continue"], true);
+        assert_eq!(v["permission"], "allow");
+        assert_eq!(v["updated_input"]["command"], "rtk git status");
+    }
+
+    #[test]
+    fn test_cursor_strips_double_utf8_bom() {
+        // Cursor on Windows ships hook stdin with **two** leading
+        // UTF-8 BOMs (`EF BB BF EF BB BF`), confirmed via a stdin
+        // tracer wrapping `rtk hook cursor` on Cursor 3.2.x. This is
+        // the real-world payload shape the loop needs to survive.
+        let payload = cursor_input("git status");
+        let with_double_bom = format!("\u{feff}\u{feff}{}", payload);
+        let result = run_cursor_inner(&with_double_bom);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["continue"], true);
+        assert_eq!(v["permission"], "allow");
+        assert_eq!(v["updated_input"]["command"], "rtk git status");
+    }
+
+    #[test]
+    fn test_strip_leading_bom_helper() {
+        // Direct unit test on the helper so future refactors can't
+        // regress the loop semantics without a clear failure signal.
+        assert_eq!(strip_leading_bom(""), "");
+        assert_eq!(strip_leading_bom("hello"), "hello");
+        assert_eq!(strip_leading_bom("\u{feff}hello"), "hello");
+        assert_eq!(strip_leading_bom("\u{feff}\u{feff}hello"), "hello");
+        assert_eq!(strip_leading_bom("\u{feff}\u{feff}\u{feff}hello"), "hello");
+        // BOM in the middle is preserved (not "leading").
+        assert_eq!(strip_leading_bom("a\u{feff}b"), "a\u{feff}b");
     }
 
     // --- Audit logging ---

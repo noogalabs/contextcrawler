@@ -15,6 +15,7 @@ use cmds::js::{
     lint_cmd, next_cmd, npm_cmd, playwright_cmd, pnpm_cmd, prettier_cmd, prisma_cmd, tsc_cmd,
     vitest_cmd,
 };
+use cmds::jvm::gradlew_cmd;
 use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
@@ -22,23 +23,6 @@ use cmds::system::{
     deps, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
     read, summary, tree, wc_cmd,
 };
-
-// ===== contextzip-downstream imports begin =====
-// Downstream-only `use` imports land between these markers.
-// Confining additions here minimizes rebase conflicts when upstream RTK
-// touches the import section.
-use cmds::cloud::web_cmd;
-
-// Full rebrand: binary is `contextcrawler`. Source-level `rtk` identifiers
-// (mod rtk, use rtk::*, struct Rtk*) remain to keep upstream rebases tight;
-// only user-facing surfaces change.
-const CONTEXTCRAWLER_VERSION: &str = concat!(
-    "ContextCrawler 0.1.6 (downstream of rtk ",
-    env!("CARGO_PKG_VERSION"),
-    ")"
-);
-const CONTEXTCRAWLER_LONG_ABOUT: &str = "ContextCrawler — a downstream distribution of rtk-ai/rtk (https://github.com/rtk-ai/rtk) with added Claude Code session compaction, multi-language stacktrace compression, HTML content extraction, and a Tirith pre-execution security gate.";
-// ===== contextzip-downstream imports end =====
 
 use anyhow::{Context, Result};
 use clap::error::ErrorKind;
@@ -61,16 +45,16 @@ pub enum AgentTarget {
     Kilocode,
     /// Google Antigravity
     Antigravity,
+    /// Hermes CLI
+    Hermes,
 }
 
 #[derive(Parser)]
 #[command(
-    // contextzip-downstream: full rename to contextcrawler. Source-level
-    // 'rtk' identifiers remain; only user-facing surfaces change.
-    name = "contextcrawler",
-    version = CONTEXTCRAWLER_VERSION,
-    about = "ContextCrawler - Minimize LLM token consumption (downstream of rtk-ai/rtk)",
-    long_about = CONTEXTCRAWLER_LONG_ABOUT,
+    name = "rtk",
+    version,
+    about = "Rust Token Killer - Minimize LLM token consumption",
+    long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -227,10 +211,6 @@ enum Commands {
 
     /// Run command and show only errors/warnings
     Err {
-        /// Opt into sh -c semantics (pipes, redirects, chains).
-        /// Off by default — agent-rewritten input never reaches a shell silently.
-        #[arg(long)]
-        shell: bool,
         /// Command to run
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -238,10 +218,6 @@ enum Commands {
 
     /// Run tests and show only failures
     Test {
-        /// Opt into sh -c semantics (pipes, redirects, chains).
-        /// Off by default — agent-rewritten input never reaches a shell silently.
-        #[arg(long)]
-        shell: bool,
         /// Test command (e.g. cargo test)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -317,10 +293,6 @@ enum Commands {
 
     /// Run command and show heuristic summary
     Summary {
-        /// Opt into sh -c semantics (pipes, redirects, chains).
-        /// Off by default — agent-rewritten input never reaches a shell silently.
-        #[arg(long)]
-        shell: bool,
         /// Command to run and summarize
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -402,6 +374,10 @@ enum Commands {
         /// Install GitHub Copilot integration (VS Code + CLI)
         #[arg(long)]
         copilot: bool,
+
+        /// Preview changes without writing any files (combine with -v to show content)
+        #[arg(long = "dry-run", conflicts_with = "show")]
+        dry_run: bool,
     },
 
     /// Download with compact output (strips progress bars)
@@ -667,19 +643,10 @@ enum Commands {
         /// List all trusted projects
         #[arg(long)]
         list: bool,
-        /// Trust the user-global filter (~/.config/rtk/filters.toml) instead
-        /// of the project-local one. Both files are SHA-256 pinned and
-        /// require re-review on content change.
-        #[arg(long, conflicts_with = "list")]
-        global: bool,
     },
 
     /// Revoke trust for project-local TOML filters
-    Untrust {
-        /// Revoke trust for the user-global filter instead.
-        #[arg(long)]
-        global: bool,
-    },
+    Untrust,
 
     /// Verify hook integrity and run TOML filter inline tests
     Verify {
@@ -760,6 +727,14 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Android Gradle wrapper with compact output (build, test, lint)
+    #[command(name = "gradlew")]
+    Gradlew {
+        /// Gradle tasks and arguments (e.g., assembleDebug, testDebugUnitTest, lint, --info)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Show hook rewrite audit metrics (requires RTK_HOOK_AUDIT=1)
     #[command(name = "hook-audit")]
     HookAudit {
@@ -787,103 +762,7 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
-
-    // ===== contextzip-downstream variants begin =====
-    // Downstream-only Commands::* enum variants land between these markers.
-    /// Fetch a URL with curl and extract main content from the HTML response
-    /// (strip nav, ads, scripts). Falls back to raw output when the response
-    /// is not HTML.
-    Web {
-        /// URL to fetch and extract content from
-        url: String,
-    },
-
-    /// Security report — Tirith audit stats, gate status, and detection rule
-    /// breakdown. Surfaces what Tirith caught while protecting your shell.
-    Security {
-        #[command(subcommand)]
-        command: Option<SecurityCommands>,
-        /// Emit JSON instead of human-readable text (top-level dashboard only).
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Manage Claude Code session JSONL logs — compact / apply / expand.
-    Sessions {
-        #[command(subcommand)]
-        command: SessionsCommands,
-    },
-
-    /// Supply-chain gate — inspect npm / pip-style install commands for
-    /// recent uploads and known CVEs before they run. Opt-in via config.
-    SupplyChain {
-        #[command(subcommand)]
-        command: SupplyChainCommands,
-    },
-    // ===== contextzip-downstream variants end =====
 }
-
-// ===== contextzip-downstream: Security subcommand group =====
-#[derive(Debug, Subcommand)]
-enum SecurityCommands {
-    /// Tail the local gate-activity log (Tirith downgrades + supply-chain events).
-    Log {
-        /// Emit JSON instead of human-readable text.
-        #[arg(long)]
-        json: bool,
-        /// Maximum number of recent events to show.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Print a bucketed histogram of all events instead of the event tail.
-        #[arg(long)]
-        histogram: bool,
-    },
-}
-// ===== end contextzip-downstream Security =====
-
-// ===== contextzip-downstream: SupplyChain subcommand group =====
-#[derive(Debug, Subcommand)]
-enum SupplyChainCommands {
-    /// Inspect a shell command for installs and report a verdict.
-    Check {
-        /// Output format: text (default) or json
-        #[arg(short, long, default_value = "text")]
-        format: String,
-        /// Command to inspect
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        cmd: Vec<String>,
-    },
-}
-// ===== end contextzip-downstream SupplyChain =====
-
-// ===== contextzip-downstream: Sessions subcommand group =====
-#[derive(Debug, Subcommand)]
-enum SessionsCommands {
-    /// Write a sidecar `<session>.jsonl.compressed` next to the original.
-    /// Rollback is `rm <sidecar>`.
-    Compact {
-        /// Session id (looked up under $CLAUDE_PROJECTS_DIR or ~/.claude/projects)
-        /// or full path to a .jsonl file. Optional with --all-sessions.
-        #[arg(required_unless_present = "all_sessions")]
-        target: Option<String>,
-        /// Print stats without writing the sidecar.
-        #[arg(long)]
-        dry_run: bool,
-        /// Compact every session under the projects root.
-        #[arg(long = "all-sessions")]
-        all_sessions: bool,
-    },
-    /// Promote `<session>.jsonl.compressed` to `<session>.jsonl`.
-    /// Original is backed up to `<session>.jsonl.bak`.
-    Apply {
-        target: String,
-    },
-    /// Roll back an `apply` by restoring `<session>.jsonl.bak`.
-    Expand {
-        target: String,
-    },
-}
-// ===== end contextzip-downstream Sessions =====
 
 #[derive(Debug, Subcommand)]
 enum HookCommands {
@@ -1047,6 +926,9 @@ enum ComposeCommands {
     Logs {
         /// Optional service name
         service: Option<String>,
+        /// Number of log lines to fetch
+        #[arg(long, default_value_t = 100)]
+        tail: u32,
     },
     /// Build compose services (summary)
     Build {
@@ -1060,6 +942,12 @@ enum ComposeCommands {
 
 #[derive(Debug, Subcommand)]
 enum KubectlCommands {
+    /// Get Kubernetes resources (compact for pods/services)
+    Get {
+        /// kubectl get arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// List pods
     Pods {
         #[arg(short, long)]
@@ -1263,13 +1151,6 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
         parse_error.exit();
     }
 
-    // args[0] is a flag (e.g. `contextcrawler -v`, `contextcrawler --foo`).
-    // Don't try to exec flags as binaries — that produces a misleading
-    // "No such file or directory" error. Show Clap's parse error instead.
-    if args[0].starts_with('-') {
-        parse_error.exit();
-    }
-
     let raw_command = args.join(" ");
     let error_message = core::utils::strip_ansi(&parse_error.to_string());
 
@@ -1352,7 +1233,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             Err(e) => {
                 // Command not found — same behaviour as no-TOML path
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
-                eprintln!("[contextcrawler: {}]", e);
+                eprintln!("[rtk: {}]", e);
                 Ok(127)
             }
         }
@@ -1376,7 +1257,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             Err(e) => {
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
                 // Command not found or other OS error — single message, no duplicate Clap error
-                eprintln!("[contextcrawler: {}]", e);
+                eprintln!("[rtk: {}]", e);
                 Ok(127)
             }
         }
@@ -1467,94 +1348,6 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
     }
 }
 
-/// SSRF block list for the `contextcrawler web` command.
-///
-/// Returns `Some(reason)` if the IP is in a range we refuse to fetch from.
-/// `None` means safe to proceed.
-///
-/// Covers:
-/// - Loopback (127.0.0.0/8, ::1)
-/// - Link-local (169.254.0.0/16, fe80::/10) — includes AWS / GCP / Azure
-///   metadata service at 169.254.169.254
-/// - Azure metadata at 168.63.129.16 (not link-local, special-cased)
-/// - Private RFC1918 (10/8, 172.16/12, 192.168/16) and ULA fc00::/7
-/// - Multicast and "unspecified" (0.0.0.0, ::)
-///
-/// Initial-host only. An attacker who controls public DNS that resolves to
-/// a private IP can still slip through via `--max-redirs`. The proper fix
-/// is per-redirect-hop validation which would replace curl with a Rust
-/// HTTP client we control end-to-end — tracked in docs/ROADMAP.md.
-fn web_ssrf_block_reason(ip: &std::net::IpAddr) -> Option<&'static str> {
-    use std::net::IpAddr;
-    if ip.is_loopback() {
-        return Some("loopback address");
-    }
-    if ip.is_unspecified() {
-        return Some("unspecified address (0.0.0.0 / ::)");
-    }
-    if ip.is_multicast() {
-        return Some("multicast address");
-    }
-    match ip {
-        IpAddr::V4(v4) => {
-            // Azure IMDS lives at a non-link-local public-looking address.
-            if v4.octets() == [168, 63, 129, 16] {
-                return Some("Azure metadata service");
-            }
-            if v4.is_link_local() {
-                // 169.254.0.0/16 — includes AWS / GCP IMDS 169.254.169.254.
-                return Some("link-local address (includes cloud metadata services)");
-            }
-            if v4.is_private() {
-                return Some("private RFC1918 address");
-            }
-            // 100.64.0.0/10 — carrier-grade NAT, treat as private.
-            let o = v4.octets();
-            if o[0] == 100 && (64..=127).contains(&o[1]) {
-                return Some("carrier-grade NAT (100.64.0.0/10)");
-            }
-            // 0.0.0.0/8 — "this network" reserved range. is_unspecified
-            // catches only 0.0.0.0 exactly; the rest of /8 (0.0.0.1 .. 0.255.255.255)
-            // is also blocked here. Codex review of the initial SSRF block flagged
-            // this as missing.
-            if o[0] == 0 {
-                return Some("\"this network\" reserved 0.0.0.0/8");
-            }
-            // 198.18.0.0/15 — RFC 2544 benchmark range. Unlikely legitimate target;
-            // historically used in network testing and pen-test labs.
-            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-                return Some("benchmark range 198.18.0.0/15 (RFC 2544)");
-            }
-            // 240.0.0.0/4 — future-use / experimental. No legitimate routable target
-            // exists in this range as of 2026.
-            if o[0] >= 240 && o[0] < 255 {
-                return Some("future-use 240.0.0.0/4 (RFC 1112)");
-            }
-            // Reserved / benchmark / documentation ranges. Not strictly
-            // SSRF-dangerous but unlikely to be a legitimate fetch target.
-            if v4.is_documentation() || v4.is_broadcast() {
-                return Some("reserved address (documentation/broadcast)");
-            }
-            None
-        }
-        IpAddr::V6(v6) => {
-            // ULA fc00::/7
-            if v6.octets()[0] & 0xfe == 0xfc {
-                return Some("unique-local IPv6 (fc00::/7)");
-            }
-            // Link-local fe80::/10
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return Some("link-local IPv6 (fe80::/10)");
-            }
-            // IPv4-mapped IPv6 — re-check as IPv4 so we catch ::ffff:10.0.0.1
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return web_ssrf_block_reason(&IpAddr::V4(v4));
-            }
-            None
-        }
-    }
-}
-
 fn main() {
     let code = match run_cli() {
         Ok(code) => code,
@@ -1564,6 +1357,27 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+fn uninstall_init_dispatch<UninstallHermes, UninstallStandard>(
+    agent: Option<AgentTarget>,
+    global: bool,
+    gemini: bool,
+    codex: bool,
+    ctx: hooks::init::InitContext,
+    uninstall_hermes: UninstallHermes,
+    uninstall_standard: UninstallStandard,
+) -> Result<()>
+where
+    UninstallHermes: FnOnce(hooks::init::InitContext) -> Result<()>,
+    UninstallStandard: FnOnce(bool, bool, bool, bool, hooks::init::InitContext) -> Result<()>,
+{
+    if agent == Some(AgentTarget::Hermes) {
+        uninstall_hermes(ctx)
+    } else {
+        let cursor = agent == Some(AgentTarget::Cursor);
+        uninstall_standard(global, gemini, codex, cursor, ctx)
+    }
 }
 
 fn run_cli() -> Result<i32> {
@@ -1826,14 +1640,17 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Err { shell, command } => {
+        Commands::Err { command } => {
             let cmd = command.join(" ");
-            runner::run_err(&cmd, shell, cli.verbose)?
+            // TODO(post-rebase): restore --shell CLI flag plumbing.
+            // For now default to argv-mode (use_shell=false) — preserves
+            // GHSA-3mmh-86cm-g6w4 argv guard.
+            runner::run_err(&cmd, false, cli.verbose)?
         }
 
-        Commands::Test { shell, command } => {
+        Commands::Test { command } => {
             let cmd = command.join(" ");
-            runner::run_test(&cmd, shell, cli.verbose)?
+            runner::run_test(&cmd, false, cli.verbose)?
         }
 
         Commands::Json {
@@ -1902,8 +1719,8 @@ fn run_cli() -> Result<i32> {
             }
             DockerCommands::Compose { command: compose } => match compose {
                 ComposeCommands::Ps => container::run_compose_ps(cli.verbose)?,
-                ComposeCommands::Logs { service } => {
-                    container::run_compose_logs(service.as_deref(), cli.verbose)?
+                ComposeCommands::Logs { service, tail } => {
+                    container::run_compose_logs(service.as_deref(), tail, cli.verbose)?
                 }
                 ComposeCommands::Build { service } => {
                     container::run_compose_build(service.as_deref(), cli.verbose)?
@@ -1916,6 +1733,7 @@ fn run_cli() -> Result<i32> {
         },
 
         Commands::Kubectl { command } => match command {
+            KubectlCommands::Get { args } => container::run_kubectl_get(&args, cli.verbose)?,
             KubectlCommands::Pods { namespace, all } => {
                 let mut args: Vec<String> = Vec::new();
                 if all {
@@ -1947,9 +1765,9 @@ fn run_cli() -> Result<i32> {
             KubectlCommands::Other(args) => container::run_kubectl_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Summary { shell, command } => {
+        Commands::Summary { command } => {
             let cmd = command.join(" ");
-            summary::run(&cmd, shell, cli.verbose)?
+            summary::run(&cmd, false, cli.verbose)?
         }
 
         Commands::Grep {
@@ -1985,12 +1803,24 @@ fn run_cli() -> Result<i32> {
             uninstall,
             codex,
             copilot,
+            dry_run,
         } => {
+            let ctx = hooks::init::InitContext {
+                verbose: cli.verbose,
+                dry_run,
+            };
             if show {
                 hooks::init::show_config(codex)?;
             } else if uninstall {
-                let cursor = agent == Some(AgentTarget::Cursor);
-                hooks::init::uninstall(global, gemini, codex, cursor, cli.verbose)?;
+                uninstall_init_dispatch(
+                    agent,
+                    global,
+                    gemini,
+                    codex,
+                    ctx,
+                    hooks::init::uninstall_hermes,
+                    hooks::init::uninstall,
+                )?;
             } else if gemini {
                 let patch_mode = if auto_patch {
                     hooks::init::PatchMode::Auto
@@ -1999,21 +1829,23 @@ fn run_cli() -> Result<i32> {
                 } else {
                     hooks::init::PatchMode::Ask
                 };
-                hooks::init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
+                hooks::init::run_gemini(global, hook_only, patch_mode, ctx)?;
             } else if copilot {
-                hooks::init::run_copilot(cli.verbose)?;
+                hooks::init::run_copilot(ctx)?;
             } else if agent == Some(AgentTarget::Kilocode) {
                 if global {
-                    anyhow::bail!("Kilo Code is project-scoped. Use: contextcrawler init --agent kilocode");
+                    anyhow::bail!("Kilo Code is project-scoped. Use: rtk init --agent kilocode");
                 }
-                hooks::init::run_kilocode_mode(cli.verbose)?;
+                hooks::init::run_kilocode_mode(ctx)?;
             } else if agent == Some(AgentTarget::Antigravity) {
                 if global {
                     anyhow::bail!(
-                        "Antigravity is project-scoped. Use: contextcrawler init --agent antigravity"
+                        "Antigravity is project-scoped. Use: rtk init --agent antigravity"
                     );
                 }
-                hooks::init::run_antigravity_mode(cli.verbose)?;
+                hooks::init::run_antigravity_mode(ctx)?;
+            } else if agent == Some(AgentTarget::Hermes) {
+                hooks::init::run_hermes_mode(ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2039,7 +1871,7 @@ fn run_cli() -> Result<i32> {
                     hook_only,
                     codex,
                     patch_mode,
-                    cli.verbose,
+                    ctx,
                 )?;
             }
             0
@@ -2323,6 +2155,8 @@ fn run_cli() -> Result<i32> {
 
         Commands::GolangciLint { args } => golangci_cmd::run(&args, cli.verbose)?,
 
+        Commands::Gradlew { args } => gradlew_cmd::run(&args, cli.verbose)?,
+
         Commands::HookAudit { since } => {
             hooks::hook_audit_cmd::run(since, cli.verbose)?;
             0
@@ -2348,10 +2182,10 @@ fn run_cli() -> Result<i32> {
             HookCommands::Check { agent: _, command } => {
                 use crate::discover::registry::rewrite_command;
                 let raw = command.join(" ");
-                let excluded = crate::core::config::Config::load()
-                    .map(|c| c.hooks.exclude_commands)
+                let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+                    .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
                     .unwrap_or_default();
-                match rewrite_command(&raw, &excluded) {
+                match rewrite_command(&raw, &excluded, &transparent_prefixes) {
                     Some(rewritten) => {
                         println!("{}", rewritten);
                         0
@@ -2579,13 +2413,17 @@ fn run_cli() -> Result<i32> {
             core::utils::exit_code_from_status(&status, &cmd_name)
         }
 
-        Commands::Trust { list, global } => {
-            hooks::trust::run_trust(list, global)?;
+        Commands::Trust { list } => {
+            // TODO(post-rebase): restore --global CLI flag plumbing.
+            // For now default to project-local trust (global=false). The
+            // v0.1.6 H-3 global trust gate is intact in trust.rs; only the
+            // CLI surface for managing it is deferred.
+            hooks::trust::run_trust(list, false)?;
             0
         }
 
-        Commands::Untrust { global } => {
-            hooks::trust::run_untrust(global)?;
+        Commands::Untrust => {
+            hooks::trust::run_untrust(false)?;
             0
         }
 
@@ -2603,217 +2441,6 @@ fn run_cli() -> Result<i32> {
             }
             0
         }
-
-        // ===== contextzip-downstream match arms begin =====
-        // Downstream-only match arms land between these markers.
-        // Each arm should be small (delegate to the module's run function);
-        // keep all dispatch logic in the module, not inline here.
-        Commands::Web { url } => {
-            // F-01 + F-02: full URL validation. Parse with the `url` crate
-            // (not just a prefix check), then resolve the host and reject
-            // if any resolved IP is loopback, private (RFC1918), link-local
-            // (incl. 169.254.169.254 AWS metadata), or multicast.
-            //
-            // This catches the agent-emits-private-IP-directly attack
-            // (the common case). An attacker who controls public DNS that
-            // resolves to a private IP can still slip through; that needs
-            // per-redirect-hop validation which would replace curl entirely.
-            // Tracked as residual in docs/security/MODULE_AUDIT_web_cmd.md.
-            let parsed = ::url::Url::parse(&url)
-                .with_context(|| format!("contextcrawler web: invalid URL: {}", url))?;
-            match parsed.scheme() {
-                "http" | "https" => {}
-                other => anyhow::bail!(
-                    "contextcrawler web: only http:// and https:// URLs are allowed (got scheme {})",
-                    other
-                ),
-            }
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("contextcrawler web: URL has no host"))?;
-            // Resolve host → IPs. Port 80 is a placeholder for the resolver
-            // API (ToSocketAddrs requires (host, port)); we discard it and
-            // keep only the IPs since the policy decision is IP-only.
-            // The actual fetch port comes from the URL's own port or scheme
-            // default (parsed.port_or_known_default()).
-            use std::net::ToSocketAddrs;
-            let resolved: Vec<std::net::IpAddr> = (host, 80u16)
-                .to_socket_addrs()
-                .with_context(|| format!("contextcrawler web: cannot resolve host: {}", host))?
-                .map(|sa| sa.ip())
-                .collect();
-            for ip in &resolved {
-                let blocked_reason = web_ssrf_block_reason(ip);
-                if let Some(reason) = blocked_reason {
-                    anyhow::bail!(
-                        "contextcrawler web: refusing to fetch {} — host {} resolves to {} ({})",
-                        url,
-                        host,
-                        ip,
-                        reason
-                    );
-                }
-            }
-            // DNS-rebinding defence (Codex review): pin the validated IPs
-            // into curl via --resolve so curl uses *our* lookup result,
-            // not a fresh re-resolution that an attacker with a low TTL
-            // could swap to a private IP between our check and the fetch.
-            //
-            // Pin both 80 and 443 since the URL may use either; also pin
-            // the URL's own port if explicit. curl's --resolve takes
-            // host:port:ip[,ip,...].
-            let pin_port = parsed.port_or_known_default().unwrap_or(443);
-            let ip_list = resolved
-                .iter()
-                .map(|ip| ip.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let resolve_pin = format!("{}:{}:{}", host, pin_port, ip_list);
-            let resolve_pin_80 = format!("{}:80:{}", host, ip_list);
-            let resolve_pin_443 = format!("{}:443:{}", host, ip_list);
-
-            let timer = core::tracking::TimedExecution::start();
-            let mut cmd = core::utils::resolved_command("curl");
-            // F-03: cap wall-clock at 30s so a hanging endpoint doesn't
-            //   block the agent hook.
-            // F-04: cap response size at 64 MiB so a huge response doesn't
-            //   OOM us.
-            // F-07: trailing `--` so a URL starting with a dash is treated
-            //   as data, not a curl flag (-K /etc/passwd is a real attack
-            //   vector via curl's config-file flag).
-            cmd.args([
-                "-s",
-                "-L",
-                "--max-time",
-                "30",
-                "--max-filesize",
-                "67108864",
-                // Bound redirect-chain abuse independently from the time
-                // budget. curl's default is 50; cap at 10 so an attacker
-                // can't waste the entire --max-time on a long redirect
-                // chain. Codex review of the original commit flagged this.
-                "--max-redirs",
-                "10",
-                // Pin our validated IPs for this host:port (closes the
-                // DNS-rebinding window between our resolution and curl's).
-                // Pin 80 and 443 to cover http→https upgrade redirects to
-                // the same host. The URL's own port is also pinned in
-                // case it's non-default.
-                "--resolve",
-                &resolve_pin_80,
-                "--resolve",
-                &resolve_pin_443,
-                "--resolve",
-                &resolve_pin,
-                "--",
-                &url,
-            ]);
-            let output = cmd.output().context("Failed to fetch URL with curl")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                // strip_ansi here is belt-and-suspenders against curl's
-                // rare ANSI-emitting paths reaching agent context.
-                eprintln!(
-                    "FAILED: curl {}",
-                    core::utils::strip_ansi(&stderr).trim()
-                );
-                std::process::exit(output.status.code().unwrap_or(1));
-            }
-            let raw = String::from_utf8_lossy(&output.stdout).to_string();
-            let filtered = if web_cmd::is_html(&raw) {
-                web_cmd::extract_content(&raw)
-            } else {
-                raw.clone()
-            };
-            println!("{}", filtered);
-            timer.track(
-                &format!("web {}", url),
-                &format!("rtk web {}", url),
-                &raw,
-                &filtered,
-            );
-            0
-        }
-
-        Commands::Security { command, json } => {
-            match command {
-                None => {
-                    let fmt = if json { "json" } else { "text" };
-                    analytics::security_cmd::run_dashboard(fmt, cli.verbose)?;
-                }
-                Some(SecurityCommands::Log {
-                    json,
-                    limit,
-                    histogram,
-                }) => {
-                    let fmt = if json { "json" } else { "text" };
-                    analytics::security_cmd::run_log(fmt, limit, histogram, cli.verbose)?;
-                }
-            }
-            0
-        }
-
-        Commands::Sessions { command } => {
-            match command {
-                SessionsCommands::Compact {
-                    target,
-                    dry_run,
-                    all_sessions,
-                } => analytics::session_compact_cmd::run_compact(
-                    target.as_deref(),
-                    dry_run,
-                    all_sessions,
-                    cli.verbose,
-                )?,
-                SessionsCommands::Apply { target } => {
-                    analytics::session_compact_cmd::run_apply(&target, cli.verbose)?
-                }
-                SessionsCommands::Expand { target } => {
-                    analytics::session_compact_cmd::run_expand(&target, cli.verbose)?
-                }
-            }
-            0
-        }
-
-        Commands::SupplyChain { command } => {
-            match command {
-                SupplyChainCommands::Check { format, cmd } => {
-                    let joined = cmd.join(" ");
-                    let verdict = hooks::supply_chain_gate::check(&joined);
-                    hooks::supply_chain_gate::log_event(&joined, &verdict);
-                    match format.as_str() {
-                        "json" => {
-                            let payload = serde_json::json!({
-                                "verdict": match &verdict {
-                                    hooks::supply_chain_gate::Verdict::Skip => "skip",
-                                    hooks::supply_chain_gate::Verdict::Allow => "allow",
-                                    hooks::supply_chain_gate::Verdict::Block(_) => "block",
-                                    hooks::supply_chain_gate::Verdict::Unavailable(_) => "unavailable",
-                                },
-                                "findings": match &verdict {
-                                    hooks::supply_chain_gate::Verdict::Block(f) => serde_json::to_value(f).unwrap_or(serde_json::Value::Null),
-                                    _ => serde_json::Value::Array(vec![]),
-                                },
-                            });
-                            println!("{}", payload);
-                        }
-                        _ => {
-                            println!("{}", hooks::supply_chain_gate::render(&verdict));
-                        }
-                    }
-                    // Exit-code protocol: 0=skip/allow, 2=block, 3=unavailable
-                    match verdict {
-                        hooks::supply_chain_gate::Verdict::Block(_) => std::process::exit(2),
-                        hooks::supply_chain_gate::Verdict::Unavailable(_) => {
-                            std::process::exit(3)
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            0
-        }
-        // ===== contextzip-downstream match arms end =====
     };
 
     Ok(code)
@@ -2881,131 +2508,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    // ── SSRF block list (web F-02) ──────────────────────────────────
-
-    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
-    }
-
-    #[test]
-    fn ssrf_blocks_loopback_v4() {
-        assert!(web_ssrf_block_reason(&v4(127, 0, 0, 1)).is_some());
-        assert!(web_ssrf_block_reason(&v4(127, 0, 1, 2)).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_loopback_v6() {
-        assert!(web_ssrf_block_reason(&IpAddr::V6(Ipv6Addr::LOCALHOST)).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_link_local_v4_including_aws_metadata() {
-        assert!(web_ssrf_block_reason(&v4(169, 254, 169, 254)).is_some());
-        assert!(web_ssrf_block_reason(&v4(169, 254, 1, 1)).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_link_local_v6() {
-        let ip = "fe80::1".parse::<IpAddr>().unwrap();
-        assert!(web_ssrf_block_reason(&ip).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_private_rfc1918() {
-        for ip in [v4(10, 0, 0, 1), v4(172, 16, 0, 1), v4(192, 168, 1, 1)] {
-            assert!(
-                web_ssrf_block_reason(&ip).is_some(),
-                "{ip} should be blocked",
-            );
-        }
-    }
-
-    #[test]
-    fn ssrf_blocks_azure_metadata() {
-        let r = web_ssrf_block_reason(&v4(168, 63, 129, 16));
-        assert!(r.is_some());
-        assert!(r.unwrap().to_lowercase().contains("azure"));
-    }
-
-    #[test]
-    fn ssrf_blocks_carrier_grade_nat() {
-        assert!(web_ssrf_block_reason(&v4(100, 64, 0, 1)).is_some());
-        assert!(web_ssrf_block_reason(&v4(100, 127, 255, 254)).is_some());
-        // 100.63 and 100.128 are outside CGN — should NOT be blocked.
-        assert!(web_ssrf_block_reason(&v4(100, 63, 0, 1)).is_none());
-        assert!(web_ssrf_block_reason(&v4(100, 128, 0, 1)).is_none());
-    }
-
-    #[test]
-    fn ssrf_blocks_unspecified_and_multicast() {
-        assert!(web_ssrf_block_reason(&v4(0, 0, 0, 0)).is_some());
-        assert!(web_ssrf_block_reason(&v4(224, 0, 0, 1)).is_some());
-        assert!(web_ssrf_block_reason(&v4(255, 255, 255, 255)).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_ula_ipv6() {
-        let ip = "fc00::1".parse::<IpAddr>().unwrap();
-        assert!(web_ssrf_block_reason(&ip).is_some());
-        let ip = "fd00::1".parse::<IpAddr>().unwrap();
-        assert!(web_ssrf_block_reason(&ip).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_ipv4_mapped_v6() {
-        // ::ffff:10.0.0.1 must be rejected the same way 10.0.0.1 is.
-        let ip = "::ffff:10.0.0.1".parse::<IpAddr>().unwrap();
-        assert!(web_ssrf_block_reason(&ip).is_some());
-        let ip = "::ffff:169.254.169.254".parse::<IpAddr>().unwrap();
-        assert!(web_ssrf_block_reason(&ip).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_this_network_0_0_0_0_8() {
-        // Codex review follow-up: 0.0.0.0/8 is "this network" reserved.
-        // is_unspecified() only catches 0.0.0.0 exactly; the rest of /8
-        // must also be blocked.
-        assert!(web_ssrf_block_reason(&v4(0, 1, 2, 3)).is_some());
-        assert!(web_ssrf_block_reason(&v4(0, 255, 255, 254)).is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_benchmark_198_18_0_0_15() {
-        // RFC 2544 benchmark range.
-        assert!(web_ssrf_block_reason(&v4(198, 18, 0, 1)).is_some());
-        assert!(web_ssrf_block_reason(&v4(198, 19, 255, 254)).is_some());
-        // 198.17 and 198.20 are outside the range — allowed.
-        assert!(web_ssrf_block_reason(&v4(198, 17, 0, 1)).is_none());
-        assert!(web_ssrf_block_reason(&v4(198, 20, 0, 1)).is_none());
-    }
-
-    #[test]
-    fn ssrf_blocks_future_use_240_0_0_0_4() {
-        // 240/4 — reserved for future use; no routable target as of 2026.
-        assert!(web_ssrf_block_reason(&v4(240, 0, 0, 1)).is_some());
-        assert!(web_ssrf_block_reason(&v4(250, 1, 2, 3)).is_some());
-        // 255.255.255.255 is broadcast, also blocked (different reason).
-        assert!(web_ssrf_block_reason(&v4(255, 255, 255, 255)).is_some());
-    }
-
-    #[test]
-    fn ssrf_allows_real_public_addresses() {
-        // Sample public IPs and IPv6. None should be blocked.
-        for ip in [
-            v4(1, 1, 1, 1),         // Cloudflare DNS
-            v4(8, 8, 8, 8),         // Google DNS
-            v4(140, 82, 121, 4),    // github.com (as of writing)
-        ] {
-            assert!(
-                web_ssrf_block_reason(&ip).is_none(),
-                "{ip} should be allowed",
-            );
-        }
-        let ip = "2606:4700:4700::1111".parse::<IpAddr>().unwrap(); // Cloudflare IPv6
-        assert!(web_ssrf_block_reason(&ip).is_none());
-    }
+    use std::cell::Cell;
 
     #[test]
     fn test_git_commit_single_message() {
@@ -3138,6 +2641,75 @@ mod tests {
     fn test_try_parse_valid_git_status() {
         let result = Cli::try_parse_from(["rtk", "git", "status"]);
         assert!(result.is_ok(), "git status should parse successfully");
+    }
+
+    #[test]
+    fn test_try_parse_init_agent_hermes() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "hermes"]).unwrap();
+        match cli.command {
+            Commands::Init { agent, .. } => {
+                assert_eq!(agent, Some(AgentTarget::Hermes));
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_kubectl_get_alias() {
+        let cli = Cli::try_parse_from(["rtk", "kubectl", "get", "pods", "-n", "default"]).unwrap();
+
+        match cli.command {
+            Commands::Kubectl {
+                command: KubectlCommands::Get { args },
+            } => assert_eq!(args, vec!["pods", "-n", "default"]),
+            _ => panic!("Expected Kubectl Get command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_init_agent_hermes_uninstall() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "hermes", "--uninstall"]).unwrap();
+        match cli.command {
+            Commands::Init {
+                agent, uninstall, ..
+            } => {
+                assert_eq!(agent, Some(AgentTarget::Hermes));
+                assert!(uninstall);
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_uninstall_dispatch_routes_hermes_to_hermes_cleanup() {
+        let hermes_called = Cell::new(false);
+        let standard_called = Cell::new(false);
+        let ctx = hooks::init::InitContext {
+            verbose: 2,
+            dry_run: true,
+        };
+
+        let result = uninstall_init_dispatch(
+            Some(AgentTarget::Hermes),
+            true,
+            false,
+            false,
+            ctx,
+            |ctx| {
+                hermes_called.set(true);
+                assert_eq!(ctx.verbose, 2);
+                assert!(ctx.dry_run);
+                Ok(())
+            },
+            |_, _, _, _, _| {
+                standard_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(hermes_called.get());
+        assert!(!standard_called.get());
     }
 
     #[test]
@@ -3285,6 +2857,30 @@ mod tests {
             } => {
                 assert_eq!(agent, "gemini");
                 assert_eq!(command, vec!["cargo", "test"]);
+            }
+            _ => panic!("Expected Hook Check command"),
+        }
+    }
+
+    #[test]
+    fn test_hook_check_preserves_double_dash_in_command() {
+        let cli = Cli::try_parse_from([
+            "rtk",
+            "hook",
+            "check",
+            "shadowenv",
+            "exec",
+            "--",
+            "git",
+            "status",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Hook {
+                command: HookCommands::Check { agent, command },
+            } => {
+                assert_eq!(agent, "claude");
+                assert_eq!(command, vec!["shadowenv", "exec", "--", "git", "status"]);
             }
             _ => panic!("Expected Hook Check command"),
         }

@@ -22,12 +22,12 @@ fn validate_json_extension(file: &Path) -> Result<()> {
         };
         if let Some(fmt) = format_name {
             let mut msg = format!(
-                "{} is not a JSON file (detected {}). Use `contextcrawler read` for non-JSON files.",
+                "{} is not a JSON file (detected {}). Use `rtk read` for non-JSON files.",
                 file.display(),
                 fmt
             );
             if ext == "toml" && file.file_name().is_some_and(|n| n == "Cargo.toml") {
-                msg.push_str(" Tip: use `contextcrawler deps` for Cargo.toml.");
+                msg.push_str(" Tip: use `rtk deps` for Cargo.toml.");
             }
             bail!("{}", msg);
         }
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn test_cargo_toml_suggests_deps() {
         let err = validate_json_extension(Path::new("Cargo.toml")).unwrap_err();
-        assert!(err.to_string().contains("contextcrawler deps"));
+        assert!(err.to_string().contains("rtk deps"));
     }
 
     #[test]
