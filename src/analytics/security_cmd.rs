@@ -15,6 +15,17 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::process::Command;
+use std::time::Duration;
+
+use crate::core::stream::exec_capture_short;
+
+/// Wall-clock budget for tirith subprocess calls from `rtk security`.
+/// Matches the 8s cap the gate uses in src/hooks/tirith_gate.rs — the
+/// dashboard poll path shares the same hung-tirith failure mode the gate
+/// hardening exists to fix. See docs/security/AUDIT-subprocess-timeouts.md
+/// finding F-06: the v0.1.6 overnight summary claimed this was already
+/// hardened, but `Command::new(bin).output()` was still in place.
+const TIRITH_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Deserialize)]
 struct AuditStats {
@@ -456,14 +467,13 @@ fn resolve_tirith_bin() -> Option<String> {
 }
 
 fn fetch_audit_stats(bin: &str) -> Option<AuditStats> {
-    let output = Command::new(bin)
-        .args(["audit", "stats", "--format", "json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let mut cmd = Command::new(bin);
+    cmd.args(["audit", "stats", "--format", "json"]);
+    let result = exec_capture_short(&mut cmd, TIRITH_QUERY_TIMEOUT).ok()?;
+    if !result.success() {
         return None;
     }
-    serde_json::from_slice(&output.stdout).ok()
+    serde_json::from_str(&result.stdout).ok()
 }
 
 #[derive(Default)]
@@ -476,13 +486,14 @@ struct DoctorStatus {
 
 fn fetch_doctor_status(bin: &str) -> DoctorStatus {
     let mut s = DoctorStatus::default();
-    let output = match Command::new(bin).arg("doctor").output() {
-        Ok(o) => o,
+    let mut cmd = Command::new(bin);
+    cmd.arg("doctor");
+    let result = match exec_capture_short(&mut cmd, TIRITH_QUERY_TIMEOUT) {
+        Ok(r) => r,
         Err(_) => return s,
     };
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    s.raw = stdout.clone();
-    for line in stdout.lines() {
+    s.raw = result.stdout.clone();
+    for line in result.stdout.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("tirith ") {
             s.version = Some(rest.split_whitespace().next().unwrap_or(rest).to_string());
