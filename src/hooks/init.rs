@@ -872,18 +872,29 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
     let mut removed = Vec::new();
     let absolute_rtk_md_ref = codex_rtk_md_ref(codex_dir);
 
-    let rtk_md_path = codex_dir.join(RTK_MD);
-    if rtk_md_path.exists() {
-        if dry_run {
-            println!("[dry-run] would remove RTK.md: {}", rtk_md_path.display());
-        } else {
-            fs::remove_file(&rtk_md_path)
-                .with_context(|| format!("Failed to remove RTK.md: {}", rtk_md_path.display()))?;
-            if verbose > 0 {
-                eprintln!("Removed RTK.md: {}", rtk_md_path.display());
+    // Remove the canonical file AND any legacy variants (e.g. RTK.md left
+    // behind by the regressed bcddd06 commit). Without the legacy sweep here,
+    // a user who runs `init` while still on a regressed install gets the
+    // orphan file cleaned up, but a user who jumps straight to `uninstall`
+    // would be left with stranded artifacts. See codex review on #19.
+    let candidate_files: Vec<&str> = std::iter::once(RTK_MD)
+        .chain(LEGACY_RTK_MD_FILES.iter().copied())
+        .collect();
+    for filename in candidate_files {
+        let file_path = codex_dir.join(filename);
+        if file_path.exists() {
+            if dry_run {
+                println!("[dry-run] would remove {}: {}", filename, file_path.display());
+            } else {
+                fs::remove_file(&file_path).with_context(|| {
+                    format!("Failed to remove {}: {}", filename, file_path.display())
+                })?;
+                if verbose > 0 {
+                    eprintln!("Removed {}: {}", filename, file_path.display());
+                }
             }
+            removed.push(format!("{}: {}", filename, file_path.display()));
         }
-        removed.push(format!("RTK.md: {}", rtk_md_path.display()));
     }
 
     let agents_md_path = codex_dir.join(AGENTS_MD);
@@ -910,11 +921,19 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
         }
     }
 
-    if remove_rtk_reference_from_agents(
-        &agents_md_path,
-        &[RTK_MD_REF, absolute_rtk_md_ref.as_str()],
-        ctx,
-    )? {
+    // Build the set of references to strip: canonical (relative + absolute)
+    // plus every legacy filename in both forms. Hands the full set to one
+    // call so the helper can do a single read/write.
+    let mut refs_to_strip: Vec<String> = vec![
+        RTK_MD_REF.to_string(),
+        absolute_rtk_md_ref.clone(),
+    ];
+    for legacy in LEGACY_RTK_MD_FILES {
+        refs_to_strip.push(format!("@{}", legacy));
+        refs_to_strip.push(format!("@{}", codex_dir.join(legacy).display()));
+    }
+    let refs_borrowed: Vec<&str> = refs_to_strip.iter().map(|s| s.as_str()).collect();
+    if remove_rtk_reference_from_agents(&agents_md_path, &refs_borrowed, ctx)? {
         removed.push("AGENTS.md: removed @RTK.md reference".to_string());
     }
 
@@ -2468,6 +2487,43 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
         }
     }
 
+    // Migrate legacy `@RTK.md` line(s) to the canonical `RTK_MD_REF`. On an
+    // upgraded install CLAUDE.md may still reference the old filename — left
+    // alone, the contains-check below misses it and the appender adds a
+    // second line, leaving both references in place. See codex review on #19.
+    for legacy in LEGACY_RTK_MD_FILES {
+        let legacy_ref = format!("@{}", legacy);
+        if content.contains(&legacy_ref) {
+            // Replace whole-line occurrences only — substring replace could
+            // mangle prose that incidentally mentions the legacy name.
+            let migrated_content = content
+                .lines()
+                .map(|line| {
+                    if line.trim() == legacy_ref.as_str() {
+                        RTK_MD_REF
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut migrated_content = migrated_content;
+            if content.ends_with('\n') && !migrated_content.ends_with('\n') {
+                migrated_content.push('\n');
+            }
+            if migrated_content != content {
+                content = migrated_content;
+                migrated = true;
+                if verbose > 0 {
+                    eprintln!(
+                        "Migrated: {} -> {} in CLAUDE.md",
+                        legacy_ref, RTK_MD_REF
+                    );
+                }
+            }
+        }
+    }
+
     // Check if @RTK.md already present
     if content.contains(RTK_MD_REF) {
         if verbose > 0 {
@@ -3460,10 +3516,34 @@ fn show_codex_config() -> Result<()> {
     } else {
         println!("[--] Global RTK.md: not found");
     }
+    // Also surface legacy artifacts so a user on a regressed install sees
+    // them in `init --show` rather than wondering why init keeps recreating
+    // files. Hint at the cleanup that runs on next `init`.
+    for legacy in LEGACY_RTK_MD_FILES {
+        let legacy_path = codex_dir.join(legacy);
+        if legacy_path.exists() {
+            println!(
+                "[!!] Global {} (legacy): {} — will be cleaned on next init",
+                legacy,
+                legacy_path.display()
+            );
+        }
+    }
 
     if global_agents_md.exists() {
         let content = fs::read_to_string(&global_agents_md)?;
-        if has_rtk_reference(&content, &[RTK_MD_REF, global_rtk_md_ref.as_str()]) {
+        // Build the full reference set (canonical + every legacy form) so a
+        // regressed install isn't reported as "not configured".
+        let mut all_refs: Vec<String> = vec![
+            RTK_MD_REF.to_string(),
+            global_rtk_md_ref.clone(),
+        ];
+        for legacy in LEGACY_RTK_MD_FILES {
+            all_refs.push(format!("@{}", legacy));
+            all_refs.push(format!("@{}", codex_dir.join(legacy).display()));
+        }
+        let all_refs_borrowed: Vec<&str> = all_refs.iter().map(|s| s.as_str()).collect();
+        if has_rtk_reference(&content, &all_refs_borrowed) {
             println!("[ok] Global AGENTS.md: RTK.md reference");
         } else if content.contains(RTK_BLOCK_START) {
             println!("[!!] Global AGENTS.md: old inline RTK block");
@@ -3482,7 +3562,13 @@ fn show_codex_config() -> Result<()> {
 
     if local_agents_md.exists() {
         let content = fs::read_to_string(&local_agents_md)?;
-        if has_rtk_reference(&content, &[RTK_MD_REF]) {
+        let mut all_local_refs: Vec<String> = vec![RTK_MD_REF.to_string()];
+        for legacy in LEGACY_RTK_MD_FILES {
+            all_local_refs.push(format!("@{}", legacy));
+        }
+        let all_local_refs_borrowed: Vec<&str> =
+            all_local_refs.iter().map(|s| s.as_str()).collect();
+        if has_rtk_reference(&content, &all_local_refs_borrowed) {
             println!("[ok] Local AGENTS.md: @RTK.md reference");
         } else if content.contains(RTK_BLOCK_START) {
             println!("[!!] Local AGENTS.md: old inline RTK block");
@@ -4807,6 +4893,68 @@ mod tests {
         let content = "alpha\n\n@RTK.md\n\nbeta\n";
         let out = strip_at_reference_line(content, "@RTK.md");
         assert_eq!(out, "alpha\n\nbeta\n");
+    }
+
+    #[test]
+    fn test_patch_claude_md_migrates_legacy_at_ref_in_place() {
+        // Codex review on #19: on upgraded installs, CLAUDE.md may still
+        // contain `@RTK.md` (the legacy form). Without migration, the
+        // contains-check below would miss it and the appender would add a
+        // second `@CONTEXTCRAWLER.md` line, leaving both references in
+        // place. This test asserts the legacy line is rewritten to the
+        // canonical form rather than duplicated.
+        let temp = TempDir::new().unwrap();
+        let claude_md = temp.path().join("CLAUDE.md");
+        fs::write(&claude_md, "# My stuff\n\n@RTK.md\n").unwrap();
+
+        let migrated = patch_claude_md(&claude_md, InitContext::default()).unwrap();
+        assert!(migrated);
+
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            content.contains(RTK_MD_REF),
+            "must end up with the canonical reference, got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("@RTK.md"),
+            "legacy @RTK.md must be removed, got:\n{}",
+            content
+        );
+        // And idempotent — a second run with the new content already in
+        // place must not duplicate the line.
+        let _ = patch_claude_md(&claude_md, InitContext::default()).unwrap();
+        let content2 = fs::read_to_string(&claude_md).unwrap();
+        assert_eq!(content2.matches(RTK_MD_REF).count(), 1);
+    }
+
+    #[test]
+    fn test_uninstall_codex_at_removes_legacy_rtk_md_file_and_ref() {
+        // Codex review on #19: an existing Codex home that still has
+        // RTK.md / @RTK.md from a regressed install should be cleanable
+        // via `uninstall --codex` without forcing the user to run a
+        // fresh `init` first.
+        let temp = TempDir::new().unwrap();
+        let codex_dir = temp.path();
+        let agents_md = codex_dir.join("AGENTS.md");
+        let legacy_rtk_md = codex_dir.join("RTK.md");
+
+        fs::write(&agents_md, "# Team rules\n\n@RTK.md\n").unwrap();
+        fs::write(&legacy_rtk_md, "legacy codex config").unwrap();
+
+        let removed = uninstall_codex_at(codex_dir, InitContext::default()).unwrap();
+
+        assert!(!legacy_rtk_md.exists(), "legacy RTK.md must be removed");
+        let content = fs::read_to_string(&agents_md).unwrap();
+        assert!(
+            !content.contains("@RTK.md"),
+            "legacy @RTK.md ref must be stripped, got:\n{}",
+            content
+        );
+        assert!(content.contains("# Team rules"));
+        // The removal should report at least the legacy file + the ref.
+        assert!(removed.iter().any(|r| r.contains("RTK.md")));
+        assert!(removed.iter().any(|r| r.contains("AGENTS.md")));
     }
 
     #[test]
