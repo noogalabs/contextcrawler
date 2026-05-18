@@ -70,7 +70,10 @@ impl Language {
             "sh" | "bash" | "zsh" => Language::Shell,
             "json" | "jsonc" | "json5" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv"
             | "graphql" | "gql" | "sql" | "md" | "markdown" | "txt" | "env" | "lock"
-            | "xcstrings" | "geojson" | "ipynb" | "webmanifest" | "code-workspace" => {
+            | "xcstrings" | "geojson" | "ipynb" | "webmanifest"
+            // `code-workspace` covers VS Code workspace files; `workspace`
+            // covers JetBrains/Theia project workspace files (also JSON).
+            | "code-workspace" | "workspace" => {
                 Language::Data
             }
             _ => Language::Unknown,

@@ -154,7 +154,16 @@ pub struct ReadConfig {
     /// Lines to keep from the start of a large unknown-extension file.
     pub head_lines: usize,
     /// Lines to keep from the end of a large unknown-extension file.
+    /// Defaults to 80 so head and tail are symmetric — final assertions,
+    /// imports-at-bottom patterns, and result lines deserve equal weight to
+    /// the file's opening when only a window is preserved.
     pub tail_lines: usize,
+    /// Extensions (with or without leading dot) that bypass the cap even
+    /// when they exceed the token threshold. Use for source-code files in
+    /// languages contextcrawler hasn't grown a filter for yet, e.g.
+    /// `[".svelte", ".astro", ".zig"]`.
+    #[serde(default)]
+    pub passthrough_extensions: Vec<String>,
 }
 
 impl Default for ReadConfig {
@@ -162,7 +171,8 @@ impl Default for ReadConfig {
         Self {
             token_threshold: 5_000,
             head_lines: 80,
-            tail_lines: 20,
+            tail_lines: 80,
+            passthrough_extensions: Vec::new(),
         }
     }
 }
@@ -328,8 +338,11 @@ consent_date = "2026-04-10T12:00:00Z"
     fn test_read_config_default_values() {
         let config = Config::default();
         assert_eq!(config.read.token_threshold, 5_000);
+        // Symmetric 80/80 — final assertions and result lines deserve the
+        // same surface area as the file's opening.
         assert_eq!(config.read.head_lines, 80);
-        assert_eq!(config.read.tail_lines, 20);
+        assert_eq!(config.read.tail_lines, 80);
+        assert!(config.read.passthrough_extensions.is_empty());
     }
 
     #[test]
