@@ -269,7 +269,7 @@ pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
 /// won't appear in the Gemfile but still need bundler for version isolation).
 pub fn ruby_exec(tool: &str) -> Command {
     if std::path::Path::new("Gemfile").exists() {
-        let mut c = Command::new("bundle");
+        let mut c = secure_ruby_command("bundle");
         c.arg("exec").arg(tool);
         return c;
     }
@@ -307,22 +307,22 @@ pub fn detect_package_manager() -> &'static str {
 /// Returns a Command ready to have tool-specific args appended.
 pub fn package_manager_exec(tool: &str) -> Command {
     if tool_exists(tool) {
-        resolved_command(tool)
+        secure_node_command(tool)
     } else {
         let pm = detect_package_manager();
         match pm {
             "pnpm" => {
-                let mut c = resolved_command("pnpm");
+                let mut c = secure_node_command("pnpm");
                 c.arg("exec").arg("--").arg(tool);
                 c
             }
             "yarn" => {
-                let mut c = resolved_command("yarn");
+                let mut c = secure_node_command("yarn");
                 c.arg("exec").arg("--").arg(tool);
                 c
             }
             _ => {
-                let mut c = resolved_command("npx");
+                let mut c = secure_node_command("npx");
                 c.arg("--no-install").arg("--").arg(tool);
                 c
             }
@@ -475,6 +475,7 @@ fn rg_deny_message(offending: &str) -> String {
 /// the raw `resolved_command()` for rg/grep invocations.
 pub fn secure_rg_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
     cmd.env_remove("RIPGREP_CONFIG_PATH");
     cmd.env_remove("RIPGREP_CONFIG_FILE");
     cmd
@@ -540,6 +541,7 @@ const GIT_CONFIG_ENV_INDEX_LIMIT: usize = 64;
 /// the raw `resolved_command("git")`.
 pub fn secure_git_command() -> Command {
     let mut cmd = resolved_command("git");
+    apply_universal_env_strip(&mut cmd);
     for var in FORBIDDEN_GIT_ENV_VARS {
         cmd.env_remove(var);
     }
@@ -994,28 +996,32 @@ pub struct ToolPolicy {
 /// macOS adding new `DYLD_*` knobs we haven't enumerated above).
 pub fn secure_command_with_policy(policy: &ToolPolicy) -> Command {
     let mut cmd = resolved_command(policy.name);
-
-    // Universal static strip list
-    for var in UNIVERSAL_ENV_STRIP {
-        cmd.env_remove(var);
-    }
-
-    // Per-tool extras
+    apply_universal_env_strip(&mut cmd);
     for var in policy.env_strip {
         cmd.env_remove(var);
     }
+    cmd
+}
 
-    // Dynamic prefixes: walk the inherited env once and strip anything
-    // matching BASH_FUNC_* (bash exported functions, used by Shellshock-
-    // class injection) or DYLD_* (any new macOS dynamic-loader knob not
-    // already in UNIVERSAL_ENV_STRIP).
+/// Apply the universal env-strip (UNIVERSAL_ENV_STRIP + BASH_FUNC_*/DYLD_*
+/// dynamic prefixes) to a Command. Every per-tool secure_*_command in this
+/// module MUST call this before adding its tool-specific env_remove list —
+/// without it, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`,
+/// `PERL5OPT`, `LUA_INIT`, etc. would still be inherited.
+///
+/// Extracted from `secure_command_with_policy` after a pre-release review
+/// (codex F8) found the per-tool helpers added by PRs #42/#43/#44/#46/#47
+/// each only stripped their OWN list — the headline universal-strip claim
+/// of PR #41 was documentation-only in production.
+pub(crate) fn apply_universal_env_strip(cmd: &mut Command) {
+    for var in UNIVERSAL_ENV_STRIP {
+        cmd.env_remove(var);
+    }
     for (key, _) in std::env::vars() {
         if key.starts_with("BASH_FUNC_") || key.starts_with("DYLD_") {
             cmd.env_remove(&key);
         }
     }
-
-    cmd
 }
 
 /// Generic equivalent of [`check_forbidden_rg_args`]: scans `args`
@@ -1115,6 +1121,7 @@ fn is_cargo_target_runner_or_linker(name: &str) -> bool {
 /// `install` / `nextest` / passthrough.
 pub fn secure_cargo_command() -> Command {
     let mut cmd = resolved_command("cargo");
+    apply_universal_env_strip(&mut cmd);
     for name in FORBIDDEN_CARGO_ENV_EXACT {
         cmd.env_remove(name);
     }
@@ -2178,6 +2185,7 @@ const NODE_ENV_VARS_EXACT: &[&str] = &[
 /// #37.
 pub fn secure_node_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
 
     for var in NODE_ENV_VARS_EXACT {
         cmd.env_remove(var);
@@ -2471,6 +2479,7 @@ const PYTHON_DANGEROUS_ENVS: &[&str] = &[
 /// PIP_TRUSTED_HOST, PIP_FIND_LINKS, ...). See issue #36.
 pub fn secure_python_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
     for var in PYTHON_DANGEROUS_ENVS {
         cmd.env_remove(var);
     }
@@ -2498,6 +2507,7 @@ const RUBY_DANGEROUS_ENVS: &[&str] = &[
 /// dangerous env vars stripped. See issue #36.
 pub fn secure_ruby_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
     for var in RUBY_DANGEROUS_ENVS {
         cmd.env_remove(var);
     }
@@ -2517,6 +2527,7 @@ const JVM_DANGEROUS_ENVS: &[&str] = &[
 /// env vars stripped. See issue #36.
 pub fn secure_jvm_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
     for var in JVM_DANGEROUS_ENVS {
         cmd.env_remove(var);
     }
@@ -2536,6 +2547,7 @@ const DOTNET_DANGEROUS_ENVS: &[&str] = &[
 /// See issue #36.
 pub fn secure_dotnet_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
     for var in DOTNET_DANGEROUS_ENVS {
         cmd.env_remove(var);
     }
@@ -2561,6 +2573,7 @@ const GO_DANGEROUS_ENVS: &[&str] = &[
 /// same family (cgo + GOFLAGS).
 pub fn secure_go_command(name: &str) -> Command {
     let mut cmd = resolved_command(name);
+    apply_universal_env_strip(&mut cmd);
     for var in GO_DANGEROUS_ENVS {
         cmd.env_remove(var);
     }
@@ -2953,6 +2966,7 @@ const KUBECTL_STRIP_ENV: &[&str] = &[
 /// attacker's apiserver.
 pub fn secure_kubectl_command() -> Command {
     let mut cmd = resolved_command("kubectl");
+    apply_universal_env_strip(&mut cmd);
     for var in KUBECTL_STRIP_ENV {
         cmd.env_remove(var);
     }
@@ -3000,6 +3014,7 @@ const DOCKER_STRIP_ENV: &[&str] = &[
 
 pub fn secure_docker_command() -> Command {
     let mut cmd = resolved_command("docker");
+    apply_universal_env_strip(&mut cmd);
     for var in DOCKER_STRIP_ENV {
         cmd.env_remove(var);
     }
@@ -3032,6 +3047,7 @@ const AWS_STRIP_ENV: &[&str] = &[
 
 pub fn secure_aws_command() -> Command {
     let mut cmd = resolved_command("aws");
+    apply_universal_env_strip(&mut cmd);
     for var in AWS_STRIP_ENV {
         cmd.env_remove(var);
     }
@@ -3071,6 +3087,7 @@ const PSQL_STRIP_ENV: &[&str] = &[
 
 pub fn secure_psql_command() -> Command {
     let mut cmd = resolved_command("psql");
+    apply_universal_env_strip(&mut cmd);
     for var in PSQL_STRIP_ENV {
         cmd.env_remove(var);
     }
@@ -3101,6 +3118,7 @@ const CURL_STRIP_ENV: &[&str] = &["CURL_HOME"];
 
 pub fn secure_curl_command() -> Command {
     let mut cmd = resolved_command("curl");
+    apply_universal_env_strip(&mut cmd);
     for var in CURL_STRIP_ENV {
         cmd.env_remove(var);
     }
@@ -3196,6 +3214,7 @@ const WGET_STRIP_ENV: &[&str] = &["WGETRC"];
 
 pub fn secure_wget_command() -> Command {
     let mut cmd = resolved_command("wget");
+    apply_universal_env_strip(&mut cmd);
     for var in WGET_STRIP_ENV {
         cmd.env_remove(var);
     }
