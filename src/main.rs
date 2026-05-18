@@ -51,10 +51,13 @@ pub enum AgentTarget {
 
 #[derive(Parser)]
 #[command(
-    name = "rtk",
+    // Downstream rebrand: clap's `name` overrides the package name in
+    // --version / --help output. Keep this in lock-step with Cargo.toml
+    // `name` so `contextcrawler --version` doesn't print "rtk". See #22.
+    name = "contextcrawler",
     version,
-    about = "Rust Token Killer - Minimize LLM token consumption",
-    long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
+    about = "ContextCrawler — token-optimized CLI proxy for LLM agents",
+    long_about = "Downstream of rtk-ai/rtk: filters and compresses command output before it reaches your LLM context, with the contextzip session compactor and an opt-in Tirith defense-in-depth gate."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -1563,6 +1566,26 @@ where
     }
 }
 
+
+#[cfg(test)]
+mod cli_branding_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_cli_name_pinned_to_contextcrawler() {
+        // REGRESSION GUARD (issue #22). The clap `name` attribute drives
+        // `--version` / `--help` output. The downstream rebrand requires
+        // it to read "contextcrawler", not the upstream "rtk". A previous
+        // rebase silently flipped this with no test to catch it.
+        let cmd = Cli::command();
+        assert_eq!(
+            cmd.get_name(),
+            "contextcrawler",
+            "branding regression: see issue #22"
+        );
+    }
+}
 
 #[cfg(test)]
 mod grep_format_flag_tests {
