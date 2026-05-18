@@ -54,3 +54,7 @@ local/
 .claude/
 .github/
 .rtk/
+
+# bench harness output (tests/harness_standalone.rs) — see issue #29
+bench/results-*.json
+bench/results-*.md
