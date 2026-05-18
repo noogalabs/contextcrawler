@@ -1,0 +1,23 @@
+# Tier 2 (Claude Code hook) bench fixtures — one command per line.
+#
+# Each command is fed through `contextcrawler hook claude` wrapped in a
+# synthetic Claude Code PreToolUse envelope. The harness records what the
+# hook rewrote it to, then runs BOTH the raw command and the rewritten
+# command in a sandbox and compares output token counts to compute the
+# real end-to-end savings the user would have seen.
+#
+# Lines beginning with `#` are skipped. Blank lines are skipped. Commands
+# are expected to be read-only and safe to run inside the repo working
+# tree — no mutating git ops, no network, no installs.
+#
+# Selection criteria: representative load (read-heavy, list-heavy,
+# structured-output) and bounded runtime (each under ~5s on a dev box).
+
+git status
+git log -5 --oneline
+git diff HEAD~1 --stat
+head -50 src/main.rs
+ls -la src/
+grep -rn secure_command src/core/utils.rs
+find . -maxdepth 3 -name *.rs -path ./src/*
+htop
