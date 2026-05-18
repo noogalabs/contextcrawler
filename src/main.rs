@@ -211,6 +211,13 @@ enum Commands {
 
     /// Run command and show only errors/warnings
     Err {
+        /// Opt into `sh -c` semantics. Default is argv-mode which rejects
+        /// shell metacharacters (`|;&<>$`...) and shell binaries (`sh`,
+        /// `bash`, `env`, `sudo`, ...) for GHSA-3mmh-86cm-g6w4. Use
+        /// `--shell` when you need pipes, redirects, or chains and trust
+        /// the command source.
+        #[arg(long)]
+        shell: bool,
         /// Command to run
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -218,6 +225,10 @@ enum Commands {
 
     /// Run tests and show only failures
     Test {
+        /// Opt into `sh -c` semantics. See `err --shell` for the security
+        /// rationale.
+        #[arg(long)]
+        shell: bool,
         /// Test command (e.g. cargo test)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -293,6 +304,10 @@ enum Commands {
 
     /// Run command and show heuristic summary
     Summary {
+        /// Opt into `sh -c` semantics. See `err --shell` for the security
+        /// rationale.
+        #[arg(long)]
+        shell: bool,
         /// Command to run and summarize
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -643,10 +658,19 @@ enum Commands {
         /// List all trusted projects
         #[arg(long)]
         list: bool,
+        /// Operate on the user-global `~/.config/contextcrawler/filters.toml`
+        /// instead of project-local `.rtk/filters.toml`. Closes the H-3
+        /// audit gap (v0.1.6) by exposing the global trust gate to the CLI.
+        #[arg(long)]
+        global: bool,
     },
 
     /// Revoke trust for project-local TOML filters
-    Untrust,
+    Untrust {
+        /// Operate on the user-global filter store. See `trust --global`.
+        #[arg(long)]
+        global: bool,
+    },
 
     /// Verify hook integrity and run TOML filter inline tests
     Verify {
@@ -1640,17 +1664,14 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Err { command } => {
+        Commands::Err { command, shell } => {
             let cmd = command.join(" ");
-            // TODO(post-rebase): restore --shell CLI flag plumbing.
-            // For now default to argv-mode (use_shell=false) — preserves
-            // GHSA-3mmh-86cm-g6w4 argv guard.
-            runner::run_err(&cmd, false, cli.verbose)?
+            runner::run_err(&cmd, shell, cli.verbose)?
         }
 
-        Commands::Test { command } => {
+        Commands::Test { command, shell } => {
             let cmd = command.join(" ");
-            runner::run_test(&cmd, false, cli.verbose)?
+            runner::run_test(&cmd, shell, cli.verbose)?
         }
 
         Commands::Json {
@@ -1765,9 +1786,9 @@ fn run_cli() -> Result<i32> {
             KubectlCommands::Other(args) => container::run_kubectl_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Summary { command } => {
+        Commands::Summary { command, shell } => {
             let cmd = command.join(" ");
-            summary::run(&cmd, false, cli.verbose)?
+            summary::run(&cmd, shell, cli.verbose)?
         }
 
         Commands::Grep {
@@ -2413,17 +2434,13 @@ fn run_cli() -> Result<i32> {
             core::utils::exit_code_from_status(&status, &cmd_name)
         }
 
-        Commands::Trust { list } => {
-            // TODO(post-rebase): restore --global CLI flag plumbing.
-            // For now default to project-local trust (global=false). The
-            // v0.1.6 H-3 global trust gate is intact in trust.rs; only the
-            // CLI surface for managing it is deferred.
-            hooks::trust::run_trust(list, false)?;
+        Commands::Trust { list, global } => {
+            hooks::trust::run_trust(list, global)?;
             0
         }
 
-        Commands::Untrust => {
-            hooks::trust::run_untrust(false)?;
+        Commands::Untrust { global } => {
+            hooks::trust::run_untrust(global)?;
             0
         }
 

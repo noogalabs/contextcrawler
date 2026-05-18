@@ -334,19 +334,17 @@ fn main() {{
         assert!(output.contains("more lines"));
     }
 
-    // TODO(post-rebase): upstream xcstrings → JSON compression path returns 0%
-    // savings on the rebased fork (input == output). Investigation needed:
-    // either Language::from_extension("xcstrings") returns Unknown or the
-    // JSON-path branch isn't wired through render_output here. Likely a
-    // post-merge integration gap, not a fork-introduced regression.
     #[test]
-    #[ignore]
     fn test_render_output_xcstrings_uses_json_path() {
+        // Build 1000 array entries with commas between them, no trailing
+        // comma before `]` (the upstream version had one — invalid JSON per
+        // serde_json strict parse, which is what filter_json_compact uses).
         let mut entries = String::from("{\n  \"entries\": [\n");
         for i in 0..1_000usize {
+            let sep = if i + 1 < 1_000 { "," } else { "" };
             entries.push_str(&format!(
-                "    {{\"id\": {}, \"value\": \"entry-{:04}\"}},\n",
-                i, i
+                "    {{\"id\": {}, \"value\": \"entry-{:04}\"}}{}\n",
+                i, i, sep
             ));
         }
         entries.push_str("  ]\n}\n");
@@ -376,7 +374,14 @@ fn main() {{
             output_tokens,
             output
         );
-        assert!(output.contains("\"entries\""));
+        // compact_json renders Object keys unquoted (`entries:`), not
+        // `"entries":`. Match either form so this test stays robust if the
+        // formatter is later changed to quote keys.
+        assert!(
+            output.contains("entries:") || output.contains("\"entries\""),
+            "output should reference the entries key, got:\n{}",
+            output
+        );
         assert!(output.contains("... +"));
     }
 
