@@ -4815,6 +4815,26 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_template_pins_gap_patterns() {
+        // REGRESSION GUARD (issue #53). The codex AGENTS.md template MUST
+        // explicitly cover the three gap patterns measured in the post-v0.1.8
+        // compliance audit:
+        //   - `nl -ba … | sed -n` (composed pipe, ~35 raw/24h)
+        //   - `git -C <dir>` (cross-directory git, ~25 raw/24h)
+        //   - `rg -n` (short rg form, ~11 raw/24h)
+        // If you're editing the template, KEEP these patterns — removing them
+        // regresses the codex compliance lift driven by #53. Read the issue
+        // before changing this assertion.
+        for needle in &["git -C ", "rg -n ", "nl -ba "] {
+            assert!(
+                RTK_SLIM_CODEX.contains(needle),
+                "codex template missing gap pattern '{}' — see issue #53",
+                needle
+            );
+        }
+    }
+
+    #[test]
     fn test_cleanup_legacy_codex_files_removes_orphan_rtk_md() {
         let temp = TempDir::new().unwrap();
         let agents_md = temp.path().join("AGENTS.md");

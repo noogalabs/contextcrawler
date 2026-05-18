@@ -592,6 +592,11 @@ enum Commands {
         /// Output format: text, json
         #[arg(short, long, default_value = "text")]
         format: String,
+        /// Scan Codex CLI job logs instead of Claude Code sessions
+        /// (~/.claude/plugins/data/codex-openai-codex/state/*/jobs/*.log).
+        /// Reports `contextcrawler ` prefix compliance %.
+        #[arg(long, conflicts_with_all = ["project", "all"])]
+        codex: bool,
     },
 
     /// Show RTK adoption across Claude Code sessions
@@ -1415,6 +1420,80 @@ enum GtCommands {
 /// e.g. `git log --format="%H %s"` → ["git", "log", "--format=%H %s"]
 fn shell_split(input: &str) -> Vec<String> {
     discover::lexer::shell_split(input)
+}
+
+/// `true` when the proxy nudge should be printed to stderr. Three independent
+/// suppression knobs (any one silences the nudge): explicit env opt-out,
+/// `CI=*` env marker, stderr is not a tty. The override env var can carry
+/// any value — empty string still suppresses.
+fn should_emit_proxy_nudge() -> bool {
+    use std::io::IsTerminal;
+
+    if std::env::var_os("CONTEXTCRAWLER_NO_PROXY_NUDGE").is_some() {
+        return false;
+    }
+    if std::env::var_os("CI").is_some() {
+        return false;
+    }
+    if !std::io::stderr().is_terminal() {
+        return false;
+    }
+    true
+}
+
+/// Returns the suggested wrapped invocation if `tool` has a `contextcrawler`
+/// equivalent. Drives the nudge in `Commands::Proxy`. Keep this list aligned
+/// with `WRAPPED_TOOLS` in `discover::codex` — if we add a wrapper there,
+/// callers should be steered here too.
+///
+/// Returns the literal text to suggest (e.g. `contextcrawler git`) so the
+/// caller can format `Consider: <suggestion>` without re-templating.
+fn proxy_wrapped_equivalent(tool: &str) -> Option<&'static str> {
+    match tool {
+        "git" => Some("contextcrawler git ..."),
+        "gh" => Some("contextcrawler gh ..."),
+        "glab" => Some("contextcrawler glab ..."),
+        "gt" => Some("contextcrawler gt ..."),
+        "rg" => Some("contextcrawler rg ..."),
+        "grep" => Some("contextcrawler grep ..."),
+        "find" => Some("contextcrawler find ..."),
+        "ls" => Some("contextcrawler ls ..."),
+        "tree" => Some("contextcrawler tree ..."),
+        "wc" => Some("contextcrawler wc ..."),
+        "diff" => Some("contextcrawler diff ..."),
+        "cat" | "head" | "tail" | "nl" => Some(
+            "contextcrawler read <file> (use -n for line numbers, --max-lines / --tail for range)",
+        ),
+        "sed" | "awk" => Some(
+            "contextcrawler read <file> for slice/line-number patterns; \
+             leave on proxy only if you genuinely need stream editing",
+        ),
+        "cargo" => Some("contextcrawler cargo ..."),
+        "npm" => Some("contextcrawler npm ..."),
+        "pnpm" => Some("contextcrawler pnpm ..."),
+        "yarn" => Some("contextcrawler yarn ..."),
+        "pytest" => Some("contextcrawler pytest ..."),
+        "ruff" => Some("contextcrawler ruff ..."),
+        "black" => Some("contextcrawler black ..."),
+        "mypy" => Some("contextcrawler mypy ..."),
+        "tsc" => Some("contextcrawler tsc ..."),
+        "vitest" => Some("contextcrawler vitest ..."),
+        "jest" => Some("contextcrawler jest ..."),
+        "prettier" => Some("contextcrawler prettier ..."),
+        "docker" => Some("contextcrawler docker ..."),
+        "kubectl" => Some("contextcrawler kubectl ..."),
+        "aws" => Some("contextcrawler aws ..."),
+        "psql" => Some("contextcrawler psql ..."),
+        "curl" => Some("contextcrawler curl ..."),
+        "wget" => Some("contextcrawler wget ..."),
+        "dotnet" => Some("contextcrawler dotnet ..."),
+        "go" => Some("contextcrawler go ..."),
+        "ruby" => Some("contextcrawler ruby ..."),
+        "rake" => Some("contextcrawler rake ..."),
+        "rspec" => Some("contextcrawler rspec ..."),
+        "rubocop" => Some("contextcrawler rubocop ..."),
+        _ => None,
+    }
 }
 
 /// Merge pnpm global filters args with other ones for standard String-based commands
@@ -2442,8 +2521,13 @@ fn run_cli() -> Result<i32> {
             all,
             since,
             format,
+            codex,
         } => {
-            discover::run(project.as_deref(), all, since, limit, &format, cli.verbose)?;
+            if codex {
+                discover::run_codex(since, &format)?;
+            } else {
+                discover::run(project.as_deref(), all, since, limit, &format, cli.verbose)?;
+            }
             0
         }
 
@@ -2685,6 +2769,31 @@ fn run_cli() -> Result<i32> {
                 eprintln!("Proxy mode: {} {}", cmd_name, cmd_args.join(" "));
             }
 
+            // Nudge: if the proxied tool has a wrapped equivalent, point the
+            // caller at it. The wrap exists for a reason (token-savings filter
+            // + env-strip + arg deny-list), and `proxy <wrapped-tool>` is
+            // currently the #1 token leak in the dashboard. Don't auto-rewrite
+            // — measure adoption of the nudge first.
+            //
+            // Suppression order (any one silences the nudge):
+            //   1. `CONTEXTCRAWLER_NO_PROXY_NUDGE=<anything>` — explicit opt-out
+            //   2. `CI=<anything>` — common CI marker (GitHub Actions, GitLab,
+            //      CircleCI, Travis all set this) so pipeline stderr stays clean
+            //   3. stderr not a tty — script/pipe consumer can't act on the nudge
+            if should_emit_proxy_nudge() {
+                let basename = std::path::Path::new(&cmd_name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&cmd_name);
+                if let Some(suggestion) = proxy_wrapped_equivalent(basename) {
+                    eprintln!(
+                        "[contextcrawler] note: `proxy {basename}` bypasses the wrapped filter. \
+                         Consider: `{suggestion}`. \
+                         Set CONTEXTCRAWLER_NO_PROXY_NUDGE=1 to suppress."
+                    );
+                }
+            }
+
             // ISSUE #897: Kill proxy child on SIGINT/SIGTERM to prevent orphan
             // processes. Drop-based ChildGuard doesn't run on signals with
             // panic=abort, so we register a signal handler that kills the child
@@ -2922,6 +3031,49 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::cell::Cell;
+
+    #[test]
+    fn test_proxy_wrapped_equivalent_known_tools() {
+        // Sanity: every tool in the codex template's "Applies to:" list should
+        // either have a wrapper hint here or be intentionally absent. This
+        // assertion just spot-checks the gap-pattern tools from issue #53.
+        assert!(proxy_wrapped_equivalent("git").is_some());
+        assert!(proxy_wrapped_equivalent("rg").is_some());
+        assert!(proxy_wrapped_equivalent("nl").is_some());
+        assert!(proxy_wrapped_equivalent("sed").is_some());
+        assert!(proxy_wrapped_equivalent("awk").is_some());
+        assert!(proxy_wrapped_equivalent("kubectl").is_some());
+        // Negative cases — the nudge should stay quiet for tools we don't wrap.
+        assert!(proxy_wrapped_equivalent("whoami").is_none());
+        assert!(proxy_wrapped_equivalent("date").is_none());
+        assert!(proxy_wrapped_equivalent("env").is_none());
+    }
+
+    #[test]
+    fn test_proxy_wrapped_equivalent_message_does_not_recurse() {
+        // REGRESSION: the first draft templated `contextcrawler {basename}`
+        // around the suggestion, producing "contextcrawler contextcrawler read".
+        // Suggestions now embed the literal command, so the eprintln template
+        // is just `Consider: {suggestion}`. If a suggestion starts with
+        // "contextcrawler" it should be the first token, never repeated.
+        for tool in &["git", "rg", "nl", "sed", "kubectl"] {
+            let suggestion = proxy_wrapped_equivalent(tool).unwrap();
+            // First word is "contextcrawler"; "contextcrawler" should NOT appear twice.
+            assert!(
+                suggestion.starts_with("contextcrawler "),
+                "suggestion for `{}` should start with 'contextcrawler ': {}",
+                tool,
+                suggestion
+            );
+            assert_eq!(
+                suggestion.matches("contextcrawler").count(),
+                1,
+                "suggestion for `{}` repeats 'contextcrawler': {}",
+                tool,
+                suggestion
+            );
+        }
+    }
 
     #[test]
     fn test_git_commit_single_message() {

@@ -1,5 +1,6 @@
 //! Scans AI coding sessions to find commands that could benefit from RTK filtering.
 
+pub mod codex;
 pub mod lexer;
 pub mod provider;
 pub mod registry;
@@ -269,6 +270,20 @@ pub fn run(
         _ => print!("{}", report::format_text(&report, limit, verbose > 0)),
     }
 
+    Ok(())
+}
+
+/// Scan codex job logs and print a compliance report.
+///
+/// Reports `wrapped / total` commands and the top raw-command patterns
+/// that should be added to the AGENTS.md template. Mirrors the Claude
+/// `discover` flow but for codex job logs instead of session jsonl.
+pub fn run_codex(since_days: u64, format: &str) -> Result<()> {
+    let report = codex::scan(None, Some(since_days))?;
+    match format {
+        "json" => println!("{}", codex::format_json(&report)),
+        _ => print!("{}", codex::format_text(&report)),
+    }
     Ok(())
 }
 
