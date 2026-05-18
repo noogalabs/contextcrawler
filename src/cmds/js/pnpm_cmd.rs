@@ -2,8 +2,8 @@
 
 use crate::core::stream::{exec_capture, CaptureResult};
 use crate::core::tracking;
-use crate::core::utils::resolved_command;
-use anyhow::{Context, Result};
+use crate::core::utils::{check_forbidden_node_args, secure_node_command};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -309,7 +309,10 @@ pub fn run(cmd: PnpmCommand, args: &[String], verbose: u8) -> Result<i32> {
 fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = resolved_command("pnpm");
+    // Issue #37: gate user-forwarded args before they reach pnpm.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
+    let mut cmd = secure_node_command("pnpm");
     cmd.arg("list");
     cmd.arg(format!("--depth={}", depth));
     cmd.arg("--json");
@@ -367,7 +370,10 @@ fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
 fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = resolved_command("pnpm");
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
+    let mut cmd = secure_node_command("pnpm");
     cmd.arg("outdated");
     cmd.arg("--format");
     cmd.arg("json");
@@ -421,7 +427,10 @@ fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
 fn run_install(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = resolved_command("pnpm");
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
+    let mut cmd = secure_node_command("pnpm");
     cmd.arg("install");
 
     for arg in args {

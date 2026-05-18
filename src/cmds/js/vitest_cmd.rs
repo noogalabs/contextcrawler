@@ -1,12 +1,12 @@
 //! Filters Vitest test output to show only failures.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{package_manager_exec, strip_ansi};
+use crate::core::utils::{check_forbidden_node_args, package_manager_exec, strip_ansi};
 use crate::parser::{
     emit_degradation_warning, emit_passthrough_warning, extract_json_object, truncate_passthrough,
     FormatMode, OutputParser, ParseResult, TestFailure, TestResult, TokenFormatter,
@@ -206,6 +206,9 @@ fn extract_failures_regex(output: &str) -> Vec<TestFailure> {
 
 pub fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+
+    // Issue #37: gate user-forwarded args before they reach vitest/jest.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
 
     let (framework, mut cmd) = match command {
         Commands::Vitest { .. } => {

@@ -2,8 +2,8 @@
 
 use crate::core::stream::{exec_capture, CaptureResult};
 use crate::core::tracking;
-use crate::core::utils::{resolved_command, tool_exists};
-use anyhow::{Context, Result};
+use crate::core::utils::{check_forbidden_node_args, secure_node_command, tool_exists};
+use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 
 /// If `exec_capture` truncated either stream, emit the raw prefix as
@@ -49,12 +49,15 @@ pub fn run(cmd: PrismaCommand, args: &[String], verbose: u8) -> Result<i32> {
     }
 }
 
-/// Create a Command that will run prisma (tries global first, then npx)
+/// Create a Command that will run prisma (tries global first, then npx).
+///
+/// Routed through `secure_node_command` so `NODE_OPTIONS`, `NPM_CONFIG_*`,
+/// and `PRISMA_*_BINARY` are stripped from the child env (issue #37).
 fn create_prisma_command() -> Command {
     if tool_exists("prisma") {
-        resolved_command("prisma")
+        secure_node_command("prisma")
     } else {
-        let mut c = resolved_command("npx");
+        let mut c = secure_node_command("npx");
         c.arg("prisma");
         c
     }
@@ -62,6 +65,9 @@ fn create_prisma_command() -> Command {
 
 fn run_generate(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
 
     let mut cmd = create_prisma_command();
     cmd.arg("generate");
@@ -103,6 +109,9 @@ fn run_generate(args: &[String], verbose: u8) -> Result<i32> {
 
 fn run_migrate(subcommand: MigrateSubcommand, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
 
     let mut cmd = create_prisma_command();
     cmd.arg("migrate");
@@ -166,6 +175,9 @@ fn run_migrate(subcommand: MigrateSubcommand, args: &[String], verbose: u8) -> R
 
 fn run_db_push(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
 
     let mut cmd = create_prisma_command();
     cmd.arg("db").arg("push");

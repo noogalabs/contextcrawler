@@ -1,10 +1,13 @@
 //! Filters Prettier output to show only files that need formatting.
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::package_manager_exec;
-use anyhow::Result;
+use crate::core::utils::{check_forbidden_node_args, package_manager_exec};
+use anyhow::{anyhow, Result};
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Issue #37.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
     let mut cmd = package_manager_exec("prettier");
 
     for arg in args {

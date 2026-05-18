@@ -1,8 +1,8 @@
 //! Filters npm output and auto-injects the "run" subcommand when appropriate.
 
 use crate::core::runner;
-use crate::core::utils::resolved_command;
-use anyhow::Result;
+use crate::core::utils::{check_forbidden_node_args, secure_node_command};
+use anyhow::{anyhow, Result};
 
 /// Known npm subcommands that should NOT get "run" injected.
 /// Shared between production code and tests to avoid drift.
@@ -109,7 +109,10 @@ pub fn exec(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
 /// emits the verbose log line, and routes through `runner::run_filtered` with
 /// the npm output filter.
 fn run_filtered(name: &str, args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
-    let mut cmd = resolved_command(name);
+    // Issue #37: refuse user-supplied path-loading flags before spawning.
+    check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+
+    let mut cmd = secure_node_command(name);
     for arg in args {
         cmd.arg(arg);
     }
