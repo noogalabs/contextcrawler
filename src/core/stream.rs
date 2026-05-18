@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 #[cfg(test)]
 use regex::Regex;
@@ -531,14 +533,129 @@ impl CaptureResult {
     }
 }
 
-pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
+/// Default per-stream cap for `exec_capture*`. A runaway child filling
+/// stdout/stderr could otherwise OOM the host. 64 MiB matches the upper
+/// bound used by the tirith gate hardening (v0.1.6 `b4c93c3`).
+pub const DEFAULT_CAPTURE_STREAM_MAX: u64 = 64 * 1024 * 1024;
+
+/// Limits applied to `exec_capture_with_limits`.
+///
+/// `Default` uses generous caps (64 MiB / 64 MiB) and no wall-clock
+/// timeout — appropriate for user-driven filter runs (`rtk cargo test`,
+/// `rtk pnpm install`) where the user has explicit context and can ^C.
+/// Hook-path callers should use `exec_capture_short` instead, which sets
+/// `timeout = Some(_)` so a hung child cannot freeze the agent.
+pub struct CaptureLimits {
+    pub stdout_max: u64,
+    pub stderr_max: u64,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for CaptureLimits {
+    fn default() -> Self {
+        Self {
+            stdout_max: DEFAULT_CAPTURE_STREAM_MAX,
+            stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+            timeout: None,
+        }
+    }
+}
+
+/// Capture a child's stdout/stderr with explicit caps and optional
+/// wall-clock timeout. stdin is always nulled (callers that need to feed
+/// stdin should use `run_streaming` with `StdinMode::Filter`).
+///
+/// Caps fire silently: the returned `CaptureResult` contains the
+/// truncated prefix and the child runs to completion. A timeout, by
+/// contrast, returns `Err` — the caller decides fallback.
+pub fn exec_capture_with_limits(
+    cmd: &mut Command,
+    limits: CaptureLimits,
+) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
-    let output = cmd.output().context("Failed to execute command")?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("Failed to execute command")?;
+
+    // Drain stdout/stderr concurrently so a chatty child can't fill the
+    // ~64 KiB kernel pipe buffer and deadlock either us or itself.
+    let stdout_handle = child.stdout.take().context("No child stdout handle")?;
+    let stderr_handle = child.stderr.take().context("No child stderr handle")?;
+    let stdout_max = limits.stdout_max;
+    let stderr_max = limits.stderr_max;
+    let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = stdout_handle.take(stdout_max).read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = stderr_handle.take(stderr_max).read_to_end(&mut buf);
+        buf
+    });
+
+    let status = match limits.timeout {
+        Some(deadline) => match child.wait_timeout(deadline) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Child exceeded the deadline. Kill, reap, drain threads,
+                // then surface as Err so the caller can fall back.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                anyhow::bail!(
+                    "command exceeded wall-clock budget of {:?}",
+                    deadline
+                );
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(anyhow::Error::from(e)
+                    .context("wait_timeout on child process failed"));
+            }
+        },
+        None => child.wait().context("Failed to wait on child")?,
+    };
+
+    let stdout_buf = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))?;
+    let stderr_buf = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))?;
+
     Ok(CaptureResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: status_to_exit_code(output.status),
+        stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+        exit_code: status_to_exit_code(status),
     })
+}
+
+/// Capture with default limits — 64 MiB per stream, no wall-clock deadline.
+/// Use for user-driven commands where the user can ^C themselves.
+pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
+    exec_capture_with_limits(cmd, CaptureLimits::default())
+}
+
+/// Capture with a wall-clock deadline. Use this from hook-path callers
+/// (PreToolUse, integrity check, anything Claude Code waits on
+/// synchronously) so a hung child cannot freeze the agent.
+///
+/// Returns `Err` on timeout; callers should treat that as "subprocess
+/// unavailable" and fall back, the same shape `tirith_gate::check` uses.
+pub fn exec_capture_short(cmd: &mut Command, timeout: Duration) -> Result<CaptureResult> {
+    exec_capture_with_limits(
+        cmd,
+        CaptureLimits {
+            timeout: Some(timeout),
+            ..CaptureLimits::default()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1025,6 +1142,7 @@ pub(crate) mod tests {
         );
     }
 
+<<<<<<< HEAD
     struct CountingLineHandler {
         observed: Vec<String>,
         skip_prefixes: Vec<String>,
@@ -1116,5 +1234,118 @@ pub(crate) mod tests {
         let result = run_line_filter(&mut f, "DROP a\nDROP b\nkeep\n", 0);
         // Only "keep" was observed, so summary says "1 kept"
         assert!(result.contains("demo: 1 kept"), "got: {}", result);
+    }
+
+    // -----------------------------------------------------------------
+    // exec_capture* limits and timeout coverage.
+    // See docs/security/AUDIT-subprocess-timeouts.md (F-01, F-02, F-04).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_exec_capture_short_times_out() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let err = match exec_capture_short(&mut cmd, Duration::from_millis(500)) {
+            Ok(_) => panic!("should error on timeout"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should return promptly after timeout, took {:?}",
+            elapsed
+        );
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("wall-clock") || msg.contains("budget"),
+            "error should mention the deadline, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_exec_capture_short_returns_normally_when_under_deadline() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hi");
+        let r = exec_capture_short(&mut cmd, Duration::from_secs(5)).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("hi"));
+    }
+
+    #[test]
+    fn test_exec_capture_caps_stdout() {
+        // Print ~512 KiB but cap at 4 KiB. Output should be exactly the cap.
+        // We use `yes` piped through `head` to bound the child's own work too.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "yes ABCDEFGHIJKLMNOPQRSTUVWXYZ | head -c 524288",
+        ]);
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: 4096,
+                stderr_max: DEFAULT_CAPTURE_STREAM_MAX,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .unwrap();
+        assert!(
+            r.stdout.len() <= 4096,
+            "stdout should be capped at 4 KiB, got {} bytes",
+            r.stdout.len()
+        );
+        // The child will typically receive SIGPIPE once we stop reading
+        // (drain thread drops the pipe handle on cap-hit), so exit_code
+        // may legitimately be 141 (128 + SIGPIPE). That's the *desired*
+        // outcome — runaway children die — but it means we can't assert
+        // exit_code == 0 here. The contract is: cap is enforced and we
+        // return successfully (no Err). Either is acceptable.
+    }
+
+    #[test]
+    fn test_exec_capture_caps_stderr_independently() {
+        // Flood stderr only; stdout stays empty.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "yes ZZZZZZZZZZZZZZZZZZZZZZZZ 1>&2 | head -c 524288 1>&2",
+        ]);
+        let r = exec_capture_with_limits(
+            &mut cmd,
+            CaptureLimits {
+                stdout_max: DEFAULT_CAPTURE_STREAM_MAX,
+                stderr_max: 2048,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .unwrap();
+        assert!(
+            r.stderr.len() <= 2048,
+            "stderr should be capped at 2 KiB, got {} bytes",
+            r.stderr.len()
+        );
+        assert!(r.stdout.is_empty(), "stdout should remain empty");
+    }
+
+    #[test]
+    fn test_exec_capture_default_unchanged_for_short_output() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello world");
+        let r = exec_capture(&mut cmd).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("hello world"));
+        assert!(r.stderr.is_empty());
+    }
+
+    #[test]
+    fn test_capture_limits_default_values() {
+        let d = CaptureLimits::default();
+        assert_eq!(d.stdout_max, DEFAULT_CAPTURE_STREAM_MAX);
+        assert_eq!(d.stderr_max, DEFAULT_CAPTURE_STREAM_MAX);
+        assert!(d.timeout.is_none(), "default = no wall-clock deadline");
     }
 }
