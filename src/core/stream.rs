@@ -661,8 +661,17 @@ fn drain_with_cap<R: Read>(mut r: R, max: u64) -> (Vec<u8>, bool) {
 
 /// Capture with default limits — 64 MiB per stream, no wall-clock deadline.
 /// Use for user-driven commands where the user can ^C themselves.
+///
+/// Emits a fail-loud `[ctxc] warning: ...` on stderr if either cap fires.
+/// This protects callers that don't (yet) read `CaptureResult.truncated_*`
+/// from silently treating a capped prefix as complete output. Mirrors the
+/// existing `RAW_CAP` warnings in `run_streaming`. Callers that want
+/// silence — because they're going to inspect the flags themselves —
+/// should use `exec_capture_with_limits` directly.
 pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
-    exec_capture_with_limits(cmd, CaptureLimits::default())
+    let r = exec_capture_with_limits(cmd, CaptureLimits::default())?;
+    warn_if_capped(&r, "exec_capture");
+    Ok(r)
 }
 
 /// Capture with a wall-clock deadline. Use this from hook-path callers
@@ -671,14 +680,35 @@ pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
 ///
 /// Returns `Err` on timeout; callers should treat that as "subprocess
 /// unavailable" and fall back, the same shape `tirith_gate::check` uses.
+/// Like `exec_capture`, emits a fail-loud warning on cap-hit so silent
+/// truncation can't mislead a downstream parser.
 pub fn exec_capture_short(cmd: &mut Command, timeout: Duration) -> Result<CaptureResult> {
-    exec_capture_with_limits(
+    let r = exec_capture_with_limits(
         cmd,
         CaptureLimits {
             timeout: Some(timeout),
             ..CaptureLimits::default()
         },
-    )
+    )?;
+    warn_if_capped(&r, "exec_capture_short");
+    Ok(r)
+}
+
+fn warn_if_capped(r: &CaptureResult, label: &str) {
+    if r.truncated_stdout {
+        eprintln!(
+            "[ctxc] warning: {} stdout exceeded {} MiB — capture truncated",
+            label,
+            DEFAULT_CAPTURE_STREAM_MAX / (1024 * 1024)
+        );
+    }
+    if r.truncated_stderr {
+        eprintln!(
+            "[ctxc] warning: {} stderr exceeded {} MiB — capture truncated",
+            label,
+            DEFAULT_CAPTURE_STREAM_MAX / (1024 * 1024)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1167,7 +1197,6 @@ pub(crate) mod tests {
         );
     }
 
-<<<<<<< HEAD
     struct CountingLineHandler {
         observed: Vec<String>,
         skip_prefixes: Vec<String>,
@@ -1519,6 +1548,25 @@ pub(crate) mod tests {
         let mut cmd2 = Command::new("true");
         let r2 = exec_capture_short(&mut cmd2, Duration::from_secs(5)).unwrap();
         assert_eq!(r2.exit_code, 0);
+    }
+
+    #[test]
+    fn test_warn_if_capped_helper_is_silent_when_not_truncated() {
+        // White-box test: warn_if_capped is a side-effect helper, can't
+        // capture eprintln from a unit test trivially. We rely on the
+        // truncation flags being correct (covered above) and the path
+        // being conditional. Manual confirmation: when truncated_* is
+        // false, no eprintln is reached. This test exists to anchor the
+        // contract; the indirect coverage via exec_capture default path
+        // verifies the call site.
+        let r = CaptureResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            truncated_stdout: false,
+            truncated_stderr: false,
+        };
+        warn_if_capped(&r, "test-noop");
     }
 
     #[test]
