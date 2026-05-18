@@ -26,7 +26,11 @@ fn manifest_dir() -> PathBuf {
 }
 
 fn binary_path() -> PathBuf {
-    manifest_dir().join("target/debug/contextcrawler")
+    // Use Cargo's CARGO_BIN_EXE_<name> env var — set automatically for
+    // integration tests, picks up CARGO_TARGET_DIR / release builds /
+    // workspace layouts correctly. Avoids the stale-binary trap of
+    // hardcoding `target/debug/contextcrawler`. See codex review on #29.
+    PathBuf::from(env!("CARGO_BIN_EXE_contextcrawler"))
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -37,8 +41,14 @@ fn bench_dir() -> PathBuf {
     manifest_dir().join("bench")
 }
 
+/// Mirror of the production token estimator at `src/core/tracking.rs`'s
+/// `estimate_tokens()` — ~4 chars per token, ceiling. Kept in lock-step so
+/// the harness numbers are directly comparable to `contextcrawler gain` and
+/// the SQLite history DB. If `estimate_tokens` ever changes formula, this
+/// function MUST track it (or the bench numbers stop being comparable to
+/// production metrics — see codex review on #29).
 fn count_tokens(s: &str) -> usize {
-    s.split_whitespace().count()
+    (s.len() as f64 / 4.0).ceil() as usize
 }
 
 fn git_short_sha() -> String {
@@ -118,7 +128,10 @@ fn run_case(
     let start = Instant::now();
     let output = Command::new(&bin)
         .env("RTK_DB_PATH", db_path)
-        .env("RTK_NO_TELEMETRY", "1") // be polite, don't ping during bench
+        // Real opt-out env var checked in src/core/telemetry.rs — codex
+        // review on #29 caught that the previous draft used a non-existent
+        // `RTK_NO_TELEMETRY`, which silently did nothing.
+        .env("RTK_TELEMETRY_DISABLED", "1")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
