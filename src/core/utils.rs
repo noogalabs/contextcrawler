@@ -537,6 +537,165 @@ mod secure_rg_tests {
     }
 }
 
+// =====================================================================
+// Generalized zero-trust wrapped-CLI primitive (issue #39)
+// ---------------------------------------------------------------------
+// This is the GENERIC counterpart to `secure_rg_command` above. The
+// per-tool `secure_*_command` helpers will be refactored to use this in
+// a follow-up PR once the in-flight per-tool hardens (#34-#38) land.
+// For now the primitive lives alongside the per-tool helpers and is
+// only exercised by its own unit tests + any new spawn sites that
+// adopt it directly.
+//
+// Design notes
+//   - `UNIVERSAL_ENV_STRIP` removes loader / pager / lang-loader /
+//     shell-metaprogramming env vars from every wrapped command. These
+//     are the variables an upstream hostile env can use to hijack a
+//     subprocess regardless of which binary we spawn, so they're
+//     stripped unconditionally.
+//   - `BASH_FUNC_*` and `DYLD_*` are dynamic prefixes -- we walk
+//     `std::env::vars()` to catch any variable matching them, because
+//     enumerating every possible name is infeasible.
+//   - `ToolPolicy` is a static struct: tools register a const, the
+//     spawn site passes it to `secure_command_with_policy`. Both env
+//     stripping and arg validation are policy-driven; the rg helpers
+//     stay as the canonical worked example until the refactor PR.
+// =====================================================================
+
+/// Universal environment-variable strip list applied to every command
+/// spawned via [`secure_command_with_policy`]. These categories are
+/// process-agnostic: any of them can hijack execution regardless of
+/// which binary we're invoking, so we drop them unconditionally.
+///
+/// Categories covered:
+/// - Pager / editor invocation (`EDITOR`, `PAGER`, `LESS`, …)
+/// - Loader hijacks (`LD_PRELOAD`, `DYLD_*`, …)
+/// - Per-language loader injection (`PERL5OPT`, `LUA_INIT`, …)
+/// - Shell metaprogramming (`BASH_ENV`, `PROMPT_COMMAND`, `IFS`, …)
+///
+/// Dynamic prefixes (`BASH_FUNC_*`, `DYLD_*`) are stripped in
+/// [`secure_command_with_policy`] by walking the inherited environment.
+pub const UNIVERSAL_ENV_STRIP: &[&str] = &[
+    // Pager / editor
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "LESS",
+    "LESSOPEN",
+    "LESSCLOSE",
+    "MANPAGER",
+    // Loader hijacks (Linux + macOS)
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    // Lang loader injections
+    "PERL5OPT",
+    "PERL5LIB",
+    "LUA_INIT",
+    "LUA_PATH",
+    "LUA_CPATH",
+    // Shell metaprogramming
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+    "PROMPT_COMMAND",
+    "IFS",
+];
+
+/// Declarative policy for a wrapped CLI tool. Each tool ships a `const`
+/// of this type and the spawn site passes it to
+/// [`secure_command_with_policy`] + [`check_args_with_policy`].
+///
+/// Field semantics mirror [`check_forbidden_rg_args`]: `arg_deny_exact`
+/// is whole-string equality, `arg_deny_prefix` is `starts_with`, and
+/// `arg_deny_short_letters_in_bundle` rejects letters appearing inside
+/// a single-`-` all-alphabetic bundle (e.g. `-cz` for `z`).
+pub struct ToolPolicy {
+    pub name: &'static str,
+    pub env_strip: &'static [&'static str],
+    pub arg_deny_exact: &'static [&'static str],
+    pub arg_deny_prefix: &'static [&'static str],
+    pub arg_deny_short_letters_in_bundle: &'static [char],
+}
+
+/// Build a `Command` for `policy.name` with the universal env-strip list
+/// applied plus any tool-specific extras from `policy.env_strip`. Also
+/// removes any inherited env var matching the dynamic prefixes
+/// `BASH_FUNC_*` and `DYLD_*` (the latter is a belt-and-braces against
+/// macOS adding new `DYLD_*` knobs we haven't enumerated above).
+pub fn secure_command_with_policy(policy: &ToolPolicy) -> Command {
+    let mut cmd = resolved_command(policy.name);
+
+    // Universal static strip list
+    for var in UNIVERSAL_ENV_STRIP {
+        cmd.env_remove(var);
+    }
+
+    // Per-tool extras
+    for var in policy.env_strip {
+        cmd.env_remove(var);
+    }
+
+    // Dynamic prefixes: walk the inherited env once and strip anything
+    // matching BASH_FUNC_* (bash exported functions, used by Shellshock-
+    // class injection) or DYLD_* (any new macOS dynamic-loader knob not
+    // already in UNIVERSAL_ENV_STRIP).
+    for (key, _) in std::env::vars() {
+        if key.starts_with("BASH_FUNC_") || key.starts_with("DYLD_") {
+            cmd.env_remove(&key);
+        }
+    }
+
+    cmd
+}
+
+/// Generic equivalent of [`check_forbidden_rg_args`]: scans `args`
+/// against the three deny lists in `policy` and returns a user-facing
+/// error string on the first violation. Bundle detection mirrors the
+/// rg-specific helper for consistency.
+pub fn check_args_with_policy<S: AsRef<str>>(
+    policy: &ToolPolicy,
+    args: &[S],
+) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+
+        if policy.arg_deny_exact.iter().any(|f| a == *f) {
+            return Err(policy_deny_message(policy.name, a));
+        }
+
+        if policy.arg_deny_prefix.iter().any(|p| a.starts_with(p)) {
+            return Err(policy_deny_message(policy.name, a));
+        }
+
+        if a.starts_with('-') && !a.starts_with("--") && a.len() >= 2 {
+            let body = &a[1..];
+            if body.chars().all(|c| c.is_ascii_alphabetic())
+                && body
+                    .chars()
+                    .any(|c| policy.arg_deny_short_letters_in_bundle.contains(&c))
+            {
+                return Err(policy_deny_message(policy.name, a));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn policy_deny_message(tool: &str, offending: &str) -> String {
+    format!(
+        "[contextcrawler] refusing to forward '{}' to {} \u{2014} flag is on \
+         the deny list for this wrapped tool. If you genuinely need it, use: \
+         contextcrawler proxy {} <args>",
+        offending, tool, tool
+    )
+}
+
 /// Extract short name from AWS ARN.
 /// Example: `arn:aws:ecs:region:acct:service/cluster/name` -> `name`
 /// For simple ARNs like `arn:aws:iam::123:user/alice`, returns `alice`.
@@ -570,6 +729,145 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod policy_registry_tests {
+    use super::*;
+
+    /// Cheap, side-effect-free test tool. We never actually spawn
+    /// `echo` here -- the goal is to assert that the policy plumbing
+    /// (env strip + arg deny lists) does what we expect on a Command
+    /// we build but don't run.
+    const ECHO_POLICY: ToolPolicy = ToolPolicy {
+        name: "echo",
+        env_strip: &["ECHO_EXTRA_STRIP"],
+        arg_deny_exact: &["--exec", "-X"],
+        arg_deny_prefix: &["--exec="],
+        arg_deny_short_letters_in_bundle: &['X'],
+    };
+
+    #[test]
+    fn universal_env_strip_covers_known_categories() {
+        assert!(
+            !UNIVERSAL_ENV_STRIP.is_empty(),
+            "UNIVERSAL_ENV_STRIP must not be empty"
+        );
+
+        // Spot-check one representative entry from each category.
+        let must_contain = [
+            "PAGER",            // pager / editor
+            "EDITOR",
+            "LD_PRELOAD",       // loader hijacks (linux)
+            "DYLD_INSERT_LIBRARIES", // loader hijacks (mac)
+            "PERL5OPT",         // lang loader injection
+            "LUA_INIT",
+            "BASH_ENV",         // shell metaprogramming
+            "PROMPT_COMMAND",
+            "IFS",
+        ];
+        for var in must_contain {
+            assert!(
+                UNIVERSAL_ENV_STRIP.contains(&var),
+                "UNIVERSAL_ENV_STRIP missing required entry: {var}"
+            );
+        }
+    }
+
+    /// Serializes tests that mutate process-global env (codex P3 catch on
+    /// the original #39 draft — without this, parallel test execution can
+    /// observe these vars and leak them into unrelated subprocess tests).
+    static GLOBAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn secure_command_with_policy_strips_env() {
+        // Serialize against other env-mutating tests in the same binary.
+        let _guard = GLOBAL_ENV_LOCK.lock().expect("env lock poisoned");
+
+        // Set a representative universal var, the per-tool extra, and a
+        // BASH_FUNC_* dynamic match. After secure_command_with_policy
+        // builds the Command, those must NOT appear in its env, while
+        // an unrelated var passed in via .env() survives.
+        unsafe {
+            std::env::set_var("LD_PRELOAD", "/tmp/evil.so");
+            std::env::set_var("ECHO_EXTRA_STRIP", "1");
+            std::env::set_var("BASH_FUNC_pwned%%", "() { :; }; echo pwned");
+        }
+
+        let cmd = secure_command_with_policy(&ECHO_POLICY);
+
+        // Convert the Command's env-mutation log into a map keyed by
+        // var name so we can assert removals vs. survivors.
+        let env_actions: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        // env_remove appears as a `None` value in get_envs().
+        assert_eq!(
+            env_actions.get("LD_PRELOAD"),
+            Some(&None),
+            "LD_PRELOAD should be marked for removal"
+        );
+        assert_eq!(
+            env_actions.get("ECHO_EXTRA_STRIP"),
+            Some(&None),
+            "per-tool env_strip entry should be marked for removal"
+        );
+        assert_eq!(
+            env_actions.get("BASH_FUNC_pwned%%"),
+            Some(&None),
+            "BASH_FUNC_* dynamic match should be marked for removal"
+        );
+
+        // Clean up to avoid leaking into other tests in the same binary.
+        unsafe {
+            std::env::remove_var("LD_PRELOAD");
+            std::env::remove_var("ECHO_EXTRA_STRIP");
+            std::env::remove_var("BASH_FUNC_pwned%%");
+        }
+    }
+
+    #[test]
+    fn check_args_with_policy_passes_benign_args() {
+        let ok = check_args_with_policy(&ECHO_POLICY, &["hello", "world", "-n"]);
+        assert!(ok.is_ok(), "benign args must pass: {ok:?}");
+    }
+
+    #[test]
+    fn check_args_with_policy_rejects_exact_match() {
+        let r = check_args_with_policy(&ECHO_POLICY, &["foo", "--exec", "rm -rf /"]);
+        assert!(r.is_err(), "must reject --exec exact match");
+        let msg = r.unwrap_err();
+        assert!(msg.contains("--exec"));
+        assert!(msg.contains("echo"));
+        assert!(msg.contains("contextcrawler proxy echo"));
+    }
+
+    #[test]
+    fn check_args_with_policy_rejects_prefix_match() {
+        let r = check_args_with_policy(&ECHO_POLICY, &["--exec=/tmp/x"]);
+        assert!(r.is_err(), "must reject --exec= prefix");
+    }
+
+    #[test]
+    fn check_args_with_policy_rejects_short_bundle() {
+        // 'X' in a bundle like -aX or -XY must trip the deny list,
+        // matching the same anti-bypass logic as check_forbidden_rg_args.
+        assert!(check_args_with_policy(&ECHO_POLICY, &["-aX"]).is_err());
+        assert!(check_args_with_policy(&ECHO_POLICY, &["-Xy"]).is_err());
+        // Bare -X is the exact-match path, also rejected.
+        assert!(check_args_with_policy(&ECHO_POLICY, &["-X"]).is_err());
+        // Bundles that don't contain X are fine.
+        assert!(check_args_with_policy(&ECHO_POLICY, &["-abc"]).is_ok());
+        // Numeric short flags (e.g. -5) must NOT be treated as bundles.
+        assert!(check_args_with_policy(&ECHO_POLICY, &["-5"]).is_ok());
     }
 }
 
