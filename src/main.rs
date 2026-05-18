@@ -1247,19 +1247,23 @@ fn cloud_fallback_hardening(tool: &str, args: &[String]) -> Option<i32> {
         return Some(2);
     }
 
-    // Strip per-tool env vars from THIS process so the child inherits the
-    // cleaned env. Safe because the fallback path exits the process right
-    // after the spawn — no other code observes the cleared vars.
+    // NOTE (codex F9 pre-release review, 2026-05-18): previous versions
+    // of this function called `unsafe { std::env::remove_var(...) }`
+    // here, claiming "single-threaded at CLI dispatch". That was
+    // unsound: `maybe_ping()` at run_cli's top spawns a telemetry
+    // thread BEFORE we reach this dispatch point, so env mutation
+    // here races against `std::env::vars()` in that live thread. Per
+    // Rust 1.81+ contract on `env::remove_var`, that's UB.
     //
-    // SAFETY: std::env::remove_var is unsafe in newer std as of Rust 1.x
-    // due to multi-threaded env races. Contextcrawler is single-threaded
-    // up to this point (CLI parse + dispatch).
-    for var in strip_vars {
-        // SAFETY: see comment above — single-threaded at this dispatch point.
-        unsafe {
-            std::env::remove_var(var);
-        }
-    }
+    // We now rely on the per-tool `secure_*_command` helpers
+    // (PRs #42/#43/#44/#46/#47) wired into every `Commands::*`
+    // dispatch path. Those use `Command::env_remove` (safe) on the
+    // spawned child only. The fallback path here is rare — only fires
+    // when clap can't parse the user's invocation — and an unhardened
+    // fallback is an accepted residual surface (file a follow-up to
+    // route the fallback through a hardened Command if it matters
+    // in practice).
+    let _ = strip_vars; // silence unused-binding warning
     None
 }
 

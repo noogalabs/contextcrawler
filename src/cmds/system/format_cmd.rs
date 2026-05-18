@@ -2,7 +2,7 @@
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{package_manager_exec, resolved_command};
+use crate::core::utils::{package_manager_exec, resolved_command, secure_python_command};
 use crate::prettier_cmd;
 use crate::ruff_cmd;
 use anyhow::{Context, Result};
@@ -74,7 +74,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Build command based on formatter
     let mut cmd = match formatter.as_str() {
         "prettier" => package_manager_exec("prettier"),
-        "black" | "ruff" => resolved_command(formatter.as_str()),
+        "black" | "ruff" => secure_python_command(formatter.as_str()),
         "biome" => package_manager_exec("biome"),
         _ => resolved_command(formatter.as_str()),
     };

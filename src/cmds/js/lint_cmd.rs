@@ -5,6 +5,7 @@ use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::{
     check_forbidden_node_args, package_manager_exec, resolved_command, truncate,
+    secure_python_command,
 };
 use crate::mypy_cmd;
 use crate::ruff_cmd;
@@ -99,7 +100,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Python linters use resolved_command() directly (they're on PATH via pip/pipx)
     // JS linters use package_manager_exec (npx/pnpm exec)
     let mut cmd = if is_python_linter(linter) {
-        resolved_command(linter)
+        secure_python_command(linter)
     } else {
         // Issue #37: gate user-forwarded args before they reach
         // eslint/biome/etc. Python linters keep their own hardening
