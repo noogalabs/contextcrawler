@@ -47,9 +47,23 @@ fn make_repo() -> (tempfile::TempDir, PathBuf) {
 
     // git init + minimal commit. Use Command directly (not contextcrawler)
     // so the setup itself can't be confused with the system under test.
+    //
+    // Pass `-c commit.gpgsign=false -c tag.gpgsign=false` on every git call
+    // (issue #57). Without it the fixture inherits the developer's global
+    // `commit.gpgsign=true` and silently fails on workstations where the
+    // signing agent (1Password, gpg-agent, ssh-agent) is unavailable or
+    // locked — the entire test suite then dies on `make_repo()` with
+    // "1Password: agent returned an error" and reports the cause as the
+    // security test, not the fixture. Isolating with these flags keeps
+    // the test hermetic against the host's git config.
     let run = |args: &[&str]| {
+        let mut full_args: Vec<&str> = vec![
+            "-c", "commit.gpgsign=false",
+            "-c", "tag.gpgsign=false",
+        ];
+        full_args.extend_from_slice(args);
         let status = Command::new("git")
-            .args(args)
+            .args(&full_args)
             .current_dir(&path)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
@@ -60,7 +74,7 @@ fn make_repo() -> (tempfile::TempDir, PathBuf) {
         assert!(
             status.status.success(),
             "git {:?} failed: stderr={}",
-            args,
+            full_args,
             String::from_utf8_lossy(&status.stderr)
         );
     };
@@ -68,6 +82,11 @@ fn make_repo() -> (tempfile::TempDir, PathBuf) {
     run(&["init", "-q", "-b", "main"]);
     run(&["config", "user.email", "t@t"]);
     run(&["config", "user.name", "t"]);
+    // Belt-and-braces: also pin signing off via local config, so any
+    // future helper that forgets the -c flags still gets a hermetic
+    // commit. Cheap insurance.
+    run(&["config", "commit.gpgsign", "false"]);
+    run(&["config", "tag.gpgsign", "false"]);
     fs::write(path.join("a.txt"), "hello\n").unwrap();
     run(&["add", "a.txt"]);
     run(&["commit", "-q", "-m", "init"]);
