@@ -175,6 +175,152 @@ pub fn log_downgrade(cmd: &str, reason: &'static str, tirith_json: Option<&str>)
     }
 }
 
+/// Resolve the Tirith binary path the gate would actually use. Returns
+/// `None` if neither `which tirith` nor `~/.cargo/bin/tirith` finds it.
+/// Used by the `security` dashboard so the user can see exactly which
+/// binary is in play.
+pub fn tirith_binary_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = which::which("tirith") {
+        return Some(p);
+    }
+    let home = dirs::home_dir()?;
+    let cargo_bin = home.join(".cargo/bin/tirith");
+    if cargo_bin.exists() {
+        Some(cargo_bin)
+    } else {
+        None
+    }
+}
+
+/// Returns the path where downgrade events are appended (whether or not
+/// the file exists yet). Mirrors the resolution in `log_downgrade`.
+pub fn downgrades_log_path() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("contextcrawler/downgrades.jsonl"))
+}
+
+/// Read the tail of the downgrades log, returning up to `limit` most
+/// recent lines as raw strings. Lines are not parsed — the dashboard
+/// command formats them for human display, the `--json` mode emits them
+/// as-is wrapped in a JSON array.
+pub fn read_recent_downgrades(limit: usize) -> Vec<String> {
+    let path = match downgrades_log_path() {
+        Some(p) if p.exists() => p,
+        _ => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(limit);
+    lines[start..].iter().map(|s| s.to_string()).collect()
+}
+
+/// `contextcrawler security` dashboard. Renders the current Tirith gate
+/// configuration + recent downgrade events. Two modes:
+/// - default (human-readable): bullet list + tail of the log
+/// - `--json`: machine-readable, suitable for piping into jq
+///
+/// Implements what the CONTEXTCRAWLER.md template has long advertised
+/// ("Tirith defense-in-depth gate dashboard") but which previously had
+/// no actual subcommand backing it — `contextcrawler security` fell
+/// through to macOS's `/usr/bin/security` (keychain tool). See issue #32
+/// for the discovery context.
+pub fn run_security_dashboard(all: bool, json: bool) -> anyhow::Result<i32> {
+    let bin = tirith_binary_path();
+    let disabled =
+        std::env::var("CONTEXTCRAWLER_TIRITH_DISABLED").as_deref() == Ok("1");
+    let required =
+        std::env::var("CONTEXTCRAWLER_TIRITH_REQUIRED").as_deref() == Ok("1");
+    let log_path = downgrades_log_path();
+    let log_exists = log_path.as_ref().is_some_and(|p| p.exists());
+    let limit = if all { usize::MAX } else { 10 };
+    let recent = read_recent_downgrades(limit);
+
+    if json {
+        let bin_str = bin
+            .as_ref()
+            .map(|p| format!("\"{}\"", json_escape_inner(&p.to_string_lossy())))
+            .unwrap_or_else(|| "null".to_string());
+        let log_str = log_path
+            .as_ref()
+            .map(|p| format!("\"{}\"", json_escape_inner(&p.to_string_lossy())))
+            .unwrap_or_else(|| "null".to_string());
+        let recent_json = recent.join(",\n    ");
+        println!(
+            "{{\n  \"tirith_binary\": {},\n  \"installed\": {},\n  \"gate_disabled\": {},\n  \"gate_required\": {},\n  \"log_path\": {},\n  \"log_exists\": {},\n  \"recent_downgrades\": [\n    {}\n  ]\n}}",
+            bin_str,
+            bin.is_some(),
+            disabled,
+            required,
+            log_str,
+            log_exists,
+            recent_json,
+        );
+        return Ok(0);
+    }
+
+    println!("ContextCrawler Tirith Gate — Status");
+    println!("════════════════════════════════════════════════════════════");
+    println!();
+    println!("Installation:");
+    match &bin {
+        Some(p) => println!("  [ok] tirith binary: {}", p.display()),
+        None => {
+            println!("  [--] tirith binary: not found (PATH lookup + ~/.cargo/bin/tirith both empty)");
+            println!("       install with: cargo install tirith");
+        }
+    }
+    println!();
+    println!("Gate state:");
+    if disabled {
+        println!("  [!!] DISABLED via CONTEXTCRAWLER_TIRITH_DISABLED=1");
+        println!("       (every command bypasses tirith inspection)");
+    } else if bin.is_none() {
+        println!("  [!!] EFFECTIVELY DISABLED (tirith binary missing)");
+    } else {
+        println!("  [ok] enabled — every hook-routed command is inspected before exec");
+    }
+    if required {
+        println!("  [ok] CONTEXTCRAWLER_TIRITH_REQUIRED=1 (strict mode: tirith failure ≠ allow)");
+    } else {
+        println!("  [--] not required — tirith unavailability falls open (default)");
+    }
+    println!();
+    println!("Downgrade log:");
+    match &log_path {
+        Some(p) => {
+            println!("  path: {}", p.display());
+            println!("  exists: {}", if log_exists { "yes" } else { "no" });
+        }
+        None => println!("  path: unresolvable (no data_local_dir)"),
+    }
+    println!();
+    if recent.is_empty() {
+        println!("Recent downgrade events: (none)");
+    } else {
+        let shown = recent.len();
+        let label = if all {
+            format!("Downgrade events (all {} shown)", shown)
+        } else {
+            format!("Recent downgrade events (last {} of newest)", shown)
+        };
+        println!("{}:", label);
+        for line in &recent {
+            println!("  {}", line);
+        }
+    }
+    println!();
+    println!("Scope note: tirith inspects COMMAND STRINGS only — env-var-driven attacks");
+    println!("(e.g. RIPGREP_CONFIG_PATH hijack, see issue #32) are blocked separately");
+    println!("inside the spawning code path via env_remove + arg deny-list.");
+    Ok(0)
+}
+
+fn json_escape_inner(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Minimal JSON string escape for our log lines.
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);

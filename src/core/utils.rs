@@ -392,6 +392,101 @@ pub fn tool_exists(name: &str) -> bool {
     which::which(name).is_ok()
 }
 
+/// rg / grep flags that contextcrawler refuses to forward to the spawned
+/// subprocess. `--pre <script>` / `--pre-glob <pat>` make rg execute the
+/// script as a per-file preprocessor, and `--search-zip` / `-z` read and
+/// decompress archives — both are RCE / blast-radius escalations that
+/// shouldn't be reachable through the agent-facing grep path. See issue
+/// #32 for the verified env-var + arg-driven PoC.
+///
+/// Users with a legitimate need can still invoke the dangerous flags
+/// directly via the escape hatch `contextcrawler proxy rg ...`.
+const FORBIDDEN_RG_FLAGS_EXACT: &[&str] =
+    &["--pre", "--pre-glob", "--search-zip", "-z"];
+
+const FORBIDDEN_RG_FLAGS_PREFIX: &[&str] = &["--pre=", "--pre-glob="];
+
+/// Scan args for any flag in the deny list. Returns `Err` with a clear
+/// user-facing explanation if one is found. The error message names the
+/// offending flag and points at the escape hatch.
+pub fn check_forbidden_rg_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        let hit = FORBIDDEN_RG_FLAGS_EXACT.iter().any(|f| a == *f)
+            || FORBIDDEN_RG_FLAGS_PREFIX.iter().any(|p| a.starts_with(p));
+        if hit {
+            return Err(format!(
+                "[contextcrawler] refusing to forward '{}' to rg/grep — this flag \
+                 enables per-file script execution or archive reads (issue #32). \
+                 If you genuinely need it, use: contextcrawler proxy rg <args>",
+                a
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build a Command for invoking `rg` (or `grep` as fallback) with the
+/// rg-config env vars stripped from the inherited environment. Without
+/// this, any process that has `RIPGREP_CONFIG_PATH` or `RIPGREP_CONFIG_FILE`
+/// set in its env can hijack every contextcrawler grep call — the config
+/// file can contain `--pre=<script>` and rg will execute the script per
+/// file. Confirmed RCE; see issue #32.
+///
+/// Both legitimate call sites (`src/cmds/system/grep_cmd.rs::run` and
+/// `src/main.rs::run_grep_format_passthrough`) should use this instead of
+/// the raw `resolved_command()` for rg/grep invocations.
+pub fn secure_rg_command(name: &str) -> Command {
+    let mut cmd = resolved_command(name);
+    cmd.env_remove("RIPGREP_CONFIG_PATH");
+    cmd.env_remove("RIPGREP_CONFIG_FILE");
+    cmd
+}
+
+#[cfg(test)]
+mod secure_rg_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_pre_flag() {
+        let r = check_forbidden_rg_args(&["pattern", "--pre", "/tmp/x.sh"]);
+        assert!(r.is_err(), "must reject bare --pre");
+        assert!(r.unwrap_err().contains("--pre"));
+    }
+
+    #[test]
+    fn rejects_pre_equals_form() {
+        let r = check_forbidden_rg_args(&["pattern", "--pre=/tmp/x.sh"]);
+        assert!(r.is_err(), "must reject --pre=value");
+    }
+
+    #[test]
+    fn rejects_pre_glob_both_forms() {
+        assert!(check_forbidden_rg_args(&["pattern", "--pre-glob", "*"]).is_err());
+        assert!(check_forbidden_rg_args(&["pattern", "--pre-glob=*"]).is_err());
+    }
+
+    #[test]
+    fn rejects_search_zip_long_and_short() {
+        assert!(check_forbidden_rg_args(&["pattern", "--search-zip"]).is_err());
+        assert!(check_forbidden_rg_args(&["pattern", "-z"]).is_err());
+    }
+
+    #[test]
+    fn allows_normal_grep_args() {
+        assert!(check_forbidden_rg_args(&["pattern", "-rn", "src/"]).is_ok());
+        assert!(check_forbidden_rg_args(&["-c", "pattern", "file"]).is_ok());
+        assert!(check_forbidden_rg_args(&["--glob", "*.rs", "pattern"]).is_ok());
+    }
+
+    #[test]
+    fn error_message_mentions_escape_hatch() {
+        let err = check_forbidden_rg_args(&["--pre", "/x"]).unwrap_err();
+        assert!(err.contains("contextcrawler proxy rg"));
+        assert!(err.contains("#32"));
+    }
+}
+
 /// Extract short name from AWS ARN.
 /// Example: `arn:aws:ecs:region:acct:service/cluster/name` -> `name`
 /// For simple ARNs like `arn:aws:iam::123:user/alice`, returns `alice`.
