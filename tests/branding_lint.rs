@@ -35,12 +35,25 @@ const ALLOW_MARKER: &str = "// branding-lint: allow legacy";
 /// Substrings that, if present on the line being scanned, exempt that line.
 /// Use for short structural references (variable names, history comments)
 /// that don't justify a per-line marker.
-const STRUCTURAL_ALLOW_NEEDLES: &[&str] = &[
-    "LEGACY_RTK_MD_FILES",       // the registry itself
-    "issue #19",                 // regression-history comments
+///
+/// The history-comment exemptions below are restricted to **comment lines
+/// only** (lines whose trimmed text starts with `//`) — a non-comment line
+/// containing both `[rtk]` AND `issue #19` should still fail the lint
+/// instead of slipping through (codex P3 catch on the introduction of the
+/// config-file pin test).
+const STRUCTURAL_ALLOW_NEEDLES_ANYWHERE: &[&str] = &[
+    "LEGACY_RTK_MD_FILES", // the registry itself — appears in declarations, not comments
+];
+
+/// Same idea but only exempts the line if it's a comment. Catches the
+/// regression-history references in `src/hooks/init.rs` without weakening
+/// the lint for production code that incidentally mentions the issue
+/// number.
+const STRUCTURAL_ALLOW_NEEDLES_IN_COMMENTS_ONLY: &[&str] = &[
+    "issue #19",
     "see issue #19",
     "see #19",
-    "bcddd06",                   // the offending commit hash mentioned in history comments
+    "bcddd06", // the offending commit hash mentioned in history comments
 ];
 
 /// Function-name prefixes whose entire body is exempt from the lint. Use
@@ -133,7 +146,21 @@ fn branding_lint_no_forbidden_upstream_literals_in_src() {
             if line.contains(ALLOW_MARKER) {
                 continue;
             }
-            if STRUCTURAL_ALLOW_NEEDLES.iter().any(|n| line.contains(n)) {
+            if STRUCTURAL_ALLOW_NEEDLES_ANYWHERE
+                .iter()
+                .any(|n| line.contains(n))
+            {
+                continue;
+            }
+            // Comment-only exemptions: only applied if the line is a
+            // comment. Prevents bypass via "production code that happens
+            // to mention issue #19".
+            let is_comment_line = line.trim_start().starts_with("//");
+            if is_comment_line
+                && STRUCTURAL_ALLOW_NEEDLES_IN_COMMENTS_ONLY
+                    .iter()
+                    .any(|n| line.contains(n))
+            {
                 continue;
             }
 
