@@ -3245,15 +3245,146 @@ pub fn check_forbidden_wget_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
     Ok(())
 }
 
+// ---- gh / glab / gt (issue #50) ----------------------------------------------
+//
+// GitHub CLI (`gh`), GitLab CLI (`glab`), and Graphite (`gt`) all shell out
+// to git internally AND have their own editor/browser/pager hijack surface.
+// The shared `EDITOR` / `VISUAL` / `PAGER` are already stripped by
+// UNIVERSAL_ENV_STRIP, so we only enumerate the tool-specific overrides
+// (`GH_EDITOR`, etc.) plus `BROWSER` which isn't universal.
+//
+// AUTH PRESERVATION: we deliberately do NOT strip the bearer tokens
+// (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITLAB_TOKEN`,
+// `GLAB_TOKEN`, `GRAPHITE_TOKEN`). Stripping them would break the tool
+// for any non-interactive caller (CI, agent harness). These are
+// caller-intended secrets, not attacker-injected hijacks.
+
+/// gh env-strip list. Covers gh's config-redirect, editor/browser/pager
+/// overrides, and the generic `BROWSER` env var that gh falls back to for
+/// `gh browse` / `gh repo view --web`. Auth tokens are intentionally NOT
+/// in this list — see auth-preservation note above.
+const GH_STRIP_ENV: &[&str] = &[
+    "GH_CONFIG_DIR",
+    "GH_EDITOR",
+    "GH_BROWSER",
+    "GH_PAGER",
+    "GH_PATH",
+    "BROWSER",
+];
+
+pub fn secure_gh_command() -> Command {
+    let mut cmd = resolved_command("gh");
+    apply_universal_env_strip(&mut cmd);
+    for var in GH_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// gh subcommands that execute attacker-controlled code paths:
+/// - `extension exec <name> <args>`: runs the named gh extension binary
+///   with the given args. The extension itself can be an arbitrary
+///   executable, so this is straightforward RCE if an attacker can plant
+///   one and convince the agent to invoke it. We deny the subcommand —
+///   users with a legitimate need run it via `contextcrawler proxy gh`.
+///
+/// `extension install` is NOT denied because installing a named extension
+/// from a trusted publisher is normally a deliberate user action; the
+/// install step itself doesn't execute attacker code.
+pub fn check_forbidden_gh_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    // Scan ALL args (not a bounded window) so an attacker can't pad with
+    // global flags to push `extension exec` past a take(N) cutoff. The
+    // loop short-circuits once both positionals are seen, so cost is
+    // proportional to the position of the second positional in practice.
+    let mut first_two: Vec<&str> = Vec::with_capacity(2);
+    for a in args.iter() {
+        let s = a.as_ref();
+        if !s.starts_with('-') {
+            first_two.push(s);
+            if first_two.len() == 2 {
+                break;
+            }
+        }
+    }
+    if first_two.len() == 2 && first_two[0] == "extension" && first_two[1] == "exec" {
+        return Err(cloud_deny_message_with_issue("gh", "extension exec", "#50"));
+    }
+    Ok(())
+}
+
+// ---- glab --------------------------------------------------------------------
+
+/// glab env-strip list — same shape as gh's. Auth tokens
+/// (`GITLAB_TOKEN`, `GLAB_TOKEN`) intentionally preserved.
+const GLAB_STRIP_ENV: &[&str] = &[
+    "GLAB_CONFIG_DIR",
+    "GLAB_EDITOR",
+    "GLAB_BROWSER",
+    "GLAB_PAGER",
+    "BROWSER",
+];
+
+pub fn secure_glab_command() -> Command {
+    let mut cmd = resolved_command("glab");
+    apply_universal_env_strip(&mut cmd);
+    for var in GLAB_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// glab has no public extension-exec subcommand at this time; the
+/// check is a no-op stub so callers compose uniformly with the gh path.
+pub fn check_forbidden_glab_args<S: AsRef<str>>(_args: &[S]) -> Result<(), String> {
+    Ok(())
+}
+
+// ---- gt (Graphite) ----------------------------------------------------------
+
+/// gt shells out to git on every operation. Strip the full git env-hijack
+/// set in addition to gt's own browser/editor knobs. `GRAPHITE_TOKEN` is
+/// preserved (auth).
+const GT_STRIP_ENV: &[&str] = &["GT_EDITOR", "GT_BROWSER", "GT_PAGER", "BROWSER"];
+
+pub fn secure_gt_command() -> Command {
+    let mut cmd = resolved_command("gt");
+    apply_universal_env_strip(&mut cmd);
+    for var in GT_STRIP_ENV {
+        cmd.env_remove(var);
+    }
+    // gt invokes git as a child; inherit the full git env-strip set so the
+    // attacker can't reach git through gt either.
+    for var in FORBIDDEN_GIT_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    for n in 0..GIT_CONFIG_ENV_INDEX_LIMIT {
+        cmd.env_remove(format!("GIT_CONFIG_KEY_{}", n));
+        cmd.env_remove(format!("GIT_CONFIG_VALUE_{}", n));
+    }
+    cmd
+}
+
+/// gt currently has no eval-like subcommand; check is a stub for shape.
+pub fn check_forbidden_gt_args<S: AsRef<str>>(_args: &[S]) -> Result<(), String> {
+    Ok(())
+}
+
 // ---- shared error message ----------------------------------------------------
 
 fn cloud_deny_message(tool: &str, offending: &str) -> String {
+    cloud_deny_message_with_issue(tool, offending, "#38")
+}
+
+/// Variant that lets callers cite the issue number that drove the deny,
+/// instead of the legacy default `#38`. New tool wrappers should call this
+/// directly so the user-facing message points at the right tracker entry.
+fn cloud_deny_message_with_issue(tool: &str, offending: &str, issue: &str) -> String {
     format!(
         "[contextcrawler] refusing to forward '{}' to {} — this flag/subcommand \
          enables credential redirect, arbitrary code execution, or output \
-         hijack (issue #38). If you genuinely need it, use: contextcrawler \
+         hijack (issue {}). If you genuinely need it, use: contextcrawler \
          proxy {} <args>",
-        offending, tool, tool
+        offending, tool, issue, tool
     )
 }
 
@@ -3400,5 +3531,110 @@ mod secure_cloud_tests {
         let err = check_forbidden_docker_args(&["--config", "/x"]).unwrap_err();
         assert!(err.contains("contextcrawler proxy docker"));
         assert!(err.contains("#38"));
+    }
+
+    // ---- gh / glab / gt (issue #50) ----
+
+    #[test]
+    fn gh_strip_list_contains_redirect_overrides() {
+        for v in ["GH_CONFIG_DIR", "GH_EDITOR", "GH_BROWSER", "GH_PAGER", "GH_PATH", "BROWSER"] {
+            assert!(GH_STRIP_ENV.contains(&v), "{v} must be in gh strip list");
+        }
+    }
+
+    #[test]
+    fn gh_strip_list_preserves_auth_tokens() {
+        // AUTH PRESERVATION: stripping these breaks non-interactive use
+        // (CI, agent harness). Tokens are caller-intended secrets, not
+        // attacker-injected hijacks — so they MUST stay in the inherited
+        // env. This test pins the contract.
+        for v in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            // `GITHUB_ENTERPRISE_TOKEN` (no GH_ prefix) is the gh fallback for
+            // GHES per https://cli.github.com/manual/gh_help_environment. Pin
+            // it too so future churn doesn't accidentally add it to the strip
+            // list and break enterprise users.
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_HOST",
+            "GH_REPO",
+        ] {
+            assert!(
+                !GH_STRIP_ENV.contains(&v),
+                "{v} must NOT be in gh strip list (auth/context preservation)"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_gh_extension_exec() {
+        assert!(check_forbidden_gh_args(&["extension", "exec", "evil"]).is_err());
+        // install IS allowed — deliberate user action, no inline exec.
+        assert!(check_forbidden_gh_args(&["extension", "install", "owner/repo"]).is_ok());
+        // list / remove / upgrade are fine.
+        assert!(check_forbidden_gh_args(&["extension", "list"]).is_ok());
+        assert!(check_forbidden_gh_args(&["extension", "remove", "name"]).is_ok());
+    }
+
+    #[test]
+    fn gh_extension_exec_detected_through_many_global_flags() {
+        // REGRESSION (issue #50 pre-PR review P2): an earlier `.take(8)` cap
+        // let an attacker pad with global flags to push `extension exec`
+        // past the detector. Verify the unbounded scan catches it.
+        let evasion: Vec<&str> = vec![
+            "--foo", "--bar", "--baz", "--qux", "--quux", "--corge", "--grault", "--garply",
+            "extension", "exec", "evil",
+        ];
+        assert!(check_forbidden_gh_args(&evasion).is_err());
+    }
+
+    #[test]
+    fn gh_deny_message_cites_issue_50() {
+        // REGRESSION (issue #50 pre-PR review P3): the shared
+        // `cloud_deny_message` hardcoded `#38`, which would confuse anyone
+        // hitting the new gh deny who looked up #38 (cloud tools, not gh).
+        // The gh deny now uses `cloud_deny_message_with_issue` with #50.
+        let err = check_forbidden_gh_args(&["extension", "exec", "evil"]).unwrap_err();
+        assert!(err.contains("#50"), "expected #50 in deny message; got: {}", err);
+        assert!(!err.contains("#38"), "should not reference #38 (cloud tools); got: {}", err);
+    }
+
+    #[test]
+    fn allows_normal_gh_args() {
+        assert!(check_forbidden_gh_args(&["pr", "list"]).is_ok());
+        assert!(check_forbidden_gh_args(&["repo", "view"]).is_ok());
+        assert!(check_forbidden_gh_args(&["api", "/user"]).is_ok());
+        // Args after flags must not confuse the subcommand detector.
+        assert!(check_forbidden_gh_args(&["--repo", "owner/x", "pr", "list"]).is_ok());
+    }
+
+    #[test]
+    fn glab_strip_list_contains_redirect_overrides_preserves_tokens() {
+        for v in ["GLAB_CONFIG_DIR", "GLAB_EDITOR", "GLAB_BROWSER", "GLAB_PAGER", "BROWSER"] {
+            assert!(GLAB_STRIP_ENV.contains(&v), "{v} must be in glab strip list");
+        }
+        for v in ["GITLAB_TOKEN", "GLAB_TOKEN", "GITLAB_HOST"] {
+            assert!(
+                !GLAB_STRIP_ENV.contains(&v),
+                "{v} must NOT be in glab strip list (auth/context preservation)"
+            );
+        }
+    }
+
+    #[test]
+    fn gt_strip_list_chains_to_git_env_deny() {
+        for v in ["GT_EDITOR", "GT_BROWSER", "GT_PAGER", "BROWSER"] {
+            assert!(GT_STRIP_ENV.contains(&v), "{v} must be in gt strip list");
+        }
+        // gt chains to git, so the secure_gt_command must also apply the
+        // git env deny set. Validate the constant exists and is populated;
+        // behaviour is covered in the integration test.
+        assert!(
+            FORBIDDEN_GIT_ENV_VARS.contains(&"GIT_SSH_COMMAND"),
+            "gt depends on git env deny list including GIT_SSH_COMMAND"
+        );
+        // GRAPHITE_TOKEN must NOT be stripped (auth).
+        assert!(!GT_STRIP_ENV.contains(&"GRAPHITE_TOKEN"));
     }
 }

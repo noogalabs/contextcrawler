@@ -4,7 +4,7 @@
 //! Focuses on extracting essential information from JSON outputs.
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::{ok_confirmation, resolved_command, truncate};
+use crate::core::utils::{check_forbidden_gh_args, ok_confirmation, secure_gh_command, truncate};
 use crate::git;
 use anyhow::Result;
 use lazy_static::lazy_static;
@@ -180,6 +180,18 @@ where
 }
 
 pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
+    // Arg deny check (issue #50): reject `gh extension exec <name>` which
+    // runs an attacker-controlled extension binary as the user. The check
+    // looks at the subcommand + its first non-flag arg, so we must include
+    // the subcommand explicitly here (it's stripped by main.rs dispatch).
+    let mut full_args: Vec<String> = Vec::with_capacity(args.len() + 1);
+    full_args.push(subcommand.to_string());
+    full_args.extend(args.iter().cloned());
+    if let Err(msg) = check_forbidden_gh_args(&full_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     // When user explicitly passes --json, they want raw gh JSON output, not RTK filtering
     if has_json_flag(args) {
         return run_passthrough("gh", subcommand, args);
@@ -218,7 +230,7 @@ fn run_pr(args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
 }
 
 fn list_prs(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args([
         "pr",
         "list",
@@ -323,7 +335,7 @@ fn view_pr(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
     if should_passthrough_pr_view(&extra_args) {
         return run_passthrough_with_extra("gh", &["pr", "view", &pr_number], &extra_args);
     }
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args([
         "pr",
         "view",
@@ -428,7 +440,7 @@ fn pr_checks(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<i32>
         Some(result) => result,
         None => return Err(anyhow::anyhow!("PR number required")),
     };
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args(["pr", "checks", &pr_number]);
     for arg in &extra_args {
         cmd.arg(arg);
@@ -485,7 +497,7 @@ fn pr_status(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<i32>
         return run_passthrough("gh", "pr", &passthrough_args);
     }
 
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args(["pr", "status", "--json", pr_status_json_fields()]);
     for arg in args {
         cmd.arg(arg);
@@ -569,7 +581,7 @@ fn run_issue(args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
 }
 
 fn list_issues(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args(["issue", "list", "--json", "number,title,state,author"]);
     for arg in args {
         cmd.arg(arg);
@@ -620,7 +632,7 @@ fn view_issue(args: &[String], _verbose: u8) -> Result<i32> {
     if should_passthrough_issue_view(&extra_args) {
         return run_passthrough_with_extra("gh", &["issue", "view", &issue_number], &extra_args);
     }
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args([
         "issue",
         "view",
@@ -681,7 +693,7 @@ fn run_workflow(args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32
 }
 
 fn list_runs(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args([
         "run",
         "list",
@@ -750,7 +762,7 @@ fn view_run(args: &[String], _verbose: u8) -> Result<i32> {
     if should_passthrough_run_view(&extra_args) {
         return run_passthrough_with_extra("gh", &["run", "view", &run_id], &extra_args);
     }
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args(["run", "view", &run_id]);
     for arg in &extra_args {
         cmd.arg(arg);
@@ -799,7 +811,7 @@ fn run_repo(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<i32> 
     if subcommand != "view" {
         return run_passthrough("gh", "repo", args);
     }
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.arg("repo").arg("view");
     for arg in rest_args {
         cmd.arg(arg);
@@ -833,7 +845,7 @@ fn format_repo_view(json: &Value) -> String {
 }
 
 fn pr_create(args: &[String], _verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args(["pr", "create"]);
     for arg in args {
         cmd.arg(arg);
@@ -888,7 +900,7 @@ fn pr_diff(args: &[String], _verbose: u8) -> Result<i32> {
     if no_compact || has_non_diff_format_flag(&gh_args) {
         return run_passthrough_with_extra("gh", &["pr", "diff"], &gh_args);
     }
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.args(["pr", "diff"]);
     for arg in gh_args.iter() {
         cmd.arg(arg);
@@ -915,7 +927,7 @@ fn pr_action(action: &str, args: &[String], _verbose: u8) -> Result<i32> {
         .find(|a| !a.starts_with('-'))
         .map(|s| format!("#{}", s))
         .unwrap_or_default();
-    let mut cmd = resolved_command("gh");
+    let mut cmd = secure_gh_command();
     cmd.arg("pr");
     for arg in args {
         cmd.arg(arg);
@@ -939,16 +951,23 @@ fn run_api(args: &[String], _verbose: u8) -> Result<i32> {
 
 // Edge case: error context is now "Failed to run {cmd}" (loses subcommand detail)
 fn run_passthrough_with_extra(cmd: &str, base_args: &[&str], extra_args: &[String]) -> Result<i32> {
+    // SECURITY (issue #50 pre-PR review P0): all gh passthrough paths must
+    // use `secure_gh_command()` to apply UNIVERSAL_ENV_STRIP + GH_STRIP_ENV
+    // to the child env. The shared `runner::run_passthrough` uses raw
+    // `resolved_command()` and would bypass the env-strip entirely.
+    debug_assert_eq!(cmd, "gh", "gh passthrough helper should only be called for gh");
     let mut os_args: Vec<std::ffi::OsString> =
         base_args.iter().map(std::ffi::OsString::from).collect();
     os_args.extend(extra_args.iter().map(std::ffi::OsString::from));
-    crate::core::runner::run_passthrough(cmd, &os_args, 0)
+    crate::core::runner::run_passthrough_cmd(secure_gh_command(), cmd, &os_args, 0)
 }
 
 fn run_passthrough(cmd: &str, subcommand: &str, args: &[String]) -> Result<i32> {
+    // SECURITY (issue #50 pre-PR review P0): see run_passthrough_with_extra.
+    debug_assert_eq!(cmd, "gh", "gh passthrough helper should only be called for gh");
     let mut os_args: Vec<std::ffi::OsString> = vec![std::ffi::OsString::from(subcommand)];
     os_args.extend(args.iter().map(std::ffi::OsString::from));
-    crate::core::runner::run_passthrough(cmd, &os_args, 0)
+    crate::core::runner::run_passthrough_cmd(secure_gh_command(), cmd, &os_args, 0)
 }
 
 #[cfg(test)]

@@ -12,7 +12,9 @@
 
 use super::git;
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::{ok_confirmation, resolved_command, strip_ansi, truncate};
+use crate::core::utils::{
+    check_forbidden_glab_args, ok_confirmation, secure_glab_command, strip_ansi, truncate,
+};
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -248,6 +250,17 @@ where
 
 /// Run a glab command with token-optimized output.
 pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
+    // Arg deny check (issue #50). check_forbidden_glab_args is currently a
+    // no-op stub — glab has no documented eval-like subcommand — but we wire
+    // it here so future denials drop in without touching the dispatch.
+    let mut full_args: Vec<String> = Vec::with_capacity(args.len() + 1);
+    full_args.push(subcommand.to_string());
+    full_args.extend(args.iter().cloned());
+    if let Err(msg) = check_forbidden_glab_args(&full_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     // If the user explicitly requests a specific output format, passthrough unchanged.
     if has_output_flag(args) {
         return run_passthrough("glab", subcommand, args);
@@ -331,7 +344,7 @@ fn format_mr_list(json: &Value, ultra_compact: bool) -> String {
 }
 
 fn mr_list(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["mr", "list", "-F", "json"]);
     for arg in args {
         cmd.arg(arg);
@@ -418,7 +431,7 @@ fn mr_view(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
         return run_passthrough_with_extra("glab", &["mr", "view", &mr_number], &extra_args);
     }
 
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["mr", "view", &mr_number, "-F", "json"]);
     for arg in &extra_args {
         cmd.arg(arg);
@@ -429,7 +442,7 @@ fn mr_view(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
 }
 
 fn mr_create(args: &[String], _verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["mr", "create"]);
     for arg in args {
         cmd.arg(arg);
@@ -454,7 +467,7 @@ fn mr_create(args: &[String], _verbose: u8) -> Result<i32> {
 }
 
 fn mr_diff(args: &[String], _verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["mr", "diff"]);
     for arg in args {
         cmd.arg(arg);
@@ -478,7 +491,7 @@ fn mr_diff(args: &[String], _verbose: u8) -> Result<i32> {
 /// Uses extract_identifier_and_extra_args to correctly find the MR number
 /// even when it appears after flags (e.g. `glab mr note -m "msg" 42`).
 fn mr_action(subcmd: &str, label: &str, args: &[String], _verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["mr", subcmd]);
     for arg in args {
         cmd.arg(arg);
@@ -551,7 +564,7 @@ fn format_issue_list(json: &Value, ultra_compact: bool) -> String {
 }
 
 fn issue_list(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["issue", "list", "-F", "json"]);
     for arg in args {
         cmd.arg(arg);
@@ -606,7 +619,7 @@ fn issue_view(args: &[String], _verbose: u8) -> Result<i32> {
         return run_passthrough_with_extra("glab", &["issue", "view", &issue_number], &extra_args);
     }
 
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["issue", "view", &issue_number, "-F", "json"]);
     for arg in &extra_args {
         cmd.arg(arg);
@@ -658,7 +671,7 @@ fn format_ci_list(json: &Value, ultra_compact: bool) -> String {
 }
 
 fn ci_list(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["ci", "list", "-F", "json"]);
     for arg in args {
         cmd.arg(arg);
@@ -709,7 +722,7 @@ fn format_ci_status(raw: &str, ultra_compact: bool) -> String {
 
 fn ci_status(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
     // glab ci status does not support -F json — text parsing with raw fallback
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["ci", "status"]);
     for arg in args {
         cmd.arg(arg);
@@ -724,7 +737,7 @@ fn ci_status(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> 
 }
 
 fn ci_trace(args: &[String]) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["ci", "trace"]);
     for arg in args {
         cmd.arg(arg);
@@ -858,7 +871,7 @@ fn format_release_list(raw: &str) -> Option<String> {
 }
 
 fn release_list(args: &[String]) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["release", "list"]);
     for arg in args {
         cmd.arg(arg);
@@ -873,7 +886,7 @@ fn release_list(args: &[String]) -> Result<i32> {
 }
 
 fn release_view(args: &[String]) -> Result<i32> {
-    let mut cmd = resolved_command("glab");
+    let mut cmd = secure_glab_command();
     cmd.args(["release", "view"]);
     for arg in args {
         cmd.arg(arg);
@@ -947,16 +960,21 @@ fn run_api(args: &[String], _verbose: u8) -> Result<i32> {
 // ── Passthrough ─────────────────────────────────────────────────────────
 
 fn run_passthrough(cmd: &str, subcommand: &str, args: &[String]) -> Result<i32> {
+    // SECURITY (issue #50 pre-PR review P0): all glab passthrough paths must
+    // use `secure_glab_command()` to apply UNIVERSAL_ENV_STRIP + GLAB_STRIP_ENV.
+    debug_assert_eq!(cmd, "glab", "glab passthrough helper should only be called for glab");
     let mut os_args: Vec<std::ffi::OsString> = vec![std::ffi::OsString::from(subcommand)];
     os_args.extend(args.iter().map(std::ffi::OsString::from));
-    runner::run_passthrough(cmd, &os_args, 0)
+    runner::run_passthrough_cmd(secure_glab_command(), cmd, &os_args, 0)
 }
 
 fn run_passthrough_with_extra(cmd: &str, base_args: &[&str], extra_args: &[String]) -> Result<i32> {
+    // SECURITY (issue #50 pre-PR review P0): see run_passthrough.
+    debug_assert_eq!(cmd, "glab", "glab passthrough helper should only be called for glab");
     let mut os_args: Vec<std::ffi::OsString> =
         base_args.iter().map(std::ffi::OsString::from).collect();
     os_args.extend(extra_args.iter().map(std::ffi::OsString::from));
-    runner::run_passthrough(cmd, &os_args, 0)
+    runner::run_passthrough_cmd(secure_glab_command(), cmd, &os_args, 0)
 }
 
 #[cfg(test)]
