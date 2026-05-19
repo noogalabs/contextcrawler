@@ -118,6 +118,9 @@ pub fn classify_command(cmd: &str) -> Classification {
 
     // Normalize absolute binary paths: /usr/bin/grep → grep (#485)
     let cmd_normalized = strip_absolute_path(cmd_clean);
+    // Re-apply ENV_PREFIX after absolute-path normalisation so `/usr/bin/env
+    // git status` (which becomes `env git status` here) is recognised. (#83)
+    let cmd_normalized = ENV_PREFIX.replace(&cmd_normalized, "").to_string();
     // Strip git global options: git -C /tmp status → git status (#163)
     let cmd_normalized = strip_git_global_opts(&cmd_normalized);
     // Strip golangci-lint global options before `run` so classify/rewrite stays
@@ -795,10 +798,16 @@ fn rewrite_segment_inner(
         _ => return None,
     };
 
+    // Normalise the command the same way classify_command does so prefix
+    // matching below works for /usr/bin/env <cmd> and similar (#83).
+    let cmd_part_norm = strip_absolute_path(cmd_part);
+    let cmd_part_norm = ENV_PREFIX.replace(&cmd_part_norm, "").to_string();
+    let cmd_part_norm = cmd_part_norm.trim();
+
     // Find the matching rule (rtk_cmd values are unique across all rules)
     let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
 
-    if let Some(parts) = parse_golangci_run_parts(cmd_part) {
+    if let Some(parts) = parse_golangci_run_parts(cmd_part_norm) {
         let rewritten = if parts.global_segment.is_empty() {
             format!("contextcrawler golangci-lint {}", parts.run_segment)
         } else {
@@ -813,7 +822,7 @@ fn rewrite_segment_inner(
     // #196: gh with --json/--jq/--template produces structured output that
     // rtk gh would corrupt — skip rewrite so the caller gets raw JSON.
     if rule.rtk_cmd == "contextcrawler gh" {
-        let args_lower = cmd_part.to_lowercase();
+        let args_lower = cmd_part_norm.to_lowercase();
         if args_lower.contains("--json")
             || args_lower.contains("--jq")
             || args_lower.contains("--template")
@@ -824,7 +833,7 @@ fn rewrite_segment_inner(
 
     // Try each rewrite prefix (longest first) with word-boundary check
     for &prefix in rule.rewrite_prefixes {
-        if let Some(rest) = strip_word_prefix(cmd_part, prefix) {
+        if let Some(rest) = strip_word_prefix(cmd_part_norm, prefix) {
             let rewritten = if rest.is_empty() {
                 format!("{}{}", rule.rtk_cmd, redirect_suffix)
             } else {
@@ -871,6 +880,43 @@ mod tests {
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
             }
+        );
+    }
+
+    #[test]
+    fn test_classify_env_prefix_absolute_path() {
+        // /usr/bin/env <cmd> must classify the same as the bare command (#83)
+        assert_eq!(
+            classify_command("/usr/bin/env git status"),
+            Classification::Supported {
+                rtk_equivalent: "contextcrawler git",
+                category: "Git",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_env_prefix_relative() {
+        // Regression guard: bare `env <cmd>` already worked, keep it that way (#83)
+        assert_eq!(
+            classify_command("env git status"),
+            Classification::Supported {
+                rtk_equivalent: "contextcrawler git",
+                category: "Git",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_prefix_absolute_path() {
+        // /usr/bin/env <cmd> must rewrite to the contextcrawler equivalent (#83)
+        assert_eq!(
+            rewrite_command("/usr/bin/env git status", &[], &[]),
+            Some("contextcrawler git status".to_string())
         );
     }
 
