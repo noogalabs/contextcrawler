@@ -24,6 +24,8 @@ fn run_with_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(args);
+    // Issue #91 — sentinel for release-built spawned binary.
+    cmd.env("CONTEXTCRAWLER_TEST_MODE", "1");
     for (k, v) in envs {
         cmd.env(k, v);
     }

@@ -38,6 +38,40 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Detect whether we're running inside a test context, so we can short-circuit
+/// DB writes and avoid polluting the production `history.db`. Issue #91.
+///
+/// Two independent signals — either is sufficient:
+///
+/// 1. `CONTEXTCRAWLER_TEST_MODE=1` — sentinel set by integration test harnesses
+///    when they spawn the binary as a child process. Required because spawned
+///    binaries can be RELEASE-compiled (`cargo test --release`), so
+///    `cfg!(debug_assertions)` is false and `cfg!(test)` is false in the
+///    spawned binary's own compilation unit. Codex review caught this hole.
+///
+/// 2. `cfg!(test)` + cargo env vars — covers in-process unit tests
+///    (`#[test]` fns inside `src/`) regardless of build mode. `cfg!(test)` is
+///    set during cargo-test compilation in both debug and release.
+///
+/// Explicit opt-in: if `RTK_DB_PATH` is set, the caller wants tracking writes
+/// against that path (typically a tmpfile in a test that *exercises*
+/// tracking), so we do NOT short-circuit.
+pub(crate) fn is_test_context() -> bool {
+    if std::env::var("RTK_DB_PATH").is_ok() {
+        return false; // explicit opt-in path
+    }
+    // Test harness sentinel — set by tests/common.rs or each #[test] that
+    // spawns the binary.
+    if std::env::var("CONTEXTCRAWLER_TEST_MODE").as_deref() == Ok("1") {
+        return true;
+    }
+    // Cargo unit-test in-process (lives inside the test runner, not a spawned
+    // binary). `cfg!(test)` is true inside `#[test]` modules in any build mode.
+    cfg!(test)
+        && std::env::var("CARGO_PKG_NAME").as_deref() == Ok("contextcrawler")
+        && std::env::var("CARGO_MANIFEST_DIR").is_ok()
+}
+
 // ── Project path helpers ── // added: project-scoped tracking support
 
 /// Get the canonical project path string for the current working directory.
@@ -1316,9 +1350,22 @@ fn categorize_command(rtk_cmd: &str) -> String {
 }
 
 fn get_db_path() -> Result<PathBuf> {
-    // Priority 1: Environment variable RTK_DB_PATH
+    // Priority 1: Environment variable RTK_DB_PATH (also acts as the explicit
+    // opt-in for `cargo test` runs that want to exercise real writes).
     if let Ok(custom_path) = std::env::var("RTK_DB_PATH") {
         return Ok(PathBuf::from(custom_path));
+    }
+
+    // Issue #91: when running under `cargo test`, redirect to a per-process
+    // tmpfile so test runs don't pollute the production `history.db`. Tests
+    // that need to inspect tracking still work because every `Tracker::new()`
+    // call within the same process resolves to the same path.
+    if is_test_context() {
+        let tmp = std::env::temp_dir().join(format!(
+            "contextcrawler-test-{}.db",
+            std::process::id()
+        ));
+        return Ok(tmp);
     }
 
     // Priority 2: Configuration file
@@ -1836,10 +1883,18 @@ mod tests {
 
         env::remove_var("RTK_DB_PATH");
         let db_path = get_db_path().expect("Failed to get db path");
+        // Under `cargo test` (issue #91), without RTK_DB_PATH the path is
+        // redirected to a per-process tmpfile, NOT the production history.db.
+        // In a release build with CARGO_PKG_NAME unset the default platform
+        // path would apply; here we just assert the redirect target.
+        let s = db_path.display().to_string();
         assert!(
-            db_path.ends_with("rtk/history.db"),
-            "expected default path ending with rtk/history.db, got: {}",
-            db_path.display()
+            s.contains("contextcrawler-test-"),
+            "expected test-context tmpfile redirect, got: {s}"
+        );
+        assert!(
+            !s.ends_with("rtk/history.db"),
+            "must not resolve to production history.db under cargo test, got: {s}"
         );
     }
 
@@ -1920,6 +1975,126 @@ mod tests {
         // We can't assert exact rate because other tests may have added records,
         // but we can verify recovery_rate is between 0 and 100
         assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+    }
+
+    // Issue #91 — `cargo test` must not write to production history.db.
+    #[test]
+    fn test_is_test_context_true_in_cargo_test() {
+        // RTK_DB_PATH overrides the test-context check (explicit opt-in path).
+        // Save/restore around the env mutation.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("RTK_DB_PATH").ok();
+        std::env::remove_var("RTK_DB_PATH");
+        assert!(
+            is_test_context(),
+            "is_test_context() must be true under `cargo test` (cfg!(test) + CARGO_PKG_NAME set, any build mode)"
+        );
+        if let Some(v) = prior {
+            std::env::set_var("RTK_DB_PATH", v);
+        }
+    }
+
+    /// Codex review — release-mode integration tests spawn the binary as a
+    /// child process where `cfg!(test)` is FALSE (the spawned binary is not
+    /// itself a test runner). The `CONTEXTCRAWLER_TEST_MODE=1` sentinel set
+    /// by the test harness is what keeps that child from polluting the
+    /// production DB. Assert the sentinel path works.
+    #[test]
+    fn test_is_test_context_true_under_sentinel_env() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prior_db = std::env::var("RTK_DB_PATH").ok();
+        let prior_mode = std::env::var("CONTEXTCRAWLER_TEST_MODE").ok();
+        std::env::remove_var("RTK_DB_PATH");
+        std::env::set_var("CONTEXTCRAWLER_TEST_MODE", "1");
+
+        assert!(
+            is_test_context(),
+            "CONTEXTCRAWLER_TEST_MODE=1 must force is_test_context() true \
+             (covers release-built spawned-binary integration tests)"
+        );
+
+        // Restore.
+        if let Some(v) = prior_db {
+            std::env::set_var("RTK_DB_PATH", v);
+        }
+        match prior_mode {
+            Some(v) => std::env::set_var("CONTEXTCRAWLER_TEST_MODE", v),
+            None => std::env::remove_var("CONTEXTCRAWLER_TEST_MODE"),
+        }
+    }
+
+    #[test]
+    fn test_tracking_no_writes_to_production_in_test_context() {
+        // Resolves get_db_path() under the active test process — must NOT
+        // point at the production history.db. The redirect target is a
+        // per-process tmpfile.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("RTK_DB_PATH").ok();
+        std::env::remove_var("RTK_DB_PATH");
+        let p = get_db_path().expect("get_db_path");
+        let p_str = p.display().to_string();
+        assert!(
+            p_str.contains("contextcrawler-test-"),
+            "test runs must redirect get_db_path → tmpfile, got: {p_str}"
+        );
+        assert!(
+            !p_str.ends_with("rtk/history.db"),
+            "test runs must not resolve to production history.db, got: {p_str}"
+        );
+        if let Some(v) = prior {
+            std::env::set_var("RTK_DB_PATH", v);
+        }
+    }
+
+    #[test]
+    fn test_rtk_db_path_overrides_test_context() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("RTK_DB_PATH").ok();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "contextcrawler-optin-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("RTK_DB_PATH", &tmp);
+
+        // is_test_context() must return false under opt-in
+        assert!(
+            !is_test_context(),
+            "RTK_DB_PATH must override is_test_context()"
+        );
+
+        // And get_db_path resolves to that exact path
+        let p = get_db_path().expect("get_db_path");
+        assert_eq!(p, tmp);
+
+        // Round-trip a record through the opt-in DB.
+        let tracker = Tracker::new().expect("tracker open");
+        let marker = format!("contextcrawler optin_{}", std::process::id());
+        tracker
+            .record("orig", &marker, 100, 20, 5)
+            .expect("record under opt-in must persist");
+        let recent = tracker.get_recent(50).expect("get_recent");
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == marker),
+            "opt-in record not persisted"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+        std::env::remove_var("RTK_DB_PATH");
+        if let Some(v) = prior {
+            std::env::set_var("RTK_DB_PATH", v);
+        }
     }
 
     #[test]

@@ -21,6 +21,8 @@ fn run_capture_stderr(args: &[&str], extra_env: &[(&str, &str)]) -> String {
     let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(args);
+    // Issue #91 — sentinel for release-built spawned binary.
+    cmd.env("CONTEXTCRAWLER_TEST_MODE", "1");
     // Start from a known-clean env baseline so test results don't depend on
     // whatever the host shell happens to export. Then layer extras on top.
     cmd.env_remove("CONTEXTCRAWLER_NO_PROXY_NUDGE");
@@ -73,6 +75,8 @@ fn proxy_nudge_suppressed_when_stderr_not_tty() {
     let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(["proxy", "sed", "--version"]);
+    // Issue #91 — sentinel for release-built spawned binary.
+    cmd.env("CONTEXTCRAWLER_TEST_MODE", "1");
     cmd.env_remove("CONTEXTCRAWLER_NO_PROXY_NUDGE");
     cmd.env_remove("CI");
     let out = cmd.output().expect("spawn contextcrawler");

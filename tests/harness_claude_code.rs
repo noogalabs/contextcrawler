@@ -184,6 +184,9 @@ fn run_hook(bin: &Path, db_path: &Path, raw_cmd: &str) -> (Option<String>, u128)
     let mut child = Command::new(bin)
         .arg("hook")
         .arg("claude")
+        // Issue #91 — sentinel so release-built spawned binary suppresses
+        // production-DB writes (cfg!(test) is false in the child).
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RTK_DB_PATH", db_path)
         .env("RTK_TELEMETRY_DISABLED", "1")
         .stdin(Stdio::piped())
@@ -228,6 +231,12 @@ fn run_shell(cmd_line: &str) -> (String, i32, u128) {
         .arg("-c")
         .arg(cmd_line)
         .current_dir(manifest_dir())
+        // Issue #91 — propagates into the contextcrawler child that `sh -c`
+        // spawns from the rewritten command line. Without this, the bench
+        // fixture commands (git status / find / grep …) hit the production
+        // history.db on release builds. Codex review pollution probe found
+        // this with a non-zero delta after the first patch round.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RTK_TELEMETRY_DISABLED", "1")
         // Suppress pager/interactive prompts that would hang the harness.
         .env("GIT_PAGER", "cat")
@@ -255,15 +264,26 @@ fn run_shell(cmd_line: &str) -> (String, i32, u128) {
 /// global shim resolves to the installed binary).
 fn resolve_rtk_prefix(rewritten: &str, bin: &Path) -> String {
     let bin_str = bin.to_string_lossy().into_owned();
-    if let Some(rest) = rewritten.strip_prefix("rtk ") {
+    // Post-rebrand the hook emits `contextcrawler …`; pre-rebrand it emitted
+    // `rtk …`. Handle both so this harness exercises the test binary
+    // (target/debug/contextcrawler) rather than whatever stale global binary
+    // happens to be on PATH (which would also pollute the production DB
+    // because it predates the issue #91 fix).
+    if let Some(rest) = rewritten.strip_prefix("contextcrawler ") {
+        format!("{bin_str} {rest}")
+    } else if rewritten == "contextcrawler" {
+        bin_str
+    } else if let Some(rest) = rewritten.strip_prefix("rtk ") {
         format!("{bin_str} {rest}")
     } else if rewritten == "rtk" {
         bin_str
     } else {
         // Compound commands like `cd "/tmp" && rtk git status`: replace
-        // every " rtk " token boundary too. We keep this conservative —
-        // only the literal "rtk " substring after a non-alphanumeric.
-        rewritten.replace(" rtk ", &format!(" {bin_str} "))
+        // every " rtk " / " contextcrawler " token boundary too. Keep this
+        // conservative — literal-substring replacement only.
+        rewritten
+            .replace(" contextcrawler ", &format!(" {bin_str} "))
+            .replace(" rtk ", &format!(" {bin_str} "))
     }
 }
 

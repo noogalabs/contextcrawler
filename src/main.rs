@@ -1639,6 +1639,63 @@ fn web_ssrf_block_reason(ip: &std::net::IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Meta flags (`--version`, `-V`, `--help`, `-h`) that wrapper subcommands
+/// don't explicitly declare. Without a pre-clap intercept these fall through
+/// to `run_fallback` → raw exec, which writes a noisy parse_failure row per
+/// invocation. Issue #90.
+const META_FLAGS: &[&str] = &["--version", "-V", "--help", "-h"];
+
+/// Wrappers that accept meta flags but don't pass them through cleanly via
+/// clap. Pre-clap intercept routes these straight to a timed passthrough so
+/// `contextcrawler cargo --version` works without a parse_failure row.
+///
+/// Codex review extension: the original list missed wrappers whose clap
+/// subcommand structure also lacks a top-level `--version`/`--help` arm —
+/// `gh`, `glab`, `aws`, `psql`, `prisma`, `gt`. Without these, meta flags
+/// fell through to `run_fallback` → raw exec and produced parse_failure
+/// rows. The regression test `meta_passthrough_covers_all_subcommand_only_wrappers`
+/// guards against future drift.
+const META_PASSTHROUGH_BINS: &[&str] = &[
+    "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
+    "gh", "glab", "aws", "psql", "prisma", "gt",
+];
+
+fn cmd_has_meta_flag(args: &[String]) -> bool {
+    args.iter().any(|a| META_FLAGS.contains(&a.as_str()))
+}
+
+/// Timed raw passthrough used by the meta-flag intercept. Records a
+/// passthrough row (so the call shows up in `gain --history`) but bypasses
+/// clap/parse_failure entirely.
+fn run_simple_passthrough(cmd: &str, args: &[String]) -> Result<i32> {
+    use crate::core::tracking::TimedExecution;
+    let timer = TimedExecution::start();
+    let status = crate::core::utils::resolved_command(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+    let raw_command = if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{} {}", cmd, args.join(" "))
+    };
+    match status {
+        Ok(s) => {
+            timer.track_passthrough(
+                &raw_command,
+                &format!("contextcrawler {} (meta passthrough)", raw_command),
+            );
+            Ok(crate::core::utils::exit_code_from_status(&s, &raw_command))
+        }
+        Err(e) => {
+            eprintln!("[contextcrawler: {}]", e);
+            Ok(127)
+        }
+    }
+}
+
 /// Documented grep format flags that should run raw rather than go through
 /// rtk's filter. Short letters are matched anywhere inside a single-`-` bundle
 /// (e.g. `-c`, `-ci`, `-cE`). Long forms match exactly.
@@ -2146,6 +2203,70 @@ mod grep_preprocess_tests {
     }
 }
 
+#[cfg(test)]
+mod meta_flag_tests {
+    use super::{cmd_has_meta_flag, META_PASSTHROUGH_BINS};
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_cmd_has_meta_flag_detects_version() {
+        assert!(cmd_has_meta_flag(&args(&["--version"])));
+    }
+
+    #[test]
+    fn test_cmd_has_meta_flag_short_v() {
+        assert!(cmd_has_meta_flag(&args(&["-V"])));
+    }
+
+    #[test]
+    fn test_cmd_has_meta_flag_help() {
+        assert!(cmd_has_meta_flag(&args(&["--help"])));
+        assert!(cmd_has_meta_flag(&args(&["-h"])));
+    }
+
+    #[test]
+    fn test_cmd_has_meta_flag_ignores_subcmd() {
+        assert!(!cmd_has_meta_flag(&args(&["build"])));
+        assert!(!cmd_has_meta_flag(&args(&["test", "--release"])));
+        assert!(!cmd_has_meta_flag(&args(&[])));
+    }
+
+    #[test]
+    fn test_cmd_has_meta_flag_meta_anywhere() {
+        // Meta flag mid-args still counts (e.g. `cargo build --version` is
+        // unusual but harmless to intercept).
+        assert!(cmd_has_meta_flag(&args(&["build", "--version"])));
+    }
+
+    /// Regression guard (Codex review of #90/#91): all wrappers that route
+    /// to filters via clap subcommand structure but don't accept
+    /// `--version`/`--help` at the top level MUST be in
+    /// `META_PASSTHROUGH_BINS`. Otherwise meta-flag invocations fall through
+    /// to `run_fallback` → raw exec and pollute `parse_failures`.
+    ///
+    /// If you add a new subcommand-only wrapper in this binary, add it to
+    /// `META_PASSTHROUGH_BINS` AND extend the `expected` list below.
+    #[test]
+    fn test_meta_passthrough_covers_all_subcommand_only_wrappers() {
+        let expected = [
+            "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
+            "gh", "glab", "aws", "psql", "prisma", "gt",
+        ];
+        for bin in expected {
+            assert!(
+                META_PASSTHROUGH_BINS.contains(&bin),
+                "missing {} from META_PASSTHROUGH_BINS — meta-flag \
+                 invocations of `contextcrawler {} --version` will pollute \
+                 parse_failures",
+                bin, bin
+            );
+        }
+    }
+}
+
 fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
@@ -2202,6 +2323,16 @@ fn run_cli() -> Result<i32> {
                     full.extend(stripped);
                     parsed_argv = full;
                 }
+            }
+        }
+
+        // Pre-clap intercept: meta flags (--version, -V, --help, -h) on
+        // wrapper subcommands. Without this, `contextcrawler cargo --version`
+        // falls through clap → run_fallback → raw exec, writing a
+        // parse_failure row per call. Issue #90.
+        if let Some(bin) = raw_args.first().map(|s| s.as_str()) {
+            if META_PASSTHROUGH_BINS.contains(&bin) && cmd_has_meta_flag(&raw_args[1..]) {
+                return run_simple_passthrough(bin, &raw_args[1..]);
             }
         }
     }
