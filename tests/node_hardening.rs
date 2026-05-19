@@ -121,6 +121,8 @@ fn node_options_require_does_not_execute_evil_js_via_tsc() {
         let _guard = common::env_lock();
         let _ = Command::new(binary_path())
             .args(["tsc", "--version"])
+            // Issue #91 — sentinel for release-built spawned binary.
+            .env("CONTEXTCRAWLER_TEST_MODE", "1")
             .env("NODE_OPTIONS", &node_options)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -163,6 +165,8 @@ fn npm_config_userconfig_is_ignored() {
         let _guard = common::env_lock();
         let out = Command::new(binary_path())
             .args(["npm", "config", "get", "registry"])
+            // Issue #91 — sentinel for release-built spawned binary.
+            .env("CONTEXTCRAWLER_TEST_MODE", "1")
             .env("NPM_CONFIG_USERCONFIG", &evil_npmrc)
             // Be defensive: also wipe any pre-existing per-user
             // overrides from the parent env that could shadow the
@@ -194,6 +198,8 @@ fn vitest_rejects_reporter_path() {
 
     let out = Command::new(binary_path())
         .args(["vitest", "--reporter", "/tmp/evil-reporter.js"])
+        // Issue #91 — sentinel for release-built spawned binary.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .output()
         .expect("spawn contextcrawler vitest");
 
@@ -233,6 +239,8 @@ fn npm_version_still_works() {
 
     let out = Command::new(binary_path())
         .args(["npm", "--version"])
+        // Issue #91 — sentinel for release-built spawned binary.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .output()
         .expect("spawn contextcrawler npm --version");
 

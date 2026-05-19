@@ -66,6 +66,8 @@ fn rustc_wrapper_does_not_fire_under_version() {
     let output = Command::new(binary_path())
         .arg("cargo")
         .arg("--version")
+        // Issue #91 — sentinel for release-built spawned binary.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RUSTC_WRAPPER", &script)
         .output()
         .expect("spawn contextcrawler cargo --version");
@@ -111,6 +113,8 @@ fn rustc_wrapper_env_is_stripped_during_check() {
         .arg("cargo")
         .arg("check")
         .arg("--offline")
+        // Issue #91 — sentinel for release-built spawned binary.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RUSTC_WRAPPER", &script)
         // Isolate target dir into the temp crate so we don't poison the
         // outer workspace's build cache.
@@ -143,6 +147,8 @@ fn target_runner_config_is_rejected() {
         .arg("build")
         .arg("--config")
         .arg("target.x86_64-apple-darwin.runner=\"evil\"")
+        // Issue #91 — sentinel for release-built spawned binary.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .output()
         .expect("spawn contextcrawler cargo build");
 
@@ -180,6 +186,8 @@ fn benign_cargo_version_still_works() {
     let output = Command::new(binary_path())
         .arg("cargo")
         .arg("--version")
+        // Issue #91 — sentinel for release-built spawned binary.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .output()
         .expect("spawn contextcrawler cargo --version");
 

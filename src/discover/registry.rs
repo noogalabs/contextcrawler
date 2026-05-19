@@ -61,8 +61,10 @@ lazy_static! {
     };
     // Git global options that appear before the subcommand: -C <path>, -c <key=val>,
     // --git-dir <dir>, --work-tree <dir>, and flag-only options (#163)
+    // #84: support quoted values for -C/-c/--git-dir/--work-tree, e.g.
+    // `git -c "core.editor=vim -w" merge` — `\S+` alone stops at the inner space.
     static ref GIT_GLOBAL_OPT: Regex =
-        Regex::new(r"^(?:(?:-C\s+\S+|-c\s+\S+|--git-dir(?:=\S+|\s+\S+)|--work-tree(?:=\S+|\s+\S+)|--no-pager|--no-optional-locks|--bare|--literal-pathspecs)\s+)+").unwrap();
+        Regex::new(r#"^(?:(?:-C\s+(?:"[^"]+"|'[^']+'|\S+)|-c\s+(?:"[^"]+"|'[^']+'|\S+)|--git-dir(?:=(?:"[^"]+"|'[^']+'|\S+)|\s+(?:"[^"]+"|'[^']+'|\S+))|--work-tree(?:=(?:"[^"]+"|'[^']+'|\S+)|\s+(?:"[^"]+"|'[^']+'|\S+))|--no-pager|--no-optional-locks|--bare|--literal-pathspecs)\s+)+"#).unwrap();
     // Issue #1362: each capture expects a SINGLE file argument (`\S+$`). Multi-file
     // invocations like `head -3 a b c` fail to match so the segment is passed through
     // to the native `head`/`tail` binary — which already handles multi-file with
@@ -97,6 +99,11 @@ pub fn classify_command(cmd: &str) -> Classification {
         return Classification::Ignored;
     }
 
+    // #87: $VAR-prefixed commands are shell expansions, not classifiable commands.
+    if trimmed.starts_with('$') {
+        return Classification::Ignored;
+    }
+
     // Check ignored
     for exact in IGNORED_EXACT {
         if trimmed == *exact {
@@ -109,21 +116,13 @@ pub fn classify_command(cmd: &str) -> Classification {
         }
     }
 
-    // Strip env prefixes (sudo, env VAR=val, VAR=val)
-    let stripped = ENV_PREFIX.replace(trimmed, "");
-    let cmd_clean = stripped.trim();
+    // Normalise: strip env prefixes (sudo, env VAR=val), absolute paths
+    // (/usr/bin/grep -> grep, #485), and git/golangci global opts (#163, #83).
+    let cmd_normalized = normalise_command(trimmed);
+    let cmd_clean = cmd_normalized.trim();
     if cmd_clean.is_empty() {
         return Classification::Ignored;
     }
-
-    // Normalize absolute binary paths: /usr/bin/grep → grep (#485)
-    let cmd_normalized = strip_absolute_path(cmd_clean);
-    // Strip git global options: git -C /tmp status → git status (#163)
-    let cmd_normalized = strip_git_global_opts(&cmd_normalized);
-    // Strip golangci-lint global options before `run` so classify/rewrite stays
-    // aligned with the runtime wrapper behavior.
-    let cmd_normalized = strip_golangci_global_opts(&cmd_normalized);
-    let cmd_clean = cmd_normalized.as_str();
 
     // Exclude cat/head/tail with redirect operators — these are writes, not reads (#315)
     if cmd_clean.starts_with("cat ")
@@ -258,6 +257,21 @@ fn strip_git_global_opts(cmd: &str) -> String {
     let after_git = &cmd[4..]; // skip "git "
     let stripped = GIT_GLOBAL_OPT.replace(after_git, "");
     format!("git {}", stripped.trim())
+}
+
+/// Normalise a command for classifier/rewriter input so the same form is
+/// seen by `classify_command`, `rewrite_segment_inner`, and the
+/// `is_excluded` check (#83):
+/// 1. Strip env-style prefix (env VAR=val, sudo) — handles `sudo /usr/bin/env`
+/// 2. Strip absolute binary path (/usr/bin/env -> env)
+/// 3. Re-strip env-style prefix so the surfaced `env <cmd>` is removed
+/// 4. Strip git/golangci-lint global opts
+fn normalise_command(cmd: &str) -> String {
+    let stripped = ENV_PREFIX.replace(cmd.trim(), "").to_string();
+    let stripped = strip_absolute_path(&stripped);
+    let stripped = ENV_PREFIX.replace(&stripped, "").to_string();
+    let stripped = strip_git_global_opts(stripped.trim());
+    strip_golangci_global_opts(&stripped)
 }
 
 /// Strip golangci-lint global options before the `run` subcommand.
@@ -782,12 +796,14 @@ fn rewrite_segment_inner(
         }
     }
 
-    // Use classify_command for correct ignore/prefix handling
+    // Use classify_command for correct ignore/prefix handling.
+    // is_excluded must see the same fully-normalised form as classify (#83
+    // follow-up) so user-configured exclude_commands rules apply to
+    // `/usr/bin/env git ...` and `sudo /usr/bin/env git ...`.
     let rtk_equivalent = match classify_command(cmd_part) {
         Classification::Supported { rtk_equivalent, .. } => {
-            let stripped = ENV_PREFIX.replace(cmd_part, "");
-            let cmd_clean = stripped.trim();
-            if is_excluded(cmd_clean, excluded) {
+            let normalised_for_exclude = normalise_command(cmd_part);
+            if is_excluded(normalised_for_exclude.trim(), excluded) {
                 return None;
             }
             rtk_equivalent
@@ -795,10 +811,17 @@ fn rewrite_segment_inner(
         _ => return None,
     };
 
+    // Lighter normalisation for downstream rule processing: strip absolute
+    // path and env-style prefix only. Global git/golangci opts must be
+    // preserved here because the rewrite logic below re-uses them. (#83)
+    let cmd_part_norm = strip_absolute_path(cmd_part);
+    let cmd_part_norm = ENV_PREFIX.replace(&cmd_part_norm, "").to_string();
+    let cmd_part_norm = cmd_part_norm.trim();
+
     // Find the matching rule (rtk_cmd values are unique across all rules)
     let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
 
-    if let Some(parts) = parse_golangci_run_parts(cmd_part) {
+    if let Some(parts) = parse_golangci_run_parts(cmd_part_norm) {
         let rewritten = if parts.global_segment.is_empty() {
             format!("contextcrawler golangci-lint {}", parts.run_segment)
         } else {
@@ -813,7 +836,7 @@ fn rewrite_segment_inner(
     // #196: gh with --json/--jq/--template produces structured output that
     // rtk gh would corrupt — skip rewrite so the caller gets raw JSON.
     if rule.rtk_cmd == "contextcrawler gh" {
-        let args_lower = cmd_part.to_lowercase();
+        let args_lower = cmd_part_norm.to_lowercase();
         if args_lower.contains("--json")
             || args_lower.contains("--jq")
             || args_lower.contains("--template")
@@ -824,7 +847,7 @@ fn rewrite_segment_inner(
 
     // Try each rewrite prefix (longest first) with word-boundary check
     for &prefix in rule.rewrite_prefixes {
-        if let Some(rest) = strip_word_prefix(cmd_part, prefix) {
+        if let Some(rest) = strip_word_prefix(cmd_part_norm, prefix) {
             let rewritten = if rest.is_empty() {
                 format!("{}{}", rule.rtk_cmd, redirect_suffix)
             } else {
@@ -871,6 +894,71 @@ mod tests {
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
             }
+        );
+    }
+
+    #[test]
+    fn test_classify_env_prefix_absolute_path() {
+        // /usr/bin/env <cmd> must classify the same as the bare command (#83)
+        assert_eq!(
+            classify_command("/usr/bin/env git status"),
+            Classification::Supported {
+                rtk_equivalent: "contextcrawler git",
+                category: "Git",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_env_prefix_relative() {
+        // Regression guard: bare `env <cmd>` already worked, keep it that way (#83)
+        assert_eq!(
+            classify_command("env git status"),
+            Classification::Supported {
+                rtk_equivalent: "contextcrawler git",
+                category: "Git",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_prefix_absolute_path() {
+        // /usr/bin/env <cmd> must rewrite to the contextcrawler equivalent (#83)
+        assert_eq!(
+            rewrite_command("/usr/bin/env git status", &[], &[]),
+            Some("contextcrawler git status".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_prefix_respects_exclude() {
+        // is_excluded must see the normalised form so exclude_commands works
+        // even when the user runs `/usr/bin/env git ...` (#83 follow-up).
+        assert_eq!(
+            rewrite_command("/usr/bin/env git status", &["git".into()], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_sudo_env_prefix_respects_exclude() {
+        assert_eq!(
+            rewrite_command("sudo /usr/bin/env git status", &["git".into()], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_prefix_not_excluded() {
+        // Regression guard: env-prefixed git still rewrites when the
+        // exclude list does not cover it.
+        assert_eq!(
+            rewrite_command("/usr/bin/env git status", &["docker".into()], &[]),
+            Some("contextcrawler git status".to_string())
         );
     }
 
@@ -990,6 +1078,28 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_tirith_ignored() {
+        // #86: tirith is our own defense-in-depth gate, not an unsupported command.
+        assert_eq!(
+            classify_command("tirith scan ./src"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
+    fn test_classify_shell_variable_ignored() {
+        // #87: $VAR-prefixed commands are shell expansions; can't classify.
+        assert_eq!(
+            classify_command("$EDITOR foo.txt"),
+            Classification::Ignored
+        );
+        assert_eq!(
+            classify_command("$(which git) status"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
     fn test_classify_echo_ignored() {
         assert_eq!(
             classify_command("echo hello world"),
@@ -1100,10 +1210,30 @@ mod tests {
 
     #[test]
     fn test_registry_covers_all_git_subcommands() {
-        // Verify that every GitCommand subcommand has a matching pattern
+        // Verify that every GitCommand subcommand has a matching pattern,
+        // including the post-#84 expanded set routed through the passthrough.
         for subcmd in [
-            "status", "log", "diff", "show", "add", "commit", "push", "pull", "branch", "fetch",
-            "stash", "worktree",
+            "status",
+            "log",
+            "diff",
+            "show",
+            "add",
+            "commit",
+            "push",
+            "pull",
+            "branch",
+            "fetch",
+            "stash",
+            "worktree",
+            "checkout",
+            "switch",
+            "restore",
+            "merge",
+            "rebase",
+            "reset",
+            "tag",
+            "remote",
+            "cherry-pick",
         ] {
             let cmd = format!("git {subcmd}");
             match classify_command(&cmd) {
@@ -1111,6 +1241,62 @@ mod tests {
                 other => panic!("git {subcmd} should be Supported, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_classify_git_checkout() {
+        // #84: checkout must classify as Supported (routed via passthrough).
+        assert_eq!(
+            classify_command("git checkout -b foo develop"),
+            Classification::Supported {
+                rtk_equivalent: "contextcrawler git",
+                category: "Git",
+                estimated_savings_pct: 30.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_git_merge_with_c_flag() {
+        // #84: `-c key=val` global flags before the subcommand should not
+        // defeat classification. cherry-pick also has to survive its hyphen.
+        match classify_command("git -c commit.gpgsign=false merge --no-ff foo") {
+            Classification::Supported {
+                category: "Git", ..
+            } => {}
+            other => panic!("git -c ... merge should be Supported, got {other:?}"),
+        }
+        match classify_command("git cherry-pick abc123") {
+            Classification::Supported {
+                category: "Git", ..
+            } => {}
+            other => panic!("git cherry-pick should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_git_checkout_tag_helper_not_matched() {
+        // Codex review: without a word-boundary anchor after the subcommand
+        // capture, `git checkout-tag-helper foo` would falsely match the
+        // `checkout` alternation. The `(?:\s|$)` anchor in rules.rs prevents that.
+        match classify_command("git checkout-tag-helper foo") {
+            Classification::Supported { category: "Git", .. } => {
+                panic!("git checkout-tag-helper should NOT classify as Supported Git");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_classify_git_c_quoted_value() {
+        // Codex review: GIT_GLOBAL_OPT must handle quoted `-c` values with
+        // embedded whitespace, e.g. `-c "core.editor=vim -w"`.
+        let cls = classify_command(r#"git -c "core.editor=vim -w" merge --no-ff foo"#);
+        assert!(
+            matches!(cls, Classification::Supported { category: "Git", .. }),
+            "expected Supported Git, got {cls:?}"
+        );
     }
 
     #[test]
