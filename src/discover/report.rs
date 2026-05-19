@@ -84,6 +84,16 @@ pub struct DiscoverReport {
     pub sessions_scanned: usize,
     pub total_commands: usize,
     pub already_rtk: usize,
+    /// Subset of `already_rtk` attributable to the PreToolUse hook rewriting
+    /// the command at runtime — detected by cross-referencing the JSONL
+    /// transcript against the contextcrawler tracking DB.
+    #[serde(default)]
+    pub rtk_via_runtime: usize,
+    /// Banner emitted when the tracking DB couldn't be opened — `None` on the
+    /// happy path. Surfaced above the MISSED SAVINGS section so users
+    /// understand a stale miss count may be over-reporting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconcile_warning: Option<String>,
     pub since_days: u64,
     pub supported: Vec<SupportedEntry>,
     pub unsupported: Vec<UnsupportedEntry>,
@@ -117,15 +127,26 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
         "Scanned: {} sessions (last {} days), {} Bash commands\n",
         report.sessions_scanned, report.since_days, report.total_commands
     ));
-    out.push_str(&format!(
-        "Already using RTK: {} commands ({:.1}%)\n",
-        report.already_rtk,
-        if report.total_commands > 0 {
-            report.already_rtk as f64 * 100.0 / report.total_commands as f64
-        } else {
-            0.0
-        }
-    ));
+    let already_pct = if report.total_commands > 0 {
+        report.already_rtk as f64 * 100.0 / report.total_commands as f64
+    } else {
+        0.0
+    };
+    if report.rtk_via_runtime > 0 {
+        out.push_str(&format!(
+            "Already using RTK: {} commands ({:.1}%)  -- {} via hook rewrite (runtime tracked)\n",
+            report.already_rtk, already_pct, report.rtk_via_runtime
+        ));
+    } else {
+        out.push_str(&format!(
+            "Already using RTK: {} commands ({:.1}%)\n",
+            report.already_rtk, already_pct
+        ));
+    }
+
+    if let Some(warning) = &report.reconcile_warning {
+        out.push_str(&format!("\nWARNING: {}\n", warning));
+    }
 
     if report.supported.is_empty() && report.unsupported.is_empty() {
         out.push_str("\nNo missed savings found. RTK usage looks good!\n");
@@ -261,6 +282,8 @@ mod tests {
             sessions_scanned: 1,
             total_commands,
             already_rtk,
+            rtk_via_runtime: 0,
+            reconcile_warning: None,
             since_days: 30,
             supported: vec![],
             unsupported: vec![],

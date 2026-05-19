@@ -203,6 +203,8 @@ mod tests {
             output_content: None,
             is_error: false,
             sequence_index: 0,
+            timestamp: None,
+            session_project_slug: None,
         }
     }
 
@@ -436,5 +438,30 @@ mod tests {
         let (total, rtk, _) = count_rtk_commands(&cmds);
         assert_eq!(total, 2, "chain splits into cd + rtk ls");
         assert_eq!(rtk, 1, "rtk ls is covered, cd is not");
+    }
+
+    #[test]
+    fn test_extract_commands_populates_timestamp() {
+        // Codex NICE-TO-HAVE #2: JSONL with a top-level ISO-8601 timestamp
+        // must surface as `Some(...)` on the ExtractedCommand. The
+        // reconcile path depends on this and was previously untested.
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-05-19T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git status"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"clean"}]}}"#,
+        ];
+
+        let mut tmp = NamedTempFile::new().expect("create tempfile");
+        for line in &jsonl {
+            writeln!(tmp, "{}", line).expect("write line");
+        }
+
+        let provider = ClaudeProvider;
+        let cmds = provider.extract_commands(tmp.path()).expect("parse JSONL");
+
+        assert_eq!(cmds.len(), 1);
+        let ts = cmds[0]
+            .timestamp
+            .expect("timestamp should be Some when JSONL provides it");
+        assert_eq!(ts.to_rfc3339(), "2026-05-19T10:00:00+00:00");
     }
 }
