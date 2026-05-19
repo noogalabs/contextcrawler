@@ -1671,6 +1671,109 @@ fn grep_format_flag_present(args: &[String]) -> bool {
     false
 }
 
+/// Result of pre-clap grep preprocessing.
+///
+/// `Stripped` — recursive flags (`-r`/`-R`/`--recursive`) were removed; the
+/// remaining args are safe to hand to clap. rg is recursive by default so
+/// dropping `-r` doesn't change behaviour.
+///
+/// `Passthrough` — call contains context flags (`-A`/`-B`/`-C` or their long
+/// forms) that the rtk-backed grep filter can't honour line-by-line; route
+/// the whole call to `run_grep_format_passthrough` (which uses rg natively
+/// and understands recursive flags).
+#[derive(Debug, PartialEq, Eq)]
+enum GrepPreprocess {
+    Stripped(Vec<String>),
+    Passthrough(Vec<String>),
+}
+
+/// Two-pass pre-clap normaliser for `grep` subcommand args.
+///
+/// Pass 1 strips `-r`/`-R`/`--recursive` (rg is recursive by default).
+/// Pass 2 detects context flags (`-A`/`-B`/`-C`, `--after-context` etc.)
+/// and routes the stripped args to passthrough so rg handles them
+/// natively. Stripping is intentionally applied to the passthrough path
+/// too — rg interprets bare `-r` as `--replace` (replacement string),
+/// not recursive, so leaving it in would silently produce wrong matches.
+/// See issue #88 and the Codex review on the original fix.
+fn preprocess_grep_args(args: Vec<String>) -> GrepPreprocess {
+    // Pass 1: strip recursive flags from short bundles + long forms.
+    // Iterator-based; only allocate a new String when a bundle actually
+    // needs rewriting. Tokens that survive untouched are moved as-is.
+    let mut stripped: Vec<String> = Vec::with_capacity(args.len());
+    for arg in args.into_iter() {
+        if arg == "-r" || arg == "-R" || arg == "--recursive" {
+            continue;
+        }
+        // Single-`-` bundle of alphabetic chars: strip r/R, keep rest.
+        // Avoid the chars().collect::<Vec<_>>() — scan bytes directly.
+        if arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") {
+            let body = &arg[1..];
+            let bytes = body.as_bytes();
+            let all_alpha = bytes.iter().all(|b| b.is_ascii_alphabetic());
+            if all_alpha {
+                let has_recursive = bytes.iter().any(|b| *b == b'r' || *b == b'R');
+                if has_recursive {
+                    let kept: String = body
+                        .bytes()
+                        .filter(|b| *b != b'r' && *b != b'R')
+                        .map(|b| b as char)
+                        .collect();
+                    if kept.is_empty() {
+                        continue;
+                    }
+                    stripped.push(format!("-{}", kept));
+                    continue;
+                }
+            }
+        }
+        stripped.push(arg);
+    }
+
+    // Pass 2: detect context flags anywhere in the stripped args. If any
+    // present, route stripped args to passthrough.
+    if has_grep_context_flag(&stripped) {
+        return GrepPreprocess::Passthrough(stripped);
+    }
+
+    GrepPreprocess::Stripped(stripped)
+}
+
+/// True if any arg is a grep context flag (`-A`/`-B`/`-C` short or long).
+fn has_grep_context_flag(args: &[String]) -> bool {
+    const LONG_FLAGS: &[&str] = &["--after-context", "--before-context", "--context"];
+
+    for arg in args {
+        // Long forms — match exact and `--flag=value`.
+        if LONG_FLAGS.iter().any(|f| arg == f || arg.starts_with(&format!("{}=", f))) {
+            return true;
+        }
+        if arg.starts_with("--") || !arg.starts_with('-') || arg.len() < 2 {
+            continue;
+        }
+        // Standalone `-A`/`-B`/`-C` (next arg is the value).
+        if arg.len() == 2 {
+            let c = arg.chars().nth(1).unwrap();
+            if c == 'A' || c == 'B' || c == 'C' {
+                return true;
+            }
+            continue;
+        }
+        // Bundle like `-A3`, `-iA3`, `-B2`. A/B/C followed by digits.
+        let body = &arg[1..];
+        let bytes = body.as_bytes();
+        for i in 0..bytes.len() {
+            let c = bytes[i];
+            if (c == b'A' || c == b'B' || c == b'C')
+                && bytes.get(i + 1).map(|n| n.is_ascii_digit()).unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Run the user's grep command through `rg` (ripgrep), bypassing clap and
 /// parse_failure tracking. We route through `rg` rather than bare `grep`
 /// because rg understands both the documented format flags (`-c`, `-L`, `-o`,
@@ -1861,6 +1964,188 @@ mod grep_format_flag_tests {
     }
 }
 
+#[cfg(test)]
+mod grep_preprocess_tests {
+    use super::{preprocess_grep_args, GrepPreprocess};
+
+    fn v(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_bare_r() {
+        let out = preprocess_grep_args(v(&["-r", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_bundled_rn() {
+        let out = preprocess_grep_args(v(&["-rn", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_bundled_nr() {
+        let out = preprocess_grep_args(v(&["-nr", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_capital_R() {
+        let out = preprocess_grep_args(v(&["-Rn", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_long_recursive() {
+        let out = preprocess_grep_args(v(&["--recursive", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_keeps_other_short_letters() {
+        let out = preprocess_grep_args(v(&["-in", "needle", "file"]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-in", "needle", "file"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_rin_to_in() {
+        let out = preprocess_grep_args(v(&["-rin", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-in", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_context_flag_short_routes_passthrough() {
+        let out = preprocess_grep_args(v(&["-A3", "needle", "file"]));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A3", "needle", "file"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_context_flag_long_routes_passthrough() {
+        let out = preprocess_grep_args(v(&["--after-context=3", "needle", "file"]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["--after-context=3", "needle", "file"]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_context_flag_with_space() {
+        let out = preprocess_grep_args(v(&["-A", "3", "needle", "file"]));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A", "3", "needle", "file"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_bundled_iA3_routes_passthrough_with_original() {
+        // -iA3 contains a context flag bundled with -i. Route to passthrough
+        // with original args so rg sees the full intent.
+        let out = preprocess_grep_args(v(&["-iA3", "needle", "file"]));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-iA3", "needle", "file"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_recursive_plus_context_strips_r_before_passthrough() {
+        // Codex review: rg reads bare `-r` as --replace, not recursive,
+        // so the stripper MUST run before passthrough too. rg is recursive
+        // by default — dropping `-r` is safe.
+        let out = preprocess_grep_args(v(&["-r", "-A3", "needle", "."]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-A3", "needle", "."]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_long_recursive_plus_context_strips_before_passthrough() {
+        let out = preprocess_grep_args(v(&["--recursive", "-A", "2", "needle", "."]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-A", "2", "needle", "."]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_bundled_rn_plus_context_strips_r() {
+        // Bundled -rn alongside -A3: r gets stripped from the bundle,
+        // -n + -A3 survive, route to passthrough.
+        let out = preprocess_grep_args(v(&["-rn", "-A3", "needle", "."]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-n", "-A3", "needle", "."]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_no_recursive_no_context_passes_through_unchanged() {
+        let out = preprocess_grep_args(v(&["-i", "-w", "pattern", "path"]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Stripped(v(&["-i", "-w", "pattern", "path"]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_dash_B_alone_routes_passthrough() {
+        let out = preprocess_grep_args(v(&["-B", "2", "needle", "file"]));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-B", "2", "needle", "file"])));
+    }
+
+    // ---- run_cli pipeline-ordering regression tests ----
+    //
+    // These mirror the run_cli ordering: preprocess first, then format-flag
+    // check on the stripped args. They guard against the Codex-reported bug
+    // where mixed `grep -c -r pat .` invocations bypassed the recursive
+    // stripper and reached rg with `-r` (which rg reads as --replace).
+
+    use super::grep_format_flag_present;
+
+    fn run_cli_grep_pipeline(args: Vec<String>) -> Vec<String> {
+        // Reproduces the relevant slice of run_cli's pre-clap routing so
+        // we can assert what the downstream consumer (rg or clap) actually
+        // sees. Returns the final args slice (without the leading "grep").
+        let preprocessed = preprocess_grep_args(args);
+        let working: &[String] = match &preprocessed {
+            GrepPreprocess::Stripped(a) | GrepPreprocess::Passthrough(a) => a.as_slice(),
+        };
+        if grep_format_flag_present(working) {
+            return working.to_vec();
+        }
+        match preprocessed {
+            GrepPreprocess::Passthrough(a) | GrepPreprocess::Stripped(a) => a,
+        }
+    }
+
+    #[test]
+    fn test_grep_format_flag_with_recursive_strips_r_before_passthrough() {
+        // Codex review case: `grep -c -r needle .` MUST NOT reach rg with
+        // -r in the args (rg would treat it as --replace).
+        let out = run_cli_grep_pipeline(v(&["-c", "-r", "needle", "."]));
+        assert!(!out.iter().any(|a| a == "-r"), "stale -r in: {:?}", out);
+        assert_eq!(out, v(&["-c", "needle", "."]));
+    }
+
+    #[test]
+    fn test_grep_format_flag_with_long_recursive() {
+        let out = run_cli_grep_pipeline(v(&["-c", "--recursive", "needle", "."]));
+        assert!(
+            !out.iter().any(|a| a == "--recursive"),
+            "stale --recursive in: {:?}",
+            out
+        );
+        assert_eq!(out, v(&["-c", "needle", "."]));
+    }
+
+    #[test]
+    fn test_grep_format_flag_with_bundled_recursive_strips_only_r() {
+        // `grep -cr needle .` — bundled. -c is the format trigger, -r must
+        // be peeled out, surviving args go to passthrough.
+        let out = run_cli_grep_pipeline(v(&["-cr", "needle", "."]));
+        // -cr bundle: -r stripped → -c remains. Format-flag check on the
+        // stripped args fires and we route to passthrough with -c.
+        assert_eq!(out, v(&["-c", "needle", "."]));
+    }
+}
+
 fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
@@ -1872,16 +2157,56 @@ fn run_cli() -> Result<i32> {
     // Note: -l is intentionally NOT in this set — this app's clap claims -l for
     // --max-len. Users wanting standard grep -l (list matching files) should use
     // either --files-with-matches or `contextcrawler proxy grep -l ...`.
+    // `parsed_argv` mirrors `std::env::args()` but is swapped out below when
+    // the grep pre-clap stripper removes recursive flags — so clap re-parses
+    // the cleaned form rather than the raw one it would have rejected (#88).
+    let mut parsed_argv: Vec<String> = std::env::args().collect();
     {
         let raw_args: Vec<String> = std::env::args().skip(1).collect();
-        if raw_args.first().map(|s| s.as_str()) == Some("grep")
-            && grep_format_flag_present(&raw_args[1..])
-        {
-            return run_grep_format_passthrough(&raw_args);
+        if raw_args.first().map(|s| s.as_str()) == Some("grep") {
+            // Codex review fix: ALWAYS strip recursive flags first. Otherwise
+            // mixed invocations like `grep -c -r pat .` short-circuit on the
+            // format-flag check and reach rg with -r intact, where rg reads
+            // it as --replace (replacement string), not recursive — silent
+            // wrong behaviour. Strip first, then route.
+            let preprocessed = preprocess_grep_args(raw_args[1..].to_vec());
+            let working_args: &[String] = match &preprocessed {
+                GrepPreprocess::Stripped(a) | GrepPreprocess::Passthrough(a) => a.as_slice(),
+            };
+
+            // Format-flag intercept runs on the stripped args so -r/-R/
+            // --recursive cannot leak through to rg.
+            if grep_format_flag_present(working_args) {
+                let mut full = Vec::with_capacity(working_args.len() + 1);
+                full.push("grep".to_string());
+                full.extend_from_slice(working_args);
+                return run_grep_format_passthrough(&full);
+            }
+
+            match preprocessed {
+                GrepPreprocess::Passthrough(stripped) => {
+                    // Context-flag passthrough: rtk-backed grep can't honour
+                    // -A/-B/-C, so route the (now stripped) args to rg.
+                    let mut full = Vec::with_capacity(stripped.len() + 1);
+                    full.push("grep".to_string());
+                    full.extend(stripped);
+                    return run_grep_format_passthrough(&full);
+                }
+                GrepPreprocess::Stripped(stripped) => {
+                    // Rebuild argv: argv0, "grep", stripped... so clap parses
+                    // the cleaned form.
+                    let argv0 = std::env::args().next().unwrap_or_default();
+                    let mut full = Vec::with_capacity(stripped.len() + 2);
+                    full.push(argv0);
+                    full.push("grep".to_string());
+                    full.extend(stripped);
+                    parsed_argv = full;
+                }
+            }
         }
     }
 
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(&parsed_argv) {
         Ok(cli) => cli,
         Err(e) => {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
