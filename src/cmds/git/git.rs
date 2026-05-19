@@ -1025,7 +1025,7 @@ fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> 
         eprintln!("git add executed");
     }
 
-    let raw_output = format!("{}\n{}", result.stdout, result.stderr);
+    let _raw_output = format!("{}\n{}", result.stdout, result.stderr);
 
     if result.success() {
         // Count what was added
@@ -1047,10 +1047,17 @@ fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> 
 
         println!("{}", compact);
 
+        // Tracking baseline: the full `git diff --cached --stat` output
+        // (multi-line, per-file) — what the agent would have asked for
+        // next. Compact side is the shortstat we just printed. This gives
+        // positive savings on real adds and ~0 on trivial ones; the prior
+        // baseline (raw stdout of `git add`, which is silent) caused
+        // -1300% records. See #89.
+        let baseline = stat_result.stdout.clone();
         timer.track(
             &format!("git add {}", args.join(" ")),
             &format!("contextcrawler git add {}", args.join(" ")),
-            &raw_output,
+            &baseline,
             &compact,
         );
     } else {
@@ -2602,6 +2609,46 @@ A  added.rs
         // Test that run_passthrough compiles and has correct signature
         let _args: Vec<OsString> = vec![OsString::from("tag"), OsString::from("--list")];
         // Compile-time verification that the function exists with correct signature
+    }
+
+    #[test]
+    fn test_git_add_tracking_uses_full_stat_baseline() {
+        // #89: prior baseline (the silent ~0-byte stdout of `git add`)
+        // compared against the ~14-token shortstat summary produced
+        // negative savings (-1300%). The new baseline is the full
+        // `git diff --cached --stat` output (multi-line, per-file) which
+        // is materially larger than the compact shortstat we emit, so
+        // savings come out positive on a multi-file add.
+        let full_stat = "\
+ src/foo.rs              | 42 ++++++++++++++++++++++++++++++++++++++++++
+ src/bar.rs              |  3 +--
+ src/baz.rs              | 10 ++++++++--
+ src/qux.rs              |  7 ++++---
+ src/lib.rs              |  1 +
+ 5 files changed, 60 insertions(+), 3 deletions(-)\n";
+        let compact = "ok 5 files changed, 60 insertions(+), 3 deletions(-)";
+
+        // Baseline must be materially larger than the compact summary,
+        // so the savings calculation in tracking::track is positive.
+        assert!(
+            full_stat.len() > compact.len() * 2,
+            "baseline ({} bytes) must dominate compact ({} bytes) for positive savings",
+            full_stat.len(),
+            compact.len()
+        );
+
+        // And token count too — that's what tracking actually measures.
+        let baseline_tokens = full_stat.split_whitespace().count();
+        let compact_tokens = compact.split_whitespace().count();
+        let savings =
+            100.0 - (compact_tokens as f64 / baseline_tokens as f64 * 100.0);
+        assert!(
+            savings > 0.0,
+            "expected positive savings, got {:.1}% (baseline={} tokens, compact={} tokens)",
+            savings,
+            baseline_tokens,
+            compact_tokens
+        );
     }
 
     #[test]

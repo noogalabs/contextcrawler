@@ -12,7 +12,7 @@ pub struct RtkRule {
 
 pub const RULES: &[RtkRule] = &[
     RtkRule {
-        pattern: r"^(?:git|yadm)\s+(?:-[Cc]\s+\S+\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree)",
+        pattern: r"^(?:git|yadm)\s+(?:-[Cc]\s+\S+\s+)*(status|log|diff|show|add|commit|push|pull|branch|fetch|stash|worktree|checkout|switch|restore|merge|rebase|reset|tag|remote|cherry-pick)(?:\s|$)",
         rtk_cmd: "contextcrawler git",
         rewrite_prefixes: &["git", "yadm"],
         category: "Git",
@@ -22,6 +22,15 @@ pub const RULES: &[RtkRule] = &[
             ("show", 80.0),
             ("add", 59.0),
             ("commit", 59.0),
+            ("checkout", 30.0),
+            ("switch", 30.0),
+            ("restore", 30.0),
+            ("merge", 30.0),
+            ("rebase", 30.0),
+            ("reset", 30.0),
+            ("tag", 30.0),
+            ("remote", 30.0),
+            ("cherry-pick", 30.0),
         ],
         subcmd_status: &[],
     },
