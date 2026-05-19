@@ -109,24 +109,13 @@ pub fn classify_command(cmd: &str) -> Classification {
         }
     }
 
-    // Strip env prefixes (sudo, env VAR=val, VAR=val)
-    let stripped = ENV_PREFIX.replace(trimmed, "");
-    let cmd_clean = stripped.trim();
+    // Normalise: strip env prefixes (sudo, env VAR=val), absolute paths
+    // (/usr/bin/grep -> grep, #485), and git/golangci global opts (#163, #83).
+    let cmd_normalized = normalise_command(trimmed);
+    let cmd_clean = cmd_normalized.trim();
     if cmd_clean.is_empty() {
         return Classification::Ignored;
     }
-
-    // Normalize absolute binary paths: /usr/bin/grep → grep (#485)
-    let cmd_normalized = strip_absolute_path(cmd_clean);
-    // Re-apply ENV_PREFIX after absolute-path normalisation so `/usr/bin/env
-    // git status` (which becomes `env git status` here) is recognised. (#83)
-    let cmd_normalized = ENV_PREFIX.replace(&cmd_normalized, "").to_string();
-    // Strip git global options: git -C /tmp status → git status (#163)
-    let cmd_normalized = strip_git_global_opts(&cmd_normalized);
-    // Strip golangci-lint global options before `run` so classify/rewrite stays
-    // aligned with the runtime wrapper behavior.
-    let cmd_normalized = strip_golangci_global_opts(&cmd_normalized);
-    let cmd_clean = cmd_normalized.as_str();
 
     // Exclude cat/head/tail with redirect operators — these are writes, not reads (#315)
     if cmd_clean.starts_with("cat ")
@@ -261,6 +250,21 @@ fn strip_git_global_opts(cmd: &str) -> String {
     let after_git = &cmd[4..]; // skip "git "
     let stripped = GIT_GLOBAL_OPT.replace(after_git, "");
     format!("git {}", stripped.trim())
+}
+
+/// Normalise a command for classifier/rewriter input so the same form is
+/// seen by `classify_command`, `rewrite_segment_inner`, and the
+/// `is_excluded` check (#83):
+/// 1. Strip env-style prefix (env VAR=val, sudo) — handles `sudo /usr/bin/env`
+/// 2. Strip absolute binary path (/usr/bin/env -> env)
+/// 3. Re-strip env-style prefix so the surfaced `env <cmd>` is removed
+/// 4. Strip git/golangci-lint global opts
+fn normalise_command(cmd: &str) -> String {
+    let stripped = ENV_PREFIX.replace(cmd.trim(), "").to_string();
+    let stripped = strip_absolute_path(&stripped);
+    let stripped = ENV_PREFIX.replace(&stripped, "").to_string();
+    let stripped = strip_git_global_opts(stripped.trim());
+    strip_golangci_global_opts(&stripped)
 }
 
 /// Strip golangci-lint global options before the `run` subcommand.
@@ -785,12 +789,14 @@ fn rewrite_segment_inner(
         }
     }
 
-    // Use classify_command for correct ignore/prefix handling
+    // Use classify_command for correct ignore/prefix handling.
+    // is_excluded must see the same fully-normalised form as classify (#83
+    // follow-up) so user-configured exclude_commands rules apply to
+    // `/usr/bin/env git ...` and `sudo /usr/bin/env git ...`.
     let rtk_equivalent = match classify_command(cmd_part) {
         Classification::Supported { rtk_equivalent, .. } => {
-            let stripped = ENV_PREFIX.replace(cmd_part, "");
-            let cmd_clean = stripped.trim();
-            if is_excluded(cmd_clean, excluded) {
+            let normalised_for_exclude = normalise_command(cmd_part);
+            if is_excluded(normalised_for_exclude.trim(), excluded) {
                 return None;
             }
             rtk_equivalent
@@ -798,8 +804,9 @@ fn rewrite_segment_inner(
         _ => return None,
     };
 
-    // Normalise the command the same way classify_command does so prefix
-    // matching below works for /usr/bin/env <cmd> and similar (#83).
+    // Lighter normalisation for downstream rule processing: strip absolute
+    // path and env-style prefix only. Global git/golangci opts must be
+    // preserved here because the rewrite logic below re-uses them. (#83)
     let cmd_part_norm = strip_absolute_path(cmd_part);
     let cmd_part_norm = ENV_PREFIX.replace(&cmd_part_norm, "").to_string();
     let cmd_part_norm = cmd_part_norm.trim();
@@ -916,6 +923,34 @@ mod tests {
         // /usr/bin/env <cmd> must rewrite to the contextcrawler equivalent (#83)
         assert_eq!(
             rewrite_command("/usr/bin/env git status", &[], &[]),
+            Some("contextcrawler git status".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_prefix_respects_exclude() {
+        // is_excluded must see the normalised form so exclude_commands works
+        // even when the user runs `/usr/bin/env git ...` (#83 follow-up).
+        assert_eq!(
+            rewrite_command("/usr/bin/env git status", &["git".into()], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_sudo_env_prefix_respects_exclude() {
+        assert_eq!(
+            rewrite_command("sudo /usr/bin/env git status", &["git".into()], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_prefix_not_excluded() {
+        // Regression guard: env-prefixed git still rewrites when the
+        // exclude list does not cover it.
+        assert_eq!(
+            rewrite_command("/usr/bin/env git status", &["docker".into()], &[]),
             Some("contextcrawler git status".to_string())
         );
     }
