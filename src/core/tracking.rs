@@ -38,10 +38,20 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Detect whether we're running inside `cargo test` (or any `cargo` invocation
-/// that exports `CARGO_PKG_NAME` + `CARGO_MANIFEST_DIR` against this crate, in
-/// a debug build). Used to short-circuit DB writes so test runs don't pollute
-/// the production `history.db`. Issue #91.
+/// Detect whether we're running inside a test context, so we can short-circuit
+/// DB writes and avoid polluting the production `history.db`. Issue #91.
+///
+/// Two independent signals — either is sufficient:
+///
+/// 1. `CONTEXTCRAWLER_TEST_MODE=1` — sentinel set by integration test harnesses
+///    when they spawn the binary as a child process. Required because spawned
+///    binaries can be RELEASE-compiled (`cargo test --release`), so
+///    `cfg!(debug_assertions)` is false and `cfg!(test)` is false in the
+///    spawned binary's own compilation unit. Codex review caught this hole.
+///
+/// 2. `cfg!(test)` + cargo env vars — covers in-process unit tests
+///    (`#[test]` fns inside `src/`) regardless of build mode. `cfg!(test)` is
+///    set during cargo-test compilation in both debug and release.
 ///
 /// Explicit opt-in: if `RTK_DB_PATH` is set, the caller wants tracking writes
 /// against that path (typically a tmpfile in a test that *exercises*
@@ -50,7 +60,14 @@ pub(crate) fn is_test_context() -> bool {
     if std::env::var("RTK_DB_PATH").is_ok() {
         return false; // explicit opt-in path
     }
-    cfg!(debug_assertions)
+    // Test harness sentinel — set by tests/common.rs or each #[test] that
+    // spawns the binary.
+    if std::env::var("CONTEXTCRAWLER_TEST_MODE").as_deref() == Ok("1") {
+        return true;
+    }
+    // Cargo unit-test in-process (lives inside the test runner, not a spawned
+    // binary). `cfg!(test)` is true inside `#[test]` modules in any build mode.
+    cfg!(test)
         && std::env::var("CARGO_PKG_NAME").as_deref() == Ok("contextcrawler")
         && std::env::var("CARGO_MANIFEST_DIR").is_ok()
 }
@@ -1972,10 +1989,42 @@ mod tests {
         std::env::remove_var("RTK_DB_PATH");
         assert!(
             is_test_context(),
-            "is_test_context() must be true under `cargo test` (debug + CARGO_PKG_NAME set)"
+            "is_test_context() must be true under `cargo test` (cfg!(test) + CARGO_PKG_NAME set, any build mode)"
         );
         if let Some(v) = prior {
             std::env::set_var("RTK_DB_PATH", v);
+        }
+    }
+
+    /// Codex review — release-mode integration tests spawn the binary as a
+    /// child process where `cfg!(test)` is FALSE (the spawned binary is not
+    /// itself a test runner). The `CONTEXTCRAWLER_TEST_MODE=1` sentinel set
+    /// by the test harness is what keeps that child from polluting the
+    /// production DB. Assert the sentinel path works.
+    #[test]
+    fn test_is_test_context_true_under_sentinel_env() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prior_db = std::env::var("RTK_DB_PATH").ok();
+        let prior_mode = std::env::var("CONTEXTCRAWLER_TEST_MODE").ok();
+        std::env::remove_var("RTK_DB_PATH");
+        std::env::set_var("CONTEXTCRAWLER_TEST_MODE", "1");
+
+        assert!(
+            is_test_context(),
+            "CONTEXTCRAWLER_TEST_MODE=1 must force is_test_context() true \
+             (covers release-built spawned-binary integration tests)"
+        );
+
+        // Restore.
+        if let Some(v) = prior_db {
+            std::env::set_var("RTK_DB_PATH", v);
+        }
+        match prior_mode {
+            Some(v) => std::env::set_var("CONTEXTCRAWLER_TEST_MODE", v),
+            None => std::env::remove_var("CONTEXTCRAWLER_TEST_MODE"),
         }
     }
 

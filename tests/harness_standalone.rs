@@ -127,6 +127,9 @@ fn run_case(
 
     let start = Instant::now();
     let output = Command::new(&bin)
+        // Issue #91 — sentinel so release-built spawned binary suppresses
+        // production-DB writes (cfg!(test) is false in the child).
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RTK_DB_PATH", db_path)
         // Real opt-out env var checked in src/core/telemetry.rs — codex
         // review on #29 caught that the previous draft used a non-existent

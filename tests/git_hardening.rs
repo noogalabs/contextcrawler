@@ -37,6 +37,9 @@ fn ccrawl_in(cwd: &std::path::Path) -> Command {
             c.env("HOME", home);
         }
     }
+    // Issue #91 — sentinel for release-built spawned binary. MUST be set
+    // AFTER env_clear() above (env_clear wipes everything including this).
+    c.env("CONTEXTCRAWLER_TEST_MODE", "1");
     c
 }
 

@@ -1648,8 +1648,16 @@ const META_FLAGS: &[&str] = &["--version", "-V", "--help", "-h"];
 /// Wrappers that accept meta flags but don't pass them through cleanly via
 /// clap. Pre-clap intercept routes these straight to a timed passthrough so
 /// `contextcrawler cargo --version` works without a parse_failure row.
+///
+/// Codex review extension: the original list missed wrappers whose clap
+/// subcommand structure also lacks a top-level `--version`/`--help` arm —
+/// `gh`, `glab`, `aws`, `psql`, `prisma`, `gt`. Without these, meta flags
+/// fell through to `run_fallback` → raw exec and produced parse_failure
+/// rows. The regression test `meta_passthrough_covers_all_subcommand_only_wrappers`
+/// guards against future drift.
 const META_PASSTHROUGH_BINS: &[&str] = &[
     "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
+    "gh", "glab", "aws", "psql", "prisma", "gt",
 ];
 
 fn cmd_has_meta_flag(args: &[String]) -> bool {
@@ -1912,7 +1920,7 @@ mod grep_format_flag_tests {
 
 #[cfg(test)]
 mod meta_flag_tests {
-    use super::cmd_has_meta_flag;
+    use super::{cmd_has_meta_flag, META_PASSTHROUGH_BINS};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
@@ -1946,6 +1954,31 @@ mod meta_flag_tests {
         // Meta flag mid-args still counts (e.g. `cargo build --version` is
         // unusual but harmless to intercept).
         assert!(cmd_has_meta_flag(&args(&["build", "--version"])));
+    }
+
+    /// Regression guard (Codex review of #90/#91): all wrappers that route
+    /// to filters via clap subcommand structure but don't accept
+    /// `--version`/`--help` at the top level MUST be in
+    /// `META_PASSTHROUGH_BINS`. Otherwise meta-flag invocations fall through
+    /// to `run_fallback` → raw exec and pollute `parse_failures`.
+    ///
+    /// If you add a new subcommand-only wrapper in this binary, add it to
+    /// `META_PASSTHROUGH_BINS` AND extend the `expected` list below.
+    #[test]
+    fn test_meta_passthrough_covers_all_subcommand_only_wrappers() {
+        let expected = [
+            "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
+            "gh", "glab", "aws", "psql", "prisma", "gt",
+        ];
+        for bin in expected {
+            assert!(
+                META_PASSTHROUGH_BINS.contains(&bin),
+                "missing {} from META_PASSTHROUGH_BINS — meta-flag \
+                 invocations of `contextcrawler {} --version` will pollute \
+                 parse_failures",
+                bin, bin
+            );
+        }
     }
 }
 

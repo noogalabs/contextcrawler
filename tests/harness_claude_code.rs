@@ -184,6 +184,9 @@ fn run_hook(bin: &Path, db_path: &Path, raw_cmd: &str) -> (Option<String>, u128)
     let mut child = Command::new(bin)
         .arg("hook")
         .arg("claude")
+        // Issue #91 — sentinel so release-built spawned binary suppresses
+        // production-DB writes (cfg!(test) is false in the child).
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RTK_DB_PATH", db_path)
         .env("RTK_TELEMETRY_DISABLED", "1")
         .stdin(Stdio::piped())
@@ -228,6 +231,12 @@ fn run_shell(cmd_line: &str) -> (String, i32, u128) {
         .arg("-c")
         .arg(cmd_line)
         .current_dir(manifest_dir())
+        // Issue #91 — propagates into the contextcrawler child that `sh -c`
+        // spawns from the rewritten command line. Without this, the bench
+        // fixture commands (git status / find / grep …) hit the production
+        // history.db on release builds. Codex review pollution probe found
+        // this with a non-zero delta after the first patch round.
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
         .env("RTK_TELEMETRY_DISABLED", "1")
         // Suppress pager/interactive prompts that would hang the harness.
         .env("GIT_PAGER", "cat")

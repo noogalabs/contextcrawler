@@ -45,6 +45,10 @@ fn run_cc(env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
     let _guard = common::env_lock();
     let mut cmd = Command::new(binary_path());
     cmd.args(args);
+    // Issue #91 — mark spawned binary as test context so it short-circuits
+    // production-DB writes even in release builds (cfg!(test) is false in
+    // a release-compiled child binary).
+    cmd.env("CONTEXTCRAWLER_TEST_MODE", "1");
     // Clear DB path so tracking doesn't touch user state.
     let tmp_db = std::env::temp_dir().join(format!(
         "cc-hardening-{}.sqlite",
