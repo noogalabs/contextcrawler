@@ -168,8 +168,9 @@ pub fn run(
                         bucket.count += 1;
                     }
                     Classification::Ignored => {
-                        // Check if it starts with "rtk "
-                        if part.trim().starts_with("rtk ") {
+                        // Check if it starts with "rtk " or "contextcrawler "
+                        let t = part.trim();
+                        if t.starts_with("rtk ") || t.starts_with("contextcrawler ") {
                             already_rtk += 1;
                         }
                         // Otherwise just skip
@@ -306,5 +307,44 @@ fn truncate_command(cmd: &str) -> String {
         0 => String::new(),
         1 => parts[0].to_string(),
         _ => format!("{} {}", parts[0], parts[1]),
+    }
+}
+
+/// Predicate matching the `already_rtk` counter branch in `run()`.
+///
+/// Extracted only so unit tests can pin the prefix-detection behaviour
+/// without spinning up a full session-scan fixture. Keep in sync with
+/// the inline check inside `run()`'s `Classification::Ignored` arm.
+#[cfg(test)]
+fn is_already_rtk_prefix(part: &str) -> bool {
+    let t = part.trim();
+    t.starts_with("rtk ") || t.starts_with("contextcrawler ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::registry::{classify_command, Classification};
+
+    #[test]
+    fn test_already_rtk_counts_contextcrawler_prefix() {
+        // #81: the `contextcrawler ` prefix must be treated as already-wrapped,
+        // not skipped as a generic Ignored command. Verify both prefixes count,
+        // and that the classifier routes them down the Ignored arm so the
+        // counter is actually reached.
+        assert!(is_already_rtk_prefix("contextcrawler git status"));
+        assert!(is_already_rtk_prefix("  contextcrawler git diff  "));
+        assert!(is_already_rtk_prefix("rtk git status"));
+        assert!(!is_already_rtk_prefix("git status"));
+        assert!(!is_already_rtk_prefix("contextcrawlerish"));
+
+        assert_eq!(
+            classify_command("contextcrawler git status"),
+            Classification::Ignored
+        );
+        assert_eq!(
+            classify_command("rtk git status"),
+            Classification::Ignored
+        );
     }
 }
