@@ -61,8 +61,10 @@ lazy_static! {
     };
     // Git global options that appear before the subcommand: -C <path>, -c <key=val>,
     // --git-dir <dir>, --work-tree <dir>, and flag-only options (#163)
+    // #84: support quoted values for -C/-c/--git-dir/--work-tree, e.g.
+    // `git -c "core.editor=vim -w" merge` — `\S+` alone stops at the inner space.
     static ref GIT_GLOBAL_OPT: Regex =
-        Regex::new(r"^(?:(?:-C\s+\S+|-c\s+\S+|--git-dir(?:=\S+|\s+\S+)|--work-tree(?:=\S+|\s+\S+)|--no-pager|--no-optional-locks|--bare|--literal-pathspecs)\s+)+").unwrap();
+        Regex::new(r#"^(?:(?:-C\s+(?:"[^"]+"|'[^']+'|\S+)|-c\s+(?:"[^"]+"|'[^']+'|\S+)|--git-dir(?:=(?:"[^"]+"|'[^']+'|\S+)|\s+(?:"[^"]+"|'[^']+'|\S+))|--work-tree(?:=(?:"[^"]+"|'[^']+'|\S+)|\s+(?:"[^"]+"|'[^']+'|\S+))|--no-pager|--no-optional-locks|--bare|--literal-pathspecs)\s+)+"#).unwrap();
     // Issue #1362: each capture expects a SINGLE file argument (`\S+$`). Multi-file
     // invocations like `head -3 a b c` fail to match so the segment is passed through
     // to the native `head`/`tail` binary — which already handles multi-file with
@@ -1163,6 +1165,30 @@ mod tests {
             } => {}
             other => panic!("git cherry-pick should be Supported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_classify_git_checkout_tag_helper_not_matched() {
+        // Codex review: without a word-boundary anchor after the subcommand
+        // capture, `git checkout-tag-helper foo` would falsely match the
+        // `checkout` alternation. The `(?:\s|$)` anchor in rules.rs prevents that.
+        match classify_command("git checkout-tag-helper foo") {
+            Classification::Supported { category: "Git", .. } => {
+                panic!("git checkout-tag-helper should NOT classify as Supported Git");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_classify_git_c_quoted_value() {
+        // Codex review: GIT_GLOBAL_OPT must handle quoted `-c` values with
+        // embedded whitespace, e.g. `-c "core.editor=vim -w"`.
+        let cls = classify_command(r#"git -c "core.editor=vim -w" merge --no-ff foo"#);
+        assert!(
+            matches!(cls, Classification::Supported { category: "Git", .. }),
+            "expected Supported Git, got {cls:?}"
+        );
     }
 
     #[test]
