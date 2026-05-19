@@ -918,6 +918,8 @@ pub const IGNORED_PREFIXES: &[&str] = &[
     // Post-#62: current rewrite output uses this prefix; classify it as
     // already-wrapped so the rewriter doesn't double-wrap.
     "contextcrawler ",
+    // #86: tirith is our own defense-in-depth gate, not an unsupported command.
+    "tirith ",
     "pwd",
     "bash ",
     "sh ",

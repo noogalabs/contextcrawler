@@ -97,6 +97,11 @@ pub fn classify_command(cmd: &str) -> Classification {
         return Classification::Ignored;
     }
 
+    // #87: $VAR-prefixed commands are shell expansions, not classifiable commands.
+    if trimmed.starts_with('$') {
+        return Classification::Ignored;
+    }
+
     // Check ignored
     for exact in IGNORED_EXACT {
         if trimmed == *exact {
@@ -987,6 +992,28 @@ mod tests {
     #[test]
     fn test_classify_rtk_already() {
         assert_eq!(classify_command("contextcrawler git status"), Classification::Ignored);
+    }
+
+    #[test]
+    fn test_classify_tirith_ignored() {
+        // #86: tirith is our own defense-in-depth gate, not an unsupported command.
+        assert_eq!(
+            classify_command("tirith scan ./src"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
+    fn test_classify_shell_variable_ignored() {
+        // #87: $VAR-prefixed commands are shell expansions; can't classify.
+        assert_eq!(
+            classify_command("$EDITOR foo.txt"),
+            Classification::Ignored
+        );
+        assert_eq!(
+            classify_command("$(which git) status"),
+            Classification::Ignored
+        );
     }
 
     #[test]
