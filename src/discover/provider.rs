@@ -23,6 +23,10 @@ pub struct ExtractedCommand {
     /// Chronological sequence index within the session
     #[allow(dead_code)]
     pub sequence_index: usize,
+    /// UTC timestamp of the assistant tool_use entry (parsed from the
+    /// top-level `timestamp` field on the JSONL line). `None` when the
+    /// session entry didn't expose a parseable ISO-8601 timestamp.
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Trait for session providers (Claude Code, OpenCode, etc.).
@@ -166,7 +170,13 @@ impl SessionProvider for ClaudeProvider {
 
         // First pass: collect all tool_use Bash commands with their IDs and sequence
         // Second pass (same loop): collect tool_result output lengths, content, and error status
-        let mut pending_tool_uses: Vec<(String, String, usize)> = Vec::new(); // (tool_use_id, command, sequence)
+        // tool_use payload: (id, command, sequence, timestamp)
+        let mut pending_tool_uses: Vec<(
+            String,
+            String,
+            usize,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = Vec::new();
         let mut tool_results: HashMap<String, (usize, String, bool)> = HashMap::new(); // (len, content, is_error)
         let mut commands = Vec::new();
         let mut sequence_counter = 0;
@@ -189,6 +199,18 @@ impl SessionProvider for ClaudeProvider {
 
             let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
+            // Top-level timestamp on every JSONL entry (Claude Code injects
+            // an ISO-8601 `timestamp` field) — used later to reconcile
+            // against the runtime tracking DB.
+            let entry_ts = entry
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                });
+
             match entry_type {
                 "assistant" => {
                     // Look for tool_use Bash blocks in message.content
@@ -207,6 +229,7 @@ impl SessionProvider for ClaudeProvider {
                                         id.to_string(),
                                         cmd.to_string(),
                                         sequence_counter,
+                                        entry_ts,
                                     ));
                                     sequence_counter += 1;
                                 }
@@ -251,7 +274,7 @@ impl SessionProvider for ClaudeProvider {
         }
 
         // Match tool_uses with their results
-        for (tool_id, command, sequence_index) in pending_tool_uses {
+        for (tool_id, command, sequence_index, timestamp) in pending_tool_uses {
             let (output_len, output_content, is_error) = tool_results
                 .get(&tool_id)
                 .map(|(len, content, err)| (Some(*len), Some(content.clone()), *err))
@@ -264,6 +287,7 @@ impl SessionProvider for ClaudeProvider {
                 output_content,
                 is_error,
                 sequence_index,
+                timestamp,
             });
         }
 

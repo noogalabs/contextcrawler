@@ -203,6 +203,7 @@ mod tests {
             output_content: None,
             is_error: false,
             sequence_index: 0,
+            timestamp: None,
         }
     }
 

@@ -3,6 +3,7 @@
 pub mod codex;
 pub mod lexer;
 pub mod provider;
+pub mod reconcile;
 pub mod registry;
 mod report;
 pub mod rules;
@@ -10,7 +11,8 @@ pub mod rules;
 use anyhow::Result;
 use std::collections::HashMap;
 
-use provider::{ClaudeProvider, SessionProvider};
+use provider::{ClaudeProvider, ExtractedCommand, SessionProvider};
+use reconcile::{is_runtime_tracked, load_tracked, DEFAULT_MATCH_WINDOW_SECS};
 use registry::{
     category_avg_tokens, classify_command, cmd_has_rtk_disabled_prefix, split_command_chain,
     strip_disabled_prefix, Classification,
@@ -73,12 +75,21 @@ pub fn run(
 
     let mut total_commands: usize = 0;
     let mut already_rtk: usize = 0;
+    let mut rtk_via_runtime: usize = 0;
     let mut parse_errors: usize = 0;
     let mut rtk_disabled_count: usize = 0;
     let mut rtk_disabled_cmds: HashMap<String, usize> = HashMap::new();
     let mut supported_map: HashMap<&'static str, SupportedBucket> = HashMap::new();
     let mut unsupported_map: HashMap<String, UnsupportedBucket> = HashMap::new();
 
+    // Pre-pass: extract every command across every session and collect them
+    // alongside their session path, so we can:
+    //   1. compute the [earliest, latest] timestamp window for the tracking DB
+    //      query, and
+    //   2. cross-reference each tool_use against the tracking DB before
+    //      classifying it (so hook-rewritten successes don't fall into the
+    //      MISSED SAVINGS bucket).
+    let mut all_extracted: Vec<ExtractedCommand> = Vec::new();
     for session_path in &sessions {
         let extracted = match provider.extract_commands(session_path) {
             Ok(cmds) => cmds,
@@ -90,90 +101,152 @@ pub fn run(
                 continue;
             }
         };
+        all_extracted.extend(extracted);
+    }
 
-        for ext_cmd in &extracted {
-            let parts = split_command_chain(&ext_cmd.command);
-            for part in parts {
-                total_commands += 1;
+    let (earliest_ts, latest_ts) = all_extracted
+        .iter()
+        .filter_map(|c| c.timestamp)
+        .fold((None, None), |(min, max), ts| {
+            let new_min = match min {
+                None => Some(ts),
+                Some(m) if ts < m => Some(ts),
+                m => m,
+            };
+            let new_max = match max {
+                None => Some(ts),
+                Some(m) if ts > m => Some(ts),
+                m => m,
+            };
+            (new_min, new_max)
+        });
 
-                // Detect RTK_DISABLED= bypass before classification
-                if cmd_has_rtk_disabled_prefix(part) {
-                    let (_prefix, actual_cmd) = strip_disabled_prefix(part);
-                    // Only count if the underlying command is one RTK supports
-                    match classify_command(actual_cmd) {
-                        Classification::Supported { .. } => {
-                            rtk_disabled_count += 1;
-                            let display = truncate_command(actual_cmd);
-                            *rtk_disabled_cmds.entry(display).or_insert(0) += 1;
-                        }
-                        _ => {
-                            // RTK_DISABLED on unsupported/ignored command — not interesting
-                        }
+    let reconcile_ctx = load_tracked(earliest_ts, latest_ts);
+    let reconcile_warning = reconcile_ctx.warning.clone();
+    let tracked = reconcile_ctx.tracked;
+
+    if verbose > 0 {
+        eprintln!(
+            "Reconcile: loaded {} tracked commands from {}",
+            tracked.len(),
+            reconcile_ctx.db_path.display()
+        );
+    }
+
+    // Optional hook-health warning: if the hook is installed globally but we
+    // found zero matching tracked rows in a non-empty session set, the JSONLs
+    // are likely from an agent that doesn't reach the hook.
+    if !all_extracted.is_empty()
+        && tracked.is_empty()
+        && reconcile_warning.is_none()
+        && matches!(
+            crate::hooks::hook_check::status(),
+            crate::hooks::hook_check::HookStatus::Ok
+        )
+    {
+        eprintln!(
+            "[contextcrawler] hook reports healthy but reconcile found zero tracked commands -- another agent (Codex, subagent) may be producing these tool_uses without reaching the hook"
+        );
+    }
+
+    for ext_cmd in &all_extracted {
+        // Reconcile the *original* JSONL command (pre-split) against the
+        // tracking DB. The hook records the full pipeline string, so chained
+        // commands like `git status && git diff` are tracked as one row and
+        // we want a single match to credit both halves.
+        let runtime_tracked =
+            is_runtime_tracked(&ext_cmd.command, ext_cmd.timestamp, &tracked, DEFAULT_MATCH_WINDOW_SECS);
+
+        let parts = split_command_chain(&ext_cmd.command);
+        for part in parts {
+            total_commands += 1;
+
+            if runtime_tracked {
+                // Credit this command to runtime-tracked (the hook handled
+                // it) and skip MISSED SAVINGS accounting entirely.
+                already_rtk += 1;
+                rtk_via_runtime += 1;
+                continue;
+            }
+
+            // Detect RTK_DISABLED= bypass before classification
+            if cmd_has_rtk_disabled_prefix(part) {
+                let (_prefix, actual_cmd) = strip_disabled_prefix(part);
+                // Only count if the underlying command is one RTK supports
+                match classify_command(actual_cmd) {
+                    Classification::Supported { .. } => {
+                        rtk_disabled_count += 1;
+                        let display = truncate_command(actual_cmd);
+                        *rtk_disabled_cmds.entry(display).or_insert(0) += 1;
                     }
-                    continue;
+                    _ => {
+                        // RTK_DISABLED on unsupported/ignored command — not interesting
+                    }
                 }
+                continue;
+            }
 
-                match classify_command(part) {
-                    Classification::Supported {
-                        rtk_equivalent,
-                        category,
-                        estimated_savings_pct,
-                        status,
-                    } => {
-                        let bucket = supported_map.entry(rtk_equivalent).or_insert_with(|| {
-                            SupportedBucket {
-                                rtk_equivalent,
-                                category,
-                                count: 0,
-                                total_output_tokens: 0,
-                                total_raw_output_tokens: 0,
-                                command_counts: HashMap::new(),
-                            }
-                        });
-
-                        bucket.count += 1;
-
-                        // Estimate tokens for this command
-                        let output_tokens = if let Some(len) = ext_cmd.output_len {
-                            // Real: from tool_result content length
-                            len / 4
-                        } else {
-                            // Fallback: category average
-                            let subcmd = extract_subcmd(part);
-                            category_avg_tokens(category, subcmd)
-                        };
-
-                        let savings =
-                            (output_tokens as f64 * estimated_savings_pct / 100.0) as usize;
-                        bucket.total_output_tokens += savings;
-                        // Accumulate pre-savings tokens so we can compute a weighted effective
-                        // savings rate across all sub-commands in this bucket later.
-                        bucket.total_raw_output_tokens += output_tokens;
-
-                        // Track the display name with status
-                        let display_name = truncate_command(part);
-                        let entry = bucket
-                            .command_counts
-                            .entry(format!("{}:{:?}", display_name, status))
-                            .or_insert(0);
-                        *entry += 1;
-                    }
-                    Classification::Unsupported { base_command } => {
-                        let bucket = unsupported_map.entry(base_command).or_insert_with(|| {
-                            UnsupportedBucket {
-                                count: 0,
-                                example: part.to_string(),
-                            }
-                        });
-                        bucket.count += 1;
-                    }
-                    Classification::Ignored => {
-                        // Check if it starts with "rtk "
-                        if part.trim().starts_with("rtk ") {
-                            already_rtk += 1;
+            match classify_command(part) {
+                Classification::Supported {
+                    rtk_equivalent,
+                    category,
+                    estimated_savings_pct,
+                    status,
+                } => {
+                    let bucket = supported_map.entry(rtk_equivalent).or_insert_with(|| {
+                        SupportedBucket {
+                            rtk_equivalent,
+                            category,
+                            count: 0,
+                            total_output_tokens: 0,
+                            total_raw_output_tokens: 0,
+                            command_counts: HashMap::new(),
                         }
-                        // Otherwise just skip
+                    });
+
+                    bucket.count += 1;
+
+                    // Estimate tokens for this command
+                    let output_tokens = if let Some(len) = ext_cmd.output_len {
+                        // Real: from tool_result content length
+                        len / 4
+                    } else {
+                        // Fallback: category average
+                        let subcmd = extract_subcmd(part);
+                        category_avg_tokens(category, subcmd)
+                    };
+
+                    let savings =
+                        (output_tokens as f64 * estimated_savings_pct / 100.0) as usize;
+                    bucket.total_output_tokens += savings;
+                    // Accumulate pre-savings tokens so we can compute a weighted effective
+                    // savings rate across all sub-commands in this bucket later.
+                    bucket.total_raw_output_tokens += output_tokens;
+
+                    // Track the display name with status
+                    let display_name = truncate_command(part);
+                    let entry = bucket
+                        .command_counts
+                        .entry(format!("{}:{:?}", display_name, status))
+                        .or_insert(0);
+                    *entry += 1;
+                }
+                Classification::Unsupported { base_command } => {
+                    let bucket = unsupported_map.entry(base_command).or_insert_with(|| {
+                        UnsupportedBucket {
+                            count: 0,
+                            example: part.to_string(),
+                        }
+                    });
+                    bucket.count += 1;
+                }
+                Classification::Ignored => {
+                    // Check if it starts with "rtk " or "contextcrawler "
+                    let trimmed = part.trim();
+                    if trimmed.starts_with("rtk ") || trimmed.starts_with("contextcrawler ") {
+                        already_rtk += 1;
                     }
+                    // Otherwise just skip
                 }
             }
         }
@@ -256,6 +329,8 @@ pub fn run(
         sessions_scanned: sessions.len(),
         total_commands,
         already_rtk,
+        rtk_via_runtime,
+        reconcile_warning,
         since_days,
         supported,
         unsupported,
