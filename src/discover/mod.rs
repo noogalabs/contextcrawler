@@ -104,6 +104,16 @@ pub fn run(
         all_extracted.extend(extracted);
     }
 
+    // Codex IMPORTANT #3: count tool_uses with no timestamp so we can
+    // surface a verbose note about skipped reconciliation.
+    let none_ts_count = all_extracted.iter().filter(|c| c.timestamp.is_none()).count();
+    if verbose > 0 && none_ts_count > 0 {
+        eprintln!(
+            "[contextcrawler] {} tool_uses had no timestamp; skipping reconciliation for these",
+            none_ts_count
+        );
+    }
+
     let (earliest_ts, latest_ts) = all_extracted
         .iter()
         .filter_map(|c| c.timestamp)
@@ -133,11 +143,10 @@ pub fn run(
         );
     }
 
-    // Optional hook-health warning: if the hook is installed globally but we
-    // found zero matching tracked rows in a non-empty session set, the JSONLs
-    // are likely from an agent that doesn't reach the hook.
-    if !all_extracted.is_empty()
-        && tracked.is_empty()
+    // Optional hook-health warning: only fire when we have enough signal to
+    // distinguish "fresh install" from "the hook isn't reaching us".
+    // See `should_emit_hook_health_warning` for the gating rationale.
+    if should_emit_hook_health_warning(sessions.len(), all_extracted.len(), tracked.len())
         && reconcile_warning.is_none()
         && matches!(
             crate::hooks::hook_check::status(),
@@ -145,7 +154,9 @@ pub fn run(
         )
     {
         eprintln!(
-            "[contextcrawler] hook reports healthy but reconcile found zero tracked commands -- another agent (Codex, subagent) may be producing these tool_uses without reaching the hook"
+            "[contextcrawler] hook reports healthy but {} of {} sessions show tracked-command activity (<1%) -- another agent (Codex, subagent) may be producing tool_uses without reaching the hook",
+            tracked.len(),
+            sessions.len()
         );
     }
 
@@ -154,8 +165,13 @@ pub fn run(
         // tracking DB. The hook records the full pipeline string, so chained
         // commands like `git status && git diff` are tracked as one row and
         // we want a single match to credit both halves.
-        let runtime_tracked =
-            is_runtime_tracked(&ext_cmd.command, ext_cmd.timestamp, &tracked, DEFAULT_MATCH_WINDOW_SECS);
+        let runtime_tracked = is_runtime_tracked(
+            &ext_cmd.command,
+            ext_cmd.timestamp,
+            ext_cmd.session_project_slug.as_deref(),
+            &tracked,
+            DEFAULT_MATCH_WINDOW_SECS,
+        );
 
         let parts = split_command_chain(&ext_cmd.command);
         for part in parts {
@@ -381,5 +397,89 @@ fn truncate_command(cmd: &str) -> String {
         0 => String::new(),
         1 => parts[0].to_string(),
         _ => format!("{} {}", parts[0], parts[1]),
+    }
+}
+
+/// Decide whether the optional hook-health warning should fire.
+///
+/// Codex IMPORTANT #2: the previous gate (`tracked.is_empty()` + sessions
+/// non-empty + hook OK) false-positives on fresh installs that haven't
+/// accumulated tracking rows yet. Tighten to:
+///   - require ≥ `HOOK_HEALTH_MIN_SESSIONS` sessions (fresh-install
+///     suppression),
+///   - require a match rate < `HOOK_HEALTH_MIN_MATCH_RATE` (1%) — if the
+///     hook is producing any meaningful volume of tracked rows we don't
+///     want to nag.
+///
+/// Thresholds are conservative; revisit once we have field data on the
+/// distribution of (sessions, matches) for healthy installs.
+fn should_emit_hook_health_warning(
+    sessions_count: usize,
+    extracted_count: usize,
+    tracked_count: usize,
+) -> bool {
+    const HOOK_HEALTH_MIN_SESSIONS: usize = 20;
+    const HOOK_HEALTH_MIN_MATCH_RATE: f64 = 0.01;
+
+    if sessions_count < HOOK_HEALTH_MIN_SESSIONS {
+        return false;
+    }
+    if extracted_count == 0 {
+        return false;
+    }
+    let match_rate = tracked_count as f64 / extracted_count as f64;
+    match_rate < HOOK_HEALTH_MIN_MATCH_RATE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hook_health_warning_suppressed_low_sample() {
+        // Fresh install: 10 sessions, 0 tracked rows. The legacy gate
+        // would have warned; the new gate suppresses.
+        assert!(
+            !should_emit_hook_health_warning(10, 50, 0),
+            "fresh install (<20 sessions) must not trigger warning"
+        );
+    }
+
+    #[test]
+    fn test_hook_health_warning_suppressed_when_matches_present() {
+        // 100 sessions, 500 extracted commands, 50 tracked (10% match).
+        // Hook is healthy and obviously working — stay quiet.
+        assert!(
+            !should_emit_hook_health_warning(100, 500, 50),
+            "high match rate must suppress the warning"
+        );
+    }
+
+    #[test]
+    fn test_hook_health_warning_fires_on_large_sample_zero_match() {
+        // 50 sessions, 500 extracted, 0 tracked → genuine anomaly.
+        assert!(
+            should_emit_hook_health_warning(50, 500, 0),
+            "≥20 sessions + zero tracked rows should fire the warning"
+        );
+    }
+
+    #[test]
+    fn test_hook_health_warning_fires_at_threshold() {
+        // Exactly 20 sessions, < 1% match rate.
+        // 500 extracted, 4 tracked → 0.8% match rate.
+        assert!(
+            should_emit_hook_health_warning(20, 500, 4),
+            "boundary case: sessions == 20, match rate < 1% should fire"
+        );
+    }
+
+    #[test]
+    fn test_hook_health_warning_suppressed_no_extracted() {
+        // Sessions exist but produced no Bash tool_uses → can't measure.
+        assert!(
+            !should_emit_hook_health_warning(30, 0, 0),
+            "zero extracted commands should suppress (no signal to gate on)"
+        );
     }
 }

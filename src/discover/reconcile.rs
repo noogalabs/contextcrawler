@@ -26,6 +26,11 @@ pub struct TrackedCommand {
     pub original_cmd: String,
     #[allow(dead_code)]
     pub rtk_cmd: String,
+    /// Encoded project-path slug derived from the tracked row's
+    /// `project_path` column via `ClaudeProvider::encode_project_path`.
+    /// `None` when the row has no project_path (legacy data) or when the
+    /// path can't be encoded.
+    pub project_slug: Option<String>,
 }
 
 impl TrackedCommand {
@@ -136,7 +141,7 @@ fn try_load(
     let mut rows = match (lo, hi) {
         (Some(lo), Some(hi)) => {
             let mut stmt = conn.prepare(
-                "SELECT timestamp, original_cmd, rtk_cmd FROM commands
+                "SELECT timestamp, original_cmd, rtk_cmd, project_path FROM commands
                  WHERE timestamp BETWEEN ?1 AND ?2",
             )?;
             let collected =
@@ -144,8 +149,8 @@ fn try_load(
             collected
         }
         _ => {
-            let mut stmt =
-                conn.prepare("SELECT timestamp, original_cmd, rtk_cmd FROM commands")?;
+            let mut stmt = conn
+                .prepare("SELECT timestamp, original_cmd, rtk_cmd, project_path FROM commands")?;
             let collected = collect_rows(stmt.query([])?)?;
             collected
         }
@@ -162,6 +167,13 @@ fn collect_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<TrackedCommand>> {
         let ts_str: String = row.get(0)?;
         let original: String = row.get(1)?;
         let rtk: String = row.get(2)?;
+        // project_path may be NULL on legacy rows that pre-date the column
+        // or have been migrated with DEFAULT ''. Empty strings are treated
+        // as "unknown" so they don't pollute the tie-break.
+        let project_path: Option<String> = row.get(3).ok();
+        let project_slug = project_path
+            .filter(|p| !p.is_empty())
+            .map(|p| crate::discover::provider::ClaudeProvider::encode_project_path(&p));
 
         let timestamp = match parse_db_timestamp(&ts_str) {
             Some(t) => t,
@@ -172,6 +184,7 @@ fn collect_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<TrackedCommand>> {
             timestamp,
             original_cmd: original,
             rtk_cmd: rtk,
+            project_slug,
         });
     }
     Ok(out)
@@ -234,30 +247,77 @@ pub fn cmds_equivalent(a: &str, b: &str) -> bool {
 /// AND the tracked row's timestamp must fall within `window_secs` of the
 /// JSONL entry's timestamp.
 ///
-/// If `jsonl_ts` is `None` we skip the timestamp check entirely — better to
-/// over-credit a few stale commands than miss the whole session.
+/// Matching rules (Codex review fixes):
+/// - `jsonl_ts == None` → unverifiable, return `false`. Better to
+///   under-credit than over-credit (no time gate means a stale row from
+///   any point in history could match a tokenised command).
+/// - When `session_slug` is provided and a tracked row exposes
+///   `project_slug`, prefer rows whose slug matches. Rows with no slug are
+///   still acceptable (legacy data), but a slug *mismatch* disqualifies
+///   the row even if tokens + timestamp line up — disambiguates duplicate
+///   commands across nearby sessions.
+/// - If `jsonl_cmd` is unparseable by shlex (unterminated quotes) AND we
+///   fall back to whitespace tokenisation, require a project_slug match
+///   as the second signal — the whitespace fallback can false-collapse
+///   commands with quote drift, so we don't credit without it.
 pub fn is_runtime_tracked(
     jsonl_cmd: &str,
     jsonl_ts: Option<DateTime<Utc>>,
+    session_slug: Option<&str>,
     tracked: &[TrackedCommand],
     window_secs: i64,
 ) -> bool {
     let window = chrono::Duration::seconds(window_secs);
 
-    let jsonl_tokens = tokenise(jsonl_cmd).unwrap_or_else(|| tokenise_whitespace(jsonl_cmd));
+    // Codex IMPORTANT #3: no timestamp == no time gate == over-credit risk.
+    // Treat as unverifiable.
+    let j_ts = match jsonl_ts {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let (jsonl_tokens, jsonl_lo_confidence) = match tokenise(jsonl_cmd) {
+        Some(t) => (t, false),
+        None => (tokenise_whitespace(jsonl_cmd), true),
+    };
     let jsonl_stripped: Vec<String> = strip_wrapper_prefix(&jsonl_tokens).to_vec();
 
     for row in tracked {
-        // Time window gate (only when we have a JSONL timestamp).
-        if let Some(j_ts) = jsonl_ts {
-            let delta = (row.timestamp - j_ts).num_seconds().abs();
-            if delta > window.num_seconds() {
+        let delta = (row.timestamp - j_ts).num_seconds().abs();
+        if delta > window.num_seconds() {
+            continue;
+        }
+
+        // Codex IMPORTANT #1: session/project tie-break.
+        // If we know both the session's project slug AND the tracked row's
+        // project slug, a mismatch means this isn't our row — skip it.
+        // A missing slug on either side falls through (legacy rows, or
+        // session paths we couldn't decode).
+        if let (Some(sess), Some(row_slug)) = (session_slug, row.project_slug.as_deref()) {
+            if sess != row_slug {
                 continue;
             }
         }
 
-        let row_tokens = tokenise(&row.original_cmd)
-            .unwrap_or_else(|| tokenise_whitespace(&row.original_cmd));
+        // Codex NICE-TO-HAVE #1: low-confidence shlex fallback needs a
+        // second signal (matching project slug) before we credit.
+        if jsonl_lo_confidence {
+            match (session_slug, row.project_slug.as_deref()) {
+                (Some(sess), Some(row_slug)) if sess == row_slug => {}
+                _ => continue,
+            }
+        }
+
+        let (row_tokens, row_lo_confidence) = match tokenise(&row.original_cmd) {
+            Some(t) => (t, false),
+            None => (tokenise_whitespace(&row.original_cmd), true),
+        };
+
+        if row_lo_confidence && jsonl_lo_confidence {
+            // Both sides degraded — even with a slug match, twice-degraded
+            // tokenisation is too noisy.
+            continue;
+        }
 
         if row_tokens == jsonl_tokens || row_tokens == jsonl_stripped {
             // Fallback rows still count as runtime-tracked.
@@ -327,6 +387,7 @@ mod tests {
         let matched = is_runtime_tracked(
             "git status",
             Some(ts("2026-05-19T10:00:30+00:00")),
+            None,
             &ctx.tracked,
             DEFAULT_MATCH_WINDOW_SECS,
         );
@@ -349,6 +410,7 @@ mod tests {
         let matched = is_runtime_tracked(
             "git   log --oneline -n   5",
             Some(ts("2026-05-19T10:00:10+00:00")),
+            None,
             &ctx.tracked,
             DEFAULT_MATCH_WINDOW_SECS,
         );
@@ -369,6 +431,7 @@ mod tests {
         let matched = is_runtime_tracked(
             "cargo test",
             Some(ts("2026-05-19T10:10:00+00:00")),
+            None,
             &ctx.tracked,
             DEFAULT_MATCH_WINDOW_SECS,
         );
@@ -399,6 +462,7 @@ mod tests {
         let matched = is_runtime_tracked(
             "unknown-cmd foo",
             Some(ts("2026-05-19T10:00:05+00:00")),
+            None,
             &ctx.tracked,
             DEFAULT_MATCH_WINDOW_SECS,
         );
@@ -437,6 +501,7 @@ mod tests {
             let got = is_runtime_tracked(
                 cmd,
                 Some(ts(ts_str)),
+                None,
                 &ctx.tracked,
                 DEFAULT_MATCH_WINDOW_SECS,
             );
@@ -459,5 +524,175 @@ mod tests {
         assert!(tokens.is_none());
 
         let _utc_marker = Utc.timestamp_opt(0, 0).unwrap();
+    }
+
+    /// Build a tracking DB row including a project_path.
+    fn mk_db_with_paths(rows: &[(&str, &str, &str, &str)]) -> tempfile::NamedTempFile {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        conn.execute(
+            "CREATE TABLE commands (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                original_cmd TEXT NOT NULL,
+                rtk_cmd TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                saved_tokens INTEGER NOT NULL DEFAULT 0,
+                savings_pct REAL NOT NULL DEFAULT 0.0,
+                exec_time_ms INTEGER DEFAULT 0,
+                project_path TEXT DEFAULT ''
+            )",
+            [],
+        )
+        .unwrap();
+        for (ts, orig, wrapped, project_path) in rows {
+            conn.execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct, project_path)
+                 VALUES (?1, ?2, ?3, 0, 0, 0, 0.0, ?4)",
+                rusqlite::params![ts, orig, wrapped, project_path],
+            )
+            .unwrap();
+        }
+        f
+    }
+
+    #[test]
+    fn test_reconcile_session_path_tiebreak() {
+        // Two tracked rows for the same command at the same instant, but
+        // from different projects. A JSONL tool_use carrying the project
+        // slug should only match the row from its own project.
+        let db = mk_db_with_paths(&[
+            (
+                "2026-05-19T10:00:00+00:00",
+                "git status",
+                "contextcrawler git status",
+                "/Users/test/projA",
+            ),
+            (
+                "2026-05-19T10:00:30+00:00",
+                "git status",
+                "contextcrawler git status",
+                "/Users/test/projB",
+            ),
+        ]);
+        let ctx = load_tracked_from(db.path(), None, None);
+        assert_eq!(ctx.tracked.len(), 2);
+        // Both slugs should be populated.
+        assert!(ctx.tracked.iter().all(|r| r.project_slug.is_some()));
+
+        let slug_a =
+            crate::discover::provider::ClaudeProvider::encode_project_path("/Users/test/projA");
+        let slug_b =
+            crate::discover::provider::ClaudeProvider::encode_project_path("/Users/test/projB");
+
+        // Tool_use from projA → matches (slug A row exists, slug B is filtered out).
+        let matched_a = is_runtime_tracked(
+            "git status",
+            Some(ts("2026-05-19T10:00:15+00:00")),
+            Some(&slug_a),
+            &ctx.tracked,
+            DEFAULT_MATCH_WINDOW_SECS,
+        );
+        assert!(matched_a, "projA tool_use should match projA tracked row");
+
+        // Tool_use from projB → also matches its own row.
+        let matched_b = is_runtime_tracked(
+            "git status",
+            Some(ts("2026-05-19T10:00:15+00:00")),
+            Some(&slug_b),
+            &ctx.tracked,
+            DEFAULT_MATCH_WINDOW_SECS,
+        );
+        assert!(matched_b, "projB tool_use should match projB tracked row");
+
+        // Tool_use from an unrelated project → mismatching slug on both
+        // rows, so neither matches.
+        let slug_other = crate::discover::provider::ClaudeProvider::encode_project_path(
+            "/Users/test/other-project",
+        );
+        let matched_other = is_runtime_tracked(
+            "git status",
+            Some(ts("2026-05-19T10:00:15+00:00")),
+            Some(&slug_other),
+            &ctx.tracked,
+            DEFAULT_MATCH_WINDOW_SECS,
+        );
+        assert!(
+            !matched_other,
+            "unrelated-project tool_use should not credit either tracked row"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_skips_none_timestamp_commands() {
+        // A JSONL tool_use with no timestamp must not match — without the
+        // time gate we'd over-credit stale rows.
+        let db = mk_db(&[(
+            "2026-05-19T10:00:00+00:00",
+            "git status",
+            "contextcrawler git status",
+        )]);
+        let ctx = load_tracked_from(db.path(), None, None);
+        assert_eq!(ctx.tracked.len(), 1);
+
+        let matched =
+            is_runtime_tracked("git status", None, None, &ctx.tracked, DEFAULT_MATCH_WINDOW_SECS);
+        assert!(!matched, "None-timestamp tool_uses must not reconcile");
+    }
+
+    #[test]
+    fn test_reconcile_legacy_row_without_project_path_still_matches() {
+        // Rows from before the project_path column existed (empty string
+        // default) should still reconcile when slug is None on the row —
+        // we don't want to break historical data.
+        let db = mk_db(&[(
+            "2026-05-19T10:00:00+00:00",
+            "git status",
+            "contextcrawler git status",
+        )]);
+        let ctx = load_tracked_from(db.path(), None, None);
+        assert_eq!(ctx.tracked.len(), 1);
+        assert!(ctx.tracked[0].project_slug.is_none());
+
+        let slug = crate::discover::provider::ClaudeProvider::encode_project_path(
+            "/Users/test/any-project",
+        );
+        let matched = is_runtime_tracked(
+            "git status",
+            Some(ts("2026-05-19T10:00:10+00:00")),
+            Some(&slug),
+            &ctx.tracked,
+            DEFAULT_MATCH_WINDOW_SECS,
+        );
+        assert!(matched, "legacy rows (no project_slug) should still match");
+    }
+
+    #[test]
+    fn test_reconcile_shlex_fallback_requires_slug_match() {
+        // Codex NICE-TO-HAVE #1: unterminated-quote JSONL commands need a
+        // second signal (matching project slug) before crediting.
+        let db = mk_db_with_paths(&[(
+            "2026-05-19T10:00:00+00:00",
+            "echo a b",
+            "contextcrawler echo a b",
+            "/Users/test/projA",
+        )]);
+        let ctx = load_tracked_from(db.path(), None, None);
+        assert_eq!(ctx.tracked.len(), 1);
+
+        // Unterminated quote → shlex returns None → whitespace fallback.
+        // Without slug context, refuse the match.
+        let matched_no_slug = is_runtime_tracked(
+            "echo \"a b",
+            Some(ts("2026-05-19T10:00:05+00:00")),
+            None,
+            &ctx.tracked,
+            DEFAULT_MATCH_WINDOW_SECS,
+        );
+        assert!(
+            !matched_no_slug,
+            "shlex fallback without slug context must not credit"
+        );
     }
 }

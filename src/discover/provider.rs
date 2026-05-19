@@ -27,6 +27,11 @@ pub struct ExtractedCommand {
     /// top-level `timestamp` field on the JSONL line). `None` when the
     /// session entry didn't expose a parseable ISO-8601 timestamp.
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// Encoded project directory slug (the JSONL file's parent directory
+    /// name under `~/.claude/projects/`). Used by `reconcile::is_runtime_tracked`
+    /// as a tie-break when the same command appears in multiple sessions
+    /// within the timestamp window.
+    pub session_project_slug: Option<String>,
 }
 
 /// Trait for session providers (Claude Code, OpenCode, etc.).
@@ -168,6 +173,28 @@ impl SessionProvider for ClaudeProvider {
             .unwrap_or("unknown")
             .to_string();
 
+        // The session JSONL lives at
+        //   ~/.claude/projects/<encoded-project-slug>/<session_id>.jsonl
+        // (optionally one extra level for subagents). Walk up until we find
+        // a parent whose name starts with `-` or `C:-` — the encoded slug
+        // format used by `encode_project_path`. Falls back to the immediate
+        // parent dir name if no encoded ancestor is found.
+        let session_project_slug = path
+            .ancestors()
+            .skip(1)
+            .find_map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|name| name.starts_with('-') || name.starts_with("C:-"))
+                    .map(|name| name.to_string())
+            })
+            .or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            });
+
         // First pass: collect all tool_use Bash commands with their IDs and sequence
         // Second pass (same loop): collect tool_result output lengths, content, and error status
         // tool_use payload: (id, command, sequence, timestamp)
@@ -288,6 +315,7 @@ impl SessionProvider for ClaudeProvider {
                 is_error,
                 sequence_index,
                 timestamp,
+                session_project_slug: session_project_slug.clone(),
             });
         }
 
