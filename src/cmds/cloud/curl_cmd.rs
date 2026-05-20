@@ -146,17 +146,49 @@ struct FilterResult<'a> {
     tee_hint: Option<String>,
 }
 
-/// Losslessly minify a JSON body: parse and re-serialise without whitespace.
+/// Losslessly minify a JSON body by stripping insignificant whitespace only.
 ///
-/// Returns `None` when the body isn't strictly-valid JSON (so the caller passes
-/// it through untouched rather than risk corrupting it) or when minifying would
-/// not shrink it (already-compact input — avoids a needless allocation and a
-/// `Cow::Owned` clone of a multi-MB body).
+/// A serde parse/re-serialise round-trip is *not* lossless: numbers beyond f64
+/// precision (e.g. a JS millisecond timestamp with a fractional part like
+/// `1779167626250.6921`) get truncated when serde re-emits the parsed `f64`.
+/// So this validates the body with serde but then strips whitespace *textually*
+/// — numbers, key order and string contents stay byte-identical.
+///
+/// Returns `None` when the body isn't strictly-valid JSON (caller passes it
+/// through untouched) or when stripping wouldn't shrink it (already-compact —
+/// avoids a needless `Cow::Owned` clone of a multi-MB body).
 fn minify_json(raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let minified = serde_json::to_string(&value).ok()?;
-    if minified.len() < raw.len() {
-        Some(minified)
+    // Validity gate: only minify well-formed JSON. A malformed body passes
+    // through untouched rather than getting its whitespace mangled.
+    if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_err() {
+        return None;
+    }
+
+    // Strip whitespace outside string literals. The validity gate above
+    // guarantees every string is terminated, so the scan can't run off the end.
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if !matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            out.push(ch);
+        }
+    }
+
+    if out.len() < raw.len() {
+        Some(out)
     } else {
         None
     }
@@ -316,10 +348,38 @@ mod tests {
 
     #[test]
     fn test_filter_curl_minified_json_preserves_key_order() {
-        // serde_json `preserve_order` feature keeps keys in source order.
+        // Textual whitespace stripping keeps keys in source order trivially.
         let pretty = "{\n  \"zebra\": 1,\n  \"apple\": 2,\n  \"mango\": 3\n}";
         let result = filter_curl_output(pretty, true);
         assert_eq!(&*result.content, r#"{"zebra":1,"apple":2,"mango":3}"#);
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_float_precision() {
+        // Regression: a serde parse/re-serialise round-trip drops precision on
+        // numbers beyond f64 range — e.g. a JS millisecond timestamp with a
+        // fractional part. Textual minification keeps the digits byte-identical.
+        let raw = "{\n  \"lastSession\": 1779167626250.6921\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, r#"{"lastSession":1779167626250.6921}"#);
+        assert!(result.content.contains("1779167626250.6921"));
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_whitespace_inside_strings() {
+        // Whitespace inside a string literal is significant — must survive.
+        let raw = "{\n  \"msg\": \"hello   world\\ttab\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"msg\":\"hello   world\\ttab\"}");
+    }
+
+    #[test]
+    fn test_filter_curl_json_escaped_quote_in_string() {
+        // An escaped quote must not be misread as the string terminator.
+        let raw = "{\n  \"q\": \"she said \\\"hi\\\"\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"q\":\"she said \\\"hi\\\"\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
     }
 
     // --- Cow optimization: passthrough must not allocate ---
