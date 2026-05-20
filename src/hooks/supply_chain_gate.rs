@@ -277,15 +277,53 @@ lazy_static! {
         Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)poetry\s+add\s+([^|;&>]+)").unwrap();
     static ref PIPX_RE: Regex =
         Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pipx\s+install\s+([^|;&>]+)").unwrap();
-    /// Bare lockfile install: `npm install` / `npm i` / `npm ci` /
-    /// `pnpm install` / `pnpm i` / `yarn install` / `yarn` with NO package
-    /// arguments. These pull the entire dependency tree from a lockfile the
-    /// gate cannot enumerate. The trailing `(?:[|;&>]|$)` ensures no package
-    /// token follows (a real install like `npm install lodash` is left for
-    /// the package-bearing regexes above).
-    static ref NPM_LOCKFILE_RE: Regex = Regex::new(
-        r"(?m)(?:^|\s|;|&&|\|\|)(?:npm\s+(?:i|install|ci)|pnpm\s+(?:i|install)|yarn(?:\s+install)?)\s*(?:[|;&>]|$)"
-    ).unwrap();
+}
+
+/// Tokenise a shell command into (offset, token) pairs, treating the shell
+/// operators `&&`, `||`, `;`, `|`, `>`, `>>` as standalone delimiter tokens.
+/// This is deliberately simple — it does not honour quoting — but it is
+/// enough to classify install verbs and tell a flag from a package name.
+fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Shell operators become their own tokens.
+        if c == ';' || c == '|' || c == '&' || c == '>' {
+            let start = i;
+            let mut j = i + 1;
+            // Group repeated operator chars (`&&`, `||`, `>>`).
+            while j < bytes.len() && (bytes[j] as char) == c {
+                j += 1;
+            }
+            out.push((start, cmd[start..j].to_string()));
+            i = j;
+            continue;
+        }
+        // Ordinary word: run until whitespace or operator char.
+        let start = i;
+        let mut j = i;
+        while j < bytes.len() {
+            let cj = bytes[j] as char;
+            if cj.is_whitespace() || cj == ';' || cj == '|' || cj == '&' || cj == '>' {
+                break;
+            }
+            j += 1;
+        }
+        out.push((start, cmd[start..j].to_string()));
+        i = j;
+    }
+    out
+}
+
+/// True if a token is a shell operator delimiter (not a package name).
+fn is_shell_operator(tok: &str) -> bool {
+    matches!(tok, ";" | "|" | "||" | "&" | "&&" | ">" | ">>")
 }
 
 fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
@@ -342,33 +380,130 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     }
 
     // Bare lockfile installs (`npm install` / `npm ci` / `pnpm install` /
-    // `yarn install` with no package args) never match the package-bearing
-    // regexes above. Detect them separately so they can't slip through as a
-    // silent Skip — the whole dependency tree comes from a lockfile.
-    for m in NPM_LOCKFILE_RE.find_iter(cmd) {
-        let (start, end) = (m.start(), m.end());
-        if claimed.iter().any(|(s, e)| start >= *s && start < *e) {
-            continue;
-        }
-        claimed.push((start, end));
-        out.push(ParsedInstall {
-            ecosystem: Ecosystem::Npm,
-            packages: Vec::new(),
-            has_editable: false,
-            unvettable: Some(
-                "bare lockfile install — pulls the dependency tree from package-lock.json/\
-                 pnpm-lock.yaml/yarn.lock the gate cannot vet"
-                    .to_string(),
-            ),
-        });
-    }
+    // `yarn install` / `yarn` with no package args) never match the
+    // package-bearing regexes above. They are classified from the parsed
+    // token stream rather than a regex that must see end-of-command: a
+    // regex anchored on `$`/delimiter is defeated by trailing flags such
+    // as `npm ci --ignore-scripts` or `yarn install --immutable`, which
+    // would then fall through as a silent Skip (#111 G1 follow-up).
+    detect_bare_lockfile_installs(cmd, &mut claimed, &mut out);
 
     out
 }
 
+/// Scan the shell token stream for npm/pnpm/yarn install verbs that resolve
+/// their package set from a lockfile (no package-name token follows). A
+/// package name is a bare token that is neither a flag (`-`-prefixed) nor a
+/// shell operator; trailing flags and shell operators must NOT defeat the
+/// classification. A verb followed by a package token is left for the
+/// package-bearing regexes above.
+fn detect_bare_lockfile_installs(
+    cmd: &str,
+    claimed: &mut Vec<(usize, usize)>,
+    out: &mut Vec<ParsedInstall>,
+) {
+    let tokens = shell_tokens(cmd);
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let (start, tok) = (&tokens[idx].0, tokens[idx].1.as_str());
+        // Identify an install-verb head: `npm`/`pnpm`/`yarn` plus the verb
+        // token(s). Bare `yarn` (no sub-command) is itself an install.
+        let (verb_span_end_idx, is_bare_install_verb) = match tok {
+            "npm" | "pnpm" => {
+                match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
+                    Some("install") | Some("i") => (idx + 1, true),
+                    // `npm ci` is npm-only but harmless to accept for pnpm too.
+                    Some("ci") => (idx + 1, true),
+                    _ => {
+                        idx += 1;
+                        continue;
+                    }
+                }
+            }
+            "yarn" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
+                Some("install") => (idx + 1, true),
+                // Bare `yarn` or `yarn` followed by a flag / operator is an
+                // install. `yarn add ...` / `yarn <other>` is not.
+                Some(next) if next.starts_with('-') || is_shell_operator(next) => (idx, true),
+                None => (idx, true),
+                _ => {
+                    idx += 1;
+                    continue;
+                }
+            },
+            _ => {
+                idx += 1;
+                continue;
+            }
+        };
+
+        if !is_bare_install_verb {
+            idx += 1;
+            continue;
+        }
+
+        // Walk the tokens after the verb: stop at the first shell operator
+        // (end of this command). If a non-flag, non-operator token appears,
+        // it is a package name and this is NOT a bare lockfile install.
+        let mut has_package = false;
+        let mut scan = verb_span_end_idx + 1;
+        while scan < tokens.len() {
+            let t = tokens[scan].1.as_str();
+            if is_shell_operator(t) {
+                break;
+            }
+            if !t.starts_with('-') {
+                has_package = true;
+                break;
+            }
+            scan += 1;
+        }
+
+        if !has_package {
+            // Skip if a higher-priority pattern already claimed this span.
+            if !claimed.iter().any(|(s, e)| *start >= *s && *start < *e) {
+                claimed.push((*start, *start + tokens[idx].1.len()));
+                out.push(ParsedInstall {
+                    ecosystem: Ecosystem::Npm,
+                    packages: Vec::new(),
+                    has_editable: false,
+                    unvettable: Some(
+                        "bare lockfile install — pulls the dependency tree from \
+                         package-lock.json/pnpm-lock.yaml/yarn.lock the gate cannot vet"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+
+        idx = verb_span_end_idx + 1;
+    }
+}
+
+/// Split a CLI argument token into `(flag, attached_value)`.
+///
+/// Returns `None` when the token is not a flag (does not start with `-`).
+/// For a flag, the value is `Some` only when an attached `=` form is used:
+///   `--requirement=req.txt` -> `("--requirement", Some("req.txt"))`
+///   `-r=req.txt`            -> `("-r", Some("req.txt"))`
+///   `--requirement`         -> `("--requirement", None)`
+///   `-r`                    -> `("-r", None)`
+/// This mirrors the established `a == "--config" || a.starts_with("--config=")`
+/// attached-form handling used by other arg checkers in the codebase.
+fn split_attached_flag(tok: &str) -> Option<(&str, Option<&str>)> {
+    if !tok.starts_with('-') {
+        return None;
+    }
+    match tok.split_once('=') {
+        Some((flag, value)) => Some((flag, Some(value))),
+        None => Some((tok, None)),
+    }
+}
+
 /// Returns (registry-package-names with optional pinned version,
 /// saw_editable_arg, lockfile_source). `lockfile_source` is `Some(detail)`
-/// when a `-r`/`--requirement`/`-c`/`--constraint` indirection flag was seen.
+/// when a `-r`/`--requirement`/`-c`/`--constraint` indirection flag was seen
+/// (in either the separate or attached `=` form).
 fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<String>) {
     let mut pkgs = Vec::new();
     let mut editable = false;
@@ -381,20 +516,35 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
             tokens.next();
             continue;
         }
-        if matches!(tok, "-r" | "--requirement" | "-c" | "--constraint") {
-            let target = tokens.next().unwrap_or("(unspecified)");
-            lockfile_source.get_or_insert_with(|| {
-                format!(
-                    "install reads packages from '{}' ({}) — the gate cannot vet a \
-                     requirements/constraints file",
-                    target, tok
-                )
-            });
-            continue;
-        }
-        if matches!(tok, "-t" | "--target" | "--index-url") {
-            tokens.next();
-            continue;
+        // Requirements / constraints indirection. Accept BOTH the separate
+        // form (`-r req.txt`, `--requirement req.txt`) and the attached `=`
+        // form (`--requirement=req.txt`, `-r=req.txt`). When the file is
+        // attached, the value travels in the same token — splitting on `=`
+        // recovers it. Either way, set `lockfile_source` so the install is
+        // flagged unvettable (#111 G1 follow-up).
+        if let Some((flag, attached)) = split_attached_flag(tok) {
+            if matches!(flag, "-r" | "--requirement" | "-c" | "--constraint") {
+                let target: String = match attached {
+                    Some(v) => v.to_string(),
+                    None => tokens.next().unwrap_or("(unspecified)").to_string(),
+                };
+                lockfile_source.get_or_insert_with(|| {
+                    format!(
+                        "install reads packages from '{}' ({}) — the gate cannot vet a \
+                         requirements/constraints file",
+                        target, flag
+                    )
+                });
+                continue;
+            }
+            if matches!(flag, "-t" | "--target" | "--index-url") {
+                // Value-bearing flag: consume the value token only when it
+                // was NOT attached with `=`.
+                if attached.is_none() {
+                    tokens.next();
+                }
+                continue;
+            }
         }
         if tok.starts_with('-') {
             continue;
@@ -1230,6 +1380,150 @@ mod tests {
         // Real names still work.
         assert!(cache_file(Ecosystem::Npm, "lodash").is_some());
         assert!(cache_file(Ecosystem::Npm, "@types/node").is_some());
+    }
+
+    #[test]
+    fn lockfile_install_with_trailing_flags_is_unvettable() {
+        // CRITICAL 1 (#111 G1 follow-up): a regex anchored on end-of-command
+        // misses these CI-common forms. Token-stream classification must
+        // catch them — trailing flags are not package names.
+        for cmd in [
+            "npm ci --ignore-scripts",
+            "pnpm install --frozen-lockfile",
+            "yarn install --immutable",
+            "npm install --no-audit",
+            "yarn --immutable",
+        ] {
+            let v = detect_installs(cmd);
+            assert_eq!(v.len(), 1, "`{}` should yield one install", cmd);
+            assert!(
+                v[0].packages.is_empty(),
+                "`{}` should name no package",
+                cmd
+            );
+            assert!(
+                v[0].unvettable.is_some(),
+                "`{}` must be flagged unvettable",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn lockfile_install_followed_by_shell_operator_is_unvettable() {
+        // A shell operator after the verb terminates the command — it is not
+        // a package name. `npm install && echo x` is still a bare install.
+        for cmd in [
+            "npm install && echo done",
+            "npm ci && echo done",
+            "pnpm install ; echo x",
+            "yarn install | tee log",
+        ] {
+            let v = detect_installs(cmd);
+            assert!(
+                v.iter().any(|i| i.unvettable.is_some()),
+                "`{}` must flag a bare lockfile install",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn check_verdict_ask_for_lockfile_install_with_flags() {
+        // End-to-end: a CI-form lockfile install must NOT be auto-allowed.
+        // It carries no package name, so detection yields an unvettable
+        // install and `check()` would downgrade to Ask (verified here via
+        // detect_installs since `check()` needs config enabled + network).
+        let v = detect_installs("npm ci --ignore-scripts && echo done");
+        assert_eq!(v.len(), 1);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn pip_install_attached_requirement_form_is_unvettable() {
+        // CRITICAL 2 (#111 G1 follow-up): the attached `=` form must be
+        // recognised as a requirements indirection, not an ordinary install.
+        for cmd in [
+            "pip install --requirement=req.txt",
+            "pip install -r=req.txt",
+        ] {
+            let v = detect_installs(cmd);
+            assert_eq!(v.len(), 1, "`{}` should yield one install", cmd);
+            assert!(
+                v[0].unvettable.is_some(),
+                "`{}` must be flagged unvettable",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn pip_install_attached_constraint_form_is_unvettable() {
+        for cmd in [
+            "pip install --constraint=constraints.txt",
+            "pip install -c=constraints.txt",
+        ] {
+            let v = detect_installs(cmd);
+            assert_eq!(v.len(), 1);
+            assert!(
+                v[0].unvettable.is_some(),
+                "`{}` must be flagged unvettable",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn pip_install_attached_requirement_with_named_pkg_keeps_name() {
+        // `--requirement=req.txt foo` names `foo` AND pulls the requirements
+        // file — name resolved, install still flagged unvettable.
+        let v = detect_installs("pip install --requirement=req.txt foo");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["foo"]);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn split_attached_flag_forms() {
+        assert_eq!(split_attached_flag("lodash"), None);
+        assert_eq!(split_attached_flag("-r"), Some(("-r", None)));
+        assert_eq!(
+            split_attached_flag("--requirement=req.txt"),
+            Some(("--requirement", Some("req.txt")))
+        );
+        assert_eq!(
+            split_attached_flag("-r=req.txt"),
+            Some(("-r", Some("req.txt")))
+        );
+    }
+
+    #[test]
+    fn normal_pip_install_unaffected_by_attached_flag_fix() {
+        // Regression: a plain `pip install requests` must still name the
+        // package and must NOT be flagged unvettable.
+        let v = detect_installs("pip install requests");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+        assert!(v[0].unvettable.is_none());
+    }
+
+    #[test]
+    fn named_install_with_flags_not_double_counted_as_bare() {
+        // `npm install lodash --no-audit` names a package — exactly one
+        // install, not also a bare-lockfile detection.
+        let v = detect_installs("npm install lodash --no-audit");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+        assert!(v[0].unvettable.is_none());
+    }
+
+    #[test]
+    fn yarn_add_not_flagged_as_bare_install() {
+        // `yarn add lodash` is a named install, not a bare lockfile install.
+        let v = detect_installs("yarn add lodash");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+        assert!(v[0].unvettable.is_none());
     }
 
     #[test]
