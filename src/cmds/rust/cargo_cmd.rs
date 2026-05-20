@@ -9,6 +9,59 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::OnceLock;
 
+/// Strip ANSI escape sequences (CSI / SGR colour codes, OSC sequences) from a
+/// string. cargo is invoked with `--color=never`, but a tainted parent env
+/// (`CARGO_TERM_COLOR=always`, `CLICOLOR_FORCE`) or a wrapper can still force
+/// colour. Without stripping, a coloured `error:` becomes `\x1b[…merror:` and
+/// fails the `starts_with("error:")` failure-detection — a real failure would
+/// read as success (issue #100, G5 finding 4).
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI sequence: ESC [ ... <final byte 0x40-0x7E>
+            Some('[') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            // OSC sequence: ESC ] ... terminated by BEL or ESC \
+            Some(']') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    if n == '\x07' {
+                        chars.next();
+                        break;
+                    }
+                    if n == '\x1b' {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            // Other two-byte escape: drop ESC + the next byte.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub enum CargoCommand {
     Build,
@@ -91,6 +144,9 @@ impl CargoBuildHandler {
 
 impl BlockHandler for CargoBuildHandler {
     fn should_skip(&mut self, line: &str) -> bool {
+        // Strip ANSI so forced-colour output can't defeat failure detection.
+        let stripped = strip_ansi(line);
+        let line = stripped.as_str();
         let trimmed = line.trim_start();
         if trimmed.starts_with("Compiling") || trimmed.starts_with("Checking") {
             self.compiled += 1;
@@ -115,6 +171,8 @@ impl BlockHandler for CargoBuildHandler {
     }
 
     fn is_block_start(&mut self, line: &str) -> bool {
+        let stripped = strip_ansi(line);
+        let line = stripped.as_str();
         if line.starts_with("error[") || line.starts_with("error:") {
             self.error_count += 1;
             return true;
@@ -127,7 +185,8 @@ impl BlockHandler for CargoBuildHandler {
     }
 
     fn is_block_continuation(&mut self, line: &str, block: &[String]) -> bool {
-        !(line.trim().is_empty() && block.len() > 3)
+        let stripped = strip_ansi(line);
+        !(stripped.trim().is_empty() && block.len() > 3)
     }
 
     fn format_summary(&self, _exit_code: i32, _raw: &str) -> Option<String> {
@@ -166,6 +225,8 @@ impl CargoTestHandler {
 
 impl BlockHandler for CargoTestHandler {
     fn should_skip(&mut self, line: &str) -> bool {
+        let stripped = strip_ansi(line);
+        let line = stripped.as_str();
         let trimmed = line.trim_start();
         if trimmed.starts_with("Compiling")
             || trimmed.starts_with("Downloading")
@@ -212,11 +273,11 @@ impl BlockHandler for CargoTestHandler {
     }
 
     fn is_block_start(&mut self, line: &str) -> bool {
-        self.in_failure_section && line.starts_with("---- ")
+        self.in_failure_section && strip_ansi(line).starts_with("---- ")
     }
 
     fn is_block_continuation(&mut self, line: &str, _block: &[String]) -> bool {
-        self.in_failure_section && !line.starts_with("---- ")
+        self.in_failure_section && !strip_ansi(line).starts_with("---- ")
     }
 
     fn format_summary(&self, _exit_code: i32, raw: &str) -> Option<String> {
@@ -302,6 +363,10 @@ where
     // / RUSTFLAGS / CARGO_HOME / etc. from the inherited env so a tainted
     // parent can't hijack this invocation. See issue #34.
     let mut cmd = secure_cargo_command();
+    // Force colour off so failure-pattern matching (`error:` / `FAILED`) is not
+    // defeated by ANSI-wrapped output from a tainted env (issue #100, G5#4).
+    // `strip_ansi` below is the belt-and-braces second line of defence.
+    cmd.arg("--color=never");
     cmd.arg(subcommand);
 
     for arg in &restored_args {
@@ -336,6 +401,9 @@ fn run_cargo_streamed(
     }
 
     let mut cmd = secure_cargo_command();
+    // See run_cargo_filtered — force colour off so ANSI can't defeat the
+    // streamed failure detection (issue #100, G5#4).
+    cmd.arg("--color=never");
     cmd.arg(subcommand);
 
     for arg in &restored_args {
@@ -407,6 +475,7 @@ fn format_crate_info(name: &str, version: &str, fallback: &str) -> String {
 
 /// Filter cargo install output - strip dep compilation, keep installed/replaced/errors
 fn filter_cargo_install(output: &str) -> String {
+    let output = &strip_ansi(output);
     let mut errors: Vec<String> = Vec::new();
     let mut error_count = 0;
     let mut compiled = 0;
@@ -591,6 +660,7 @@ fn flush_failure_block(header: &mut String, body: &mut Vec<String>, failures: &m
 
 /// Filter cargo nextest output - show failures + compact summary
 fn filter_cargo_nextest(output: &str) -> String {
+    let output = &strip_ansi(output);
     static SUMMARY_RE: OnceLock<regex::Regex> = OnceLock::new();
     let summary_re = SUMMARY_RE.get_or_init(|| {
         regex::Regex::new(
@@ -807,6 +877,7 @@ fn filter_cargo_nextest(output: &str) -> String {
 }
 
 fn filter_cargo_build(output: &str) -> String {
+    let output = &strip_ansi(output);
     let mut handler = CargoBuildHandler::new();
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut current_block: Vec<String> = Vec::new();
@@ -959,6 +1030,7 @@ impl AggregatedTestResult {
 }
 
 pub(crate) fn filter_cargo_test(output: &str) -> String {
+    let output = &strip_ansi(output);
     let mut failures: Vec<String> = Vec::new();
     let mut summary_lines: Vec<String> = Vec::new();
     let mut in_failure_section = false;
@@ -1089,6 +1161,7 @@ pub(crate) fn filter_cargo_test(output: &str) -> String {
 
 /// Filter cargo clippy output - show full error blocks, group warnings by lint rule
 fn filter_cargo_clippy(output: &str) -> String {
+    let output = &strip_ansi(output);
     let mut by_rule: HashMap<String, Vec<String>> = HashMap::new();
     let mut error_count = 0;
     let mut warning_count = 0;
@@ -1144,10 +1217,13 @@ fn filter_cargo_clippy(output: &str) -> String {
 
             // Extract rule/error-code from brackets for warning grouping
             current_rule = if let Some(bracket_start) = line.rfind('[') {
-                if let Some(bracket_end) = line.rfind(']') {
-                    line[bracket_start + 1..bracket_end].to_string()
-                } else {
-                    line.to_string()
+                // Guard against `]` appearing before `[` (e.g. `]foo[`) — an
+                // unguarded slice would panic with a reversed range (#100, G5#5).
+                match line.rfind(']') {
+                    Some(bracket_end) if bracket_start < bracket_end => {
+                        line[bracket_start + 1..bracket_end].to_string()
+                    }
+                    _ => line.to_string(),
                 }
             } else {
                 let prefix = if is_error_line {
@@ -1199,17 +1275,15 @@ fn filter_cargo_clippy(output: &str) -> String {
     ));
     result.push_str("═══════════════════════════════════════\n");
 
-    // Show full error blocks so developers can see what needs fixing
+    // Show every error block — errors are actionable and must never be
+    // silently dropped (#100, G5#10). Warnings are still grouped/capped below.
     if !error_blocks.is_empty() {
         result.push_str("\nErrors:\n");
-        for block in error_blocks.iter().take(10) {
+        for block in &error_blocks {
             for block_line in block {
                 result.push_str(&format!("  {}\n", truncate(block_line, 160)));
             }
             result.push('\n');
-        }
-        if error_blocks.len() > 10 {
-            result.push_str(&format!("  ... +{} more errors\n", error_blocks.len() - 10));
         }
     }
 
@@ -1255,6 +1329,55 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #100 G5#4: ANSI-wrapped failure lines must still be detected ---
+
+    #[test]
+    fn test_strip_ansi_removes_sgr_codes() {
+        let input = "\x1b[1m\x1b[31merror:\x1b[0m something broke";
+        assert_eq!(strip_ansi(input), "error: something broke");
+    }
+
+    #[test]
+    fn test_strip_ansi_plain_text_unchanged() {
+        assert_eq!(strip_ansi("error: plain"), "error: plain");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_sequence() {
+        // OSC hyperlink: ESC ] 8 ; ; URL BEL text ESC ] 8 ; ; BEL
+        let input = "\x1b]8;;https://x\x07link\x1b]8;;\x07";
+        assert_eq!(strip_ansi(input), "link");
+    }
+
+    #[test]
+    fn test_filter_cargo_test_detects_ansi_wrapped_failure() {
+        // A real failure with forced colour: without ANSI stripping the
+        // `error:` prefix match fails and the failure reads as success.
+        let output = "\x1b[0m\x1b[1m\x1b[38;5;9merror[E0308]\x1b[0m: mismatched types\n\
+                      \x1b[0m\x1b[1m\x1b[38;5;9merror\x1b[0m: aborting due to 1 previous error\n";
+        let result = filter_cargo_test(output);
+        assert!(
+            result.contains("error") || result.contains("cargo"),
+            "ANSI-wrapped failure should still be visible, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\x1b["),
+            "filtered output must not retain ANSI escapes, got: {:?}",
+            result
+        );
+    }
+
+    // --- #100 G5#5: clippy bracket slice must not panic on `]...[` ---
+
+    #[test]
+    fn test_filter_cargo_clippy_reversed_brackets_no_panic() {
+        // `]` before `[` previously panicked on a reversed slice range.
+        let output = "warning: weird ]thing[ here\n --> src/x.rs:1:1\n";
+        let result = filter_cargo_clippy(output);
+        assert!(result.contains("cargo clippy"));
+    }
 
     #[test]
     fn test_restore_double_dash_with_separator() {

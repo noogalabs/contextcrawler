@@ -358,8 +358,17 @@ fn filter_migrate_status(output: &str) -> String {
             applied_count += 1;
             if latest_migration.is_empty() && line.contains("202") {
                 if let Some(pos) = line.find("202") {
-                    let end = line[pos..].find(|c: char| c.is_whitespace()).unwrap_or(20);
-                    latest_migration = line[pos..pos + end].to_string();
+                    // `end` is relative to `line[pos..]`. When no whitespace
+                    // follows, fall back to a 20-char window but clamp to the
+                    // line length and use `.get()` so a char boundary inside a
+                    // multi-byte sequence cannot panic (#100, G5#8).
+                    let rel_end = line[pos..]
+                        .find(|c: char| c.is_whitespace())
+                        .unwrap_or(20);
+                    let abs_end = (pos + rel_end).min(line.len());
+                    if let Some(slice) = line.get(pos..abs_end) {
+                        latest_migration = slice.to_string();
+                    }
                 }
             }
         }
@@ -483,6 +492,35 @@ fn extract_index_name(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #100 G5#8: migrate-status slice offset must not panic ---
+
+    #[test]
+    fn test_filter_migrate_status_no_whitespace_after_marker() {
+        // "202..." with no trailing whitespace previously sliced a fixed
+        // 20-char window that overran the line.
+        let output = "applied 202401";
+        let result = filter_migrate_status(output);
+        assert!(result.contains("1 applied"));
+    }
+
+    #[test]
+    fn test_filter_migrate_status_multibyte_after_marker() {
+        // A multi-byte char inside the 20-char fallback window must not
+        // trigger a char-boundary panic.
+        let output = "applied 202401\u{1F600}migration";
+        let result = filter_migrate_status(output);
+        assert!(result.contains("applied"));
+    }
+
+    #[test]
+    fn test_filter_migrate_status_normal_case() {
+        let output = "applied 20240101_init done\npending 20240202_next";
+        let result = filter_migrate_status(output);
+        assert!(result.contains("1 applied"));
+        assert!(result.contains("1 pending"));
+        assert!(result.contains("20240101_init"));
+    }
 
     #[test]
     fn test_filter_generate() {
