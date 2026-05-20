@@ -106,3 +106,87 @@ fn tree_handles_dash_prefixed_path() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A grep pattern shaped like `--pre=<cmd>` must NOT be parsed by rg as the
+/// `--pre` preprocessor flag (confirmed RCE, #32 / #111 G5). With the `--`
+/// boundary in front of the pattern, rg treats it as a literal pattern, so
+/// the marker file the "preprocessor" would create is never written.
+#[test]
+fn grep_pattern_shaped_like_pre_flag_is_not_executed() {
+    let root = unique_dir("grep-pre");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create grep-pre dir");
+    fs::write(root.join("haystack.txt"), "nothing interesting here\n")
+        .expect("write haystack.txt");
+
+    // If `--pre` were honoured, rg would exec this script per file.
+    let marker = root.join("pwned.marker");
+    let script = root.join("evil.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\ncat \"$1\"\n", marker.display()),
+    )
+    .expect("write evil.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+    }
+
+    let out = Command::new(binary_path())
+        .arg("grep")
+        .arg(format!("--pre={}", script.display()))
+        .arg(&root)
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
+        .output()
+        .expect("spawn contextcrawler grep");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert!(
+        !marker.exists(),
+        "preprocessor script must NOT have run — `--`-shaped pattern reached rg as a flag; got:\n{}",
+        combined,
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A grep `path` operand that begins with `-` must be treated as a path, not
+/// parsed as an rg/grep option — the `--` boundary precedes the path.
+#[test]
+fn grep_path_starting_with_dash_is_treated_as_path() {
+    let root = unique_dir("grep-dashpath");
+    let _ = fs::remove_dir_all(&root);
+    let dash_dir = root.join("-dashdir");
+    fs::create_dir_all(&dash_dir).expect("create -dashdir");
+    fs::write(dash_dir.join("file.txt"), "findme_token\n").expect("write file.txt");
+
+    let out = Command::new(binary_path())
+        .arg("grep")
+        .arg("findme_token")
+        .arg(&dash_dir)
+        .env("CONTEXTCRAWLER_TEST_MODE", "1")
+        .output()
+        .expect("spawn contextcrawler grep");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert!(
+        combined.contains("findme_token"),
+        "grep should search a dash-prefixed path and find the match, got:\n{}",
+        combined,
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

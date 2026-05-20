@@ -50,12 +50,21 @@ pub fn run(
     // Without this, rg returns 0 matches for files in .gitignore, causing
     // false negatives that make AI agents draw wrong conclusions.
     // Using --no-ignore-vcs (not --no-ignore) so .ignore/.rgignore are still respected.
-    rg_cmd.args(["-n", "--no-heading", "--no-ignore-vcs", &rg_pattern, path]);
+    //
+    // argv layout (#100, G5#1): fixed flags, then the forbidden-checked
+    // `extra_args`, then a `--` boundary, then the pattern and path. The
+    // `--` MUST precede `rg_pattern`/`path` so neither can be parsed as an
+    // option — without it a pattern of the form `--pre=<cmd>` reaches rg
+    // unscanned and runs an arbitrary preprocessor (confirmed RCE, #32).
+    rg_cmd.args(["-n", "--no-heading", "--no-ignore-vcs"]);
 
     if let Some(ft) = file_type {
         rg_cmd.arg("--type").arg(ft);
     }
 
+    // `extra_args` were already screened by `check_forbidden_rg_args` above;
+    // they must stay on the option side of the `--` boundary so legitimate
+    // flags (e.g. `-i`, `-A 3`) are still parsed as options.
     for arg in extra_args {
         // Fix: skip grep-ism -r flag (rg is recursive by default; rg -r means --replace)
         if arg == "-r" || arg == "--recursive" {
@@ -64,6 +73,10 @@ pub fn run(
         rg_cmd.arg(arg);
     }
 
+    rg_cmd.arg("--");
+    rg_cmd.arg(&rg_pattern);
+    rg_cmd.arg(path);
+
     let result = exec_capture(&mut rg_cmd)
         .or_else(|_| {
             // Fallback grep also needs env-sanitisation (env vars are
@@ -71,8 +84,12 @@ pub fn run(
             // grep variant could honor similar mechanisms). Use the secure
             // helper for consistency.
             let mut grep_cmd = secure_rg_command("grep");
-            //When we fall back to grep,include all args, not just -rn.
-            grep_cmd.args(["-rn", pattern, path]).args(extra_args);
+            // When we fall back to grep, include all args, not just -rn.
+            // Same `--` boundary as the rg path above (#100, G5#1): the
+            // forbidden-checked `extra_args` stay on the option side, then
+            // `--`, then pattern and path so neither is parsed as an option.
+            grep_cmd.args(["-rn"]).args(extra_args);
+            grep_cmd.arg("--").arg(pattern).arg(path);
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;

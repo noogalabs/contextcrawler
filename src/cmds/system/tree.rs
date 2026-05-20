@@ -35,23 +35,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Forward options first, then a `--` boundary, then path operands. Without
     // the boundary a user path beginning with `-` (e.g. a directory named
     // `-la`) would be parsed by `tree` as an option (#100, G5#2).
-    // `tree` short options that consume the following argument as their value;
-    // that argument must stay on the option side of the `--` boundary.
-    const VALUE_FLAGS: &[&str] = &["-L", "-I", "-P", "-o", "--filelimit"];
-    let mut flags: Vec<&str> = Vec::new();
-    let mut paths: Vec<&str> = Vec::new();
-    let mut expect_value = false;
-    for arg in args {
-        if expect_value {
-            flags.push(arg);
-            expect_value = false;
-        } else if arg.starts_with('-') {
-            flags.push(arg);
-            expect_value = VALUE_FLAGS.contains(&arg.as_str());
-        } else {
-            paths.push(arg);
-        }
-    }
+    let (flags, paths) = split_flags_and_paths(args);
     for flag in flags {
         cmd.arg(flag);
     }
@@ -84,6 +68,32 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             .early_exit_on_failure()
             .no_trailing_newline(),
     )
+}
+
+/// Split raw `tree` args into `(flags, paths)`.
+///
+/// `tree` short options that consume the following argument as their value;
+/// that argument must stay on the option side of the `--` boundary so it is
+/// not mistaken for a search path. `-o` is genuine: native tree (v2.x,
+/// `tree --help`) documents `-o filename` — "Output to file instead of
+/// stdout" — so the token after `-o` is a filename operand, not a path.
+fn split_flags_and_paths(args: &[String]) -> (Vec<&str>, Vec<&str>) {
+    const VALUE_FLAGS: &[&str] = &["-L", "-I", "-P", "-o", "--filelimit"];
+    let mut flags: Vec<&str> = Vec::new();
+    let mut paths: Vec<&str> = Vec::new();
+    let mut expect_value = false;
+    for arg in args {
+        if expect_value {
+            flags.push(arg);
+            expect_value = false;
+        } else if arg.starts_with('-') {
+            flags.push(arg);
+            expect_value = VALUE_FLAGS.contains(&arg.as_str());
+        } else {
+            paths.push(arg);
+        }
+    }
+    (flags, paths)
 }
 
 fn filter_tree_output(raw: &str) -> String {
@@ -177,6 +187,37 @@ mod tests {
                 "Should preserve file.txt in output"
             );
         }
+    }
+
+    fn sv(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    // #111 G5: `-o filename` is tree's output-file flag — `filename` is its
+    // value and must stay on the flag side, while the trailing operand is
+    // still recognised as the search path.
+    #[test]
+    fn test_split_o_consumes_filename_value() {
+        let args = sv(&["-o", "out.txt", "somedir"]);
+        let (flags, paths) = split_flags_and_paths(&args);
+        assert_eq!(flags, vec!["-o", "out.txt"]);
+        assert_eq!(paths, vec!["somedir"], "search path must survive -o value");
+    }
+
+    #[test]
+    fn test_split_plain_path_only() {
+        let args = sv(&["somedir"]);
+        let (flags, paths) = split_flags_and_paths(&args);
+        assert!(flags.is_empty());
+        assert_eq!(paths, vec!["somedir"]);
+    }
+
+    #[test]
+    fn test_split_value_flags_then_path() {
+        let args = sv(&["-L", "2", "-P", "*.rs", "src"]);
+        let (flags, paths) = split_flags_and_paths(&args);
+        assert_eq!(flags, vec!["-L", "2", "-P", "*.rs"]);
+        assert_eq!(paths, vec!["src"]);
     }
 
     #[test]
