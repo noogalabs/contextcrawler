@@ -2017,42 +2017,41 @@ mod tests {
     // 12. record_parse_failure + get_parse_failure_summary roundtrip
     #[test]
     fn test_parse_failure_roundtrip() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let test_cmd = format!("git -C /path status test_{}", std::process::id());
+        // In-memory tracker: isolated from the process-shared test DB, so the
+        // counts are exact rather than ">= 1" (Codex review of #69/#94).
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let test_cmd = "git -C /path status";
 
         tracker
-            .record_parse_failure(&test_cmd, "unrecognized subcommand", true)
+            .record_parse_failure(test_cmd, "unrecognized subcommand", true)
             .expect("Failed to record parse failure");
 
         let summary = tracker
             .get_parse_failure_summary()
             .expect("Failed to get summary");
 
-        assert!(summary.total >= 1);
+        assert_eq!(summary.total, 1);
         assert!(summary.recent.iter().any(|r| r.raw_command == test_cmd));
     }
 
     // 13. recovery_rate calculation
     #[test]
     fn test_parse_failure_recovery_rate() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let pid = std::process::id();
+        // In-memory tracker — isolation makes the rate exact, not a range.
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
 
-        // 2 successes, 1 failure
-        tracker
-            .record_parse_failure(&format!("cmd_ok1_{}", pid), "err", true)
-            .unwrap();
-        tracker
-            .record_parse_failure(&format!("cmd_ok2_{}", pid), "err", true)
-            .unwrap();
-        tracker
-            .record_parse_failure(&format!("cmd_fail_{}", pid), "err", false)
-            .unwrap();
+        // 2 recovered, 1 not → recovery_rate = 2/3.
+        tracker.record_parse_failure("cmd_ok1", "err", true).unwrap();
+        tracker.record_parse_failure("cmd_ok2", "err", true).unwrap();
+        tracker.record_parse_failure("cmd_fail", "err", false).unwrap();
 
         let summary = tracker.get_parse_failure_summary().unwrap();
-        // We can't assert exact rate because other tests may have added records,
-        // but we can verify recovery_rate is between 0 and 100
-        assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+        assert_eq!(summary.total, 3);
+        assert!(
+            (summary.recovery_rate - 200.0 / 3.0).abs() < 0.01,
+            "expected ~66.67% recovery, got {}",
+            summary.recovery_rate
+        );
     }
 
     // Issue #91 — `cargo test` must not write to production history.db.
