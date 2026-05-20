@@ -642,9 +642,16 @@ fn run_streaming_with_sink(
                 "\n[contextcrawler: {} bytes dropped — output sink stalled]\n",
                 dropped_bytes
             );
-            if filtered.len() + marker.len() <= FILTERED_CAP {
-                filtered.push_str(&marker);
-            }
+            // Append unconditionally — do NOT gate on FILTERED_CAP. The cap is
+            // a soft guard against unbounded accumulator growth; this is a
+            // fixed ~60-byte end-of-stream diagnostic. Gating it meant a user
+            // whose output BOTH filled the accumulator AND hit sink drops saw
+            // no notice of the loss at all. A tiny fixed trailing overrun is
+            // harmless; silently swallowing the drop notice is not. The
+            // `truncated_filtered` markers above already append unconditionally
+            // once over cap, so both end-of-stream markers stay visible even
+            // when truncation and drop fire together.
+            filtered.push_str(&marker);
             let mm = if filter_fd_is_stderr {
                 SinkMsg::Err(marker)
             } else {
@@ -2134,6 +2141,95 @@ pub(crate) mod tests {
                 .count(),
             1,
             "exactly one dropped-output summary marker expected"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_dropped_marker_survives_full_filtered_accumulator() {
+        // Fifth-pass regression (Codex re-review): the dropped-output summary
+        // marker used to be appended only `if filtered.len() + marker.len() <=
+        // FILTERED_CAP`. A user whose output BOTH filled the 10 MiB
+        // accumulator AND hit sink drops would therefore see no notice of the
+        // loss at all — the marker was silently elided.
+        //
+        // This test wedges the sink AND drives the filtered accumulator past
+        // FILTERED_CAP at the same time, then asserts the dropped-output
+        // marker IS present in the returned `filtered` and that the
+        // truncation marker is also visible — neither end-of-stream marker
+        // may be lost when both conditions fire together.
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let bytes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let out_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+        let err_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+
+        // Watchdog opens the gate after the wedged window so the run finishes.
+        let wd_gate = gate.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let (lock, cvar) = &*wd_gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+
+        // Child emits 14000 lines; the filter expands each to a ~1 KiB chunk.
+        // Two caps must both trip:
+        //   - the filtered accumulator fills after ~10 MiB ≈ 10500 chunks, so
+        //     `truncated_filtered` fires and the truncation marker is emitted;
+        //   - the sink is wedged for the whole run, so once the bounded sink
+        //     channel (SINK_CHANNEL_CAP = 8192) fills, every further chunk is
+        //     dropped → `dropped` is set and the dropped-output marker fires.
+        // 14000 > both thresholds, so both end-of-stream markers must reach
+        // the returned `filtered` even though it is at FILTERED_CAP.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 14000); do echo x; done"]);
+        let chunk = "A".repeat(1024);
+        let filter = LineFilter::new(move |_l| Some(format!("{}\n", chunk)));
+
+        let result = run_streaming_with_sink(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+            Some((Box::new(out_sink), Box::new(err_sink))),
+        )
+        .unwrap();
+        watchdog.join().ok();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.truncated_filtered,
+            "filtered accumulator must have hit FILTERED_CAP"
+        );
+        // The accumulator is full — within a marker's length of the cap — yet
+        // the dropped-output marker must STILL be present.
+        assert!(
+            result.filtered.len() >= FILTERED_CAP,
+            "filtered accumulator must be at the cap, len = {}",
+            result.filtered.len()
+        );
+        assert!(
+            result
+                .filtered
+                .contains("bytes dropped — output sink stalled"),
+            "dropped-output marker must survive a full accumulator, filtered tail: {}",
+            &result.filtered[result.filtered.len().saturating_sub(300)..]
+        );
+        assert!(
+            result.filtered.contains("[contextcrawler: output truncated at"),
+            "truncation marker must also be visible when both conditions fire"
         );
     }
 
