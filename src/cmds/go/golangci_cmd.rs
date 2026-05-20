@@ -5,7 +5,7 @@ use crate::core::runner;
 use crate::core::stream::exec_capture;
 // `secure_go_command` strips GOFLAGS/GOPATH/GOPROXY/CC/CXX from
 // inherited env — golangci-lint shells out to `go` underneath. See #36.
-use crate::core::utils::{secure_go_command, truncate};
+use crate::core::utils::{check_forbidden_golangci_args, secure_go_command, truncate};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -129,6 +129,14 @@ pub(crate) fn detect_major_version() -> u32 {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // golangci-lint loads custom .so plugin linters declared in its config,
+    // so `-c <attacker.yml>` is RCE-equivalent. Reject before any spawn —
+    // covers both the filtered `run` path and passthrough. See #111 G6.
+    if let Err(msg) = check_forbidden_golangci_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     match classify_invocation(args) {
         Invocation::FilteredRun(invocation) => run_filtered(args, &invocation, verbose),
         Invocation::Passthrough => run_passthrough(args, verbose),

@@ -2919,6 +2919,21 @@ pub fn check_forbidden_pytest_args<S: AsRef<str>>(args: &[S]) -> Result<(), Stri
             ));
         }
 
+        // `-c FILE` / `--config FILE` point pytest at an attacker pytest.ini /
+        // pyproject.toml, which can set `addopts = -p /tmp/evil_plugin.py` and
+        // sideload arbitrary plugin code — bypassing the `-p` block below.
+        if a == "-c"
+            || a == "--config"
+            || a.starts_with("-c=")
+            || a.starts_with("--config=")
+        {
+            return Err(pyrbjvm_deny_message(
+                "pytest",
+                a,
+                "-c / --config loads an attacker pytest.ini that can set addopts = -p <plugin>",
+            ));
+        }
+
         // `-p VALUE` (space form). Also handle the argparse-accepted glued
         // forms `-pVALUE` and `-p=VALUE` — pytest's argparse honours both,
         // so the old whitespace-only split was bypassable (issue #49 P2).
@@ -3049,23 +3064,140 @@ pub fn check_forbidden_rubocop_args<S: AsRef<str>>(args: &[S]) -> Result<(), Str
     Ok(())
 }
 
-/// gradle `--init-script <file>` and `-I <file>` evaluate arbitrary
-/// Groovy from the given path at every Gradle invocation.
+/// gradle `--init-script <file>` / `-I <file>` evaluate arbitrary Groovy
+/// from the given path at every Gradle invocation. `-c`/`--settings-file`
+/// and `-b`/`--build-file` likewise point Gradle at attacker-controlled
+/// `settings.gradle` / `build.gradle` scripts (also arbitrary Groovy).
 pub fn check_forbidden_gradle_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_ref();
-        if a == "--init-script"
-            || a.starts_with("--init-script=")
-            || a == "-I"
-        {
+        // `-I` matches the exact, `--init-script=` and glued `-I/path` forms.
+        if a == "--init-script" || a.starts_with("--init-script=") || a.starts_with("-I") {
             return Err(pyrbjvm_deny_message(
                 "gradle",
                 a,
                 "--init-script / -I evaluates arbitrary Groovy at startup",
             ));
         }
+        if a == "-c"
+            || a == "--settings-file"
+            || a.starts_with("-c=")
+            || a.starts_with("--settings-file=")
+        {
+            return Err(pyrbjvm_deny_message(
+                "gradle",
+                a,
+                "-c / --settings-file loads an attacker settings.gradle (arbitrary Groovy)",
+            ));
+        }
+        if a == "-b"
+            || a == "--build-file"
+            || a.starts_with("-b=")
+            || a.starts_with("--build-file=")
+        {
+            return Err(pyrbjvm_deny_message(
+                "gradle",
+                a,
+                "-b / --build-file loads an attacker build.gradle (arbitrary Groovy)",
+            ));
+        }
         i += 1;
+    }
+    Ok(())
+}
+
+/// `go build`/`go test` accept `-toolexec` and `-exec`, plus `-gcflags` /
+/// `-ldflags` / `-asmflags` whose values can themselves carry `-toolexec`.
+/// Each runs an arbitrary binary during the build / test — full RCE. These
+/// are CLI flags, NOT env vars, so `secure_go_command` does NOT defend them.
+/// `golangci-lint` additionally loads custom Go-plugin `.so` linters declared
+/// in its config, so `-c`/`--config` is rejected there too.
+pub fn check_forbidden_go_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let raw = args[i].as_ref();
+
+        // Go's flag parser accepts ONE or TWO leading dashes for every flag
+        // (https://pkg.go.dev/flag — "command line flag syntax"), so
+        // `--toolexec=/x` bypasses a single-dash-only matcher. Canonicalize a
+        // double-dash flag token to single-dash form purely for MATCHING — the
+        // checker only inspects argv, it never rewrites it, so `raw` (the value
+        // actually spawned) is untouched. A bare `--` is the end-of-options
+        // separator: leave it as-is so it can't masquerade as a `-` flag.
+        let a: &str = if raw == "--" {
+            raw
+        } else if raw.starts_with("--") {
+            // Strip exactly ONE dash, so `--toolexec` -> `-toolexec` and
+            // `---x` -> `--x` — never collapses past a single leading dash.
+            &raw[1..]
+        } else {
+            raw
+        };
+
+        // `-toolexec` / `-exec`: exact form consumes the next arg, attached
+        // `-toolexec=/x` carries the value inline. Either way it's RCE.
+        if a == "-toolexec" || a.starts_with("-toolexec=") {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "go",
+                raw,
+                "-toolexec runs an arbitrary binary for every compile/link step",
+                "#111",
+            ));
+        }
+        if a == "-exec" || a.starts_with("-exec=") {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "go",
+                raw,
+                "-exec runs an arbitrary binary instead of the compiled test/program",
+                "#111",
+            ));
+        }
+
+        // `-gcflags` / `-ldflags` / `-asmflags` forward a flag string to the
+        // toolchain, which can smuggle `-toolexec=` / `-exec=` back in. Check
+        // both the attached `-gcflags=...` form and the `-gcflags ...` form.
+        for flag in ["-gcflags", "-ldflags", "-asmflags"] {
+            let value: Option<&str> = if a == flag {
+                args.get(i + 1).map(|s| s.as_ref())
+            } else if let Some(rest) = a.strip_prefix(flag) {
+                rest.strip_prefix('=')
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                if value.contains("-toolexec") || value.contains("-exec=") {
+                    return Err(pyrbjvm_deny_message_with_issue(
+                        "go",
+                        raw,
+                        "-gcflags/-ldflags/-asmflags value smuggles -toolexec/-exec (RCE)",
+                        "#111",
+                    ));
+                }
+            }
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
+/// golangci-lint loads custom Go-plugin `.so` linters declared in its config
+/// file, so `-c <attacker.yml>` / `--config <attacker.yml>` is RCE-equivalent.
+pub fn check_forbidden_golangci_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+        if a == "-c"
+            || a == "--config"
+            || a.starts_with("-c=")
+            || a.starts_with("--config=")
+        {
+            return Err(pyrbjvm_deny_message(
+                "golangci-lint",
+                a,
+                "-c / --config loads an attacker config that can declare custom .so plugin linters",
+            ));
+        }
     }
     Ok(())
 }
@@ -3430,9 +3562,71 @@ mod secure_pyrbjvmdotnet_tests {
     }
 
     #[test]
+    fn gradle_rejects_glued_init_script_and_config_flags() {
+        // Glued `-I/path` form — #111 G6.
+        assert!(check_forbidden_gradle_args(&["-I/tmp/evil.gradle"]).is_err());
+        // `-c`/`--settings-file` and `-b`/`--build-file` load arbitrary Groovy.
+        assert!(check_forbidden_gradle_args(&["-c", "evil.gradle"]).is_err());
+        assert!(check_forbidden_gradle_args(&["--settings-file=evil.gradle"]).is_err());
+        assert!(check_forbidden_gradle_args(&["-b", "evil.gradle"]).is_err());
+        assert!(check_forbidden_gradle_args(&["--build-file=evil.gradle"]).is_err());
+    }
+
+    #[test]
     fn gradle_allows_normal_args() {
         assert!(check_forbidden_gradle_args(&["assembleDebug"]).is_ok());
         assert!(check_forbidden_gradle_args(&["--info", "test"]).is_ok());
+    }
+
+    // ── go deny (#111 G6) ────────────────────────────────────────────
+
+    #[test]
+    fn go_rejects_toolexec_and_exec() {
+        assert!(check_forbidden_go_args(&["build", "-toolexec", "/tmp/evil"]).is_err());
+        assert!(check_forbidden_go_args(&["build", "-toolexec=/tmp/evil"]).is_err());
+        assert!(check_forbidden_go_args(&["test", "-exec", "/tmp/evil"]).is_err());
+        assert!(check_forbidden_go_args(&["test", "-exec=/tmp/evil"]).is_err());
+    }
+
+    #[test]
+    fn go_rejects_toolexec_smuggled_via_buildflags() {
+        assert!(check_forbidden_go_args(&["build", "-gcflags=-toolexec=/tmp/evil"]).is_err());
+        assert!(check_forbidden_go_args(&["build", "-gcflags", "-toolexec=/x"]).is_err());
+        assert!(check_forbidden_go_args(&["build", "-ldflags=-exec=/tmp/evil"]).is_err());
+        assert!(check_forbidden_go_args(&["build", "-asmflags=-toolexec=/x"]).is_err());
+    }
+
+    #[test]
+    fn go_allows_normal_args() {
+        assert!(check_forbidden_go_args(&["build", "./..."]).is_ok());
+        assert!(check_forbidden_go_args(&["test", "-run", "TestFoo", "./..."]).is_ok());
+        assert!(check_forbidden_go_args(&["build", "-gcflags=-N -l", "./..."]).is_ok());
+    }
+
+    // ── golangci-lint deny (#111 G6) ─────────────────────────────────
+
+    #[test]
+    fn golangci_rejects_config_flag() {
+        assert!(check_forbidden_golangci_args(&["-c", "evil.yml", "run"]).is_err());
+        assert!(check_forbidden_golangci_args(&["--config", "evil.yml", "run"]).is_err());
+        assert!(check_forbidden_golangci_args(&["--config=evil.yml", "run"]).is_err());
+        assert!(check_forbidden_golangci_args(&["-c=evil.yml", "run"]).is_err());
+    }
+
+    #[test]
+    fn golangci_allows_normal_args() {
+        assert!(check_forbidden_golangci_args(&["run", "./..."]).is_ok());
+        assert!(check_forbidden_golangci_args(&["run", "--fix"]).is_ok());
+    }
+
+    // ── pytest -c/--config deny (#111 G6) ────────────────────────────
+
+    #[test]
+    fn pytest_rejects_config_file() {
+        assert!(check_forbidden_pytest_args(&["-c", "evil.ini"]).is_err());
+        assert!(check_forbidden_pytest_args(&["--config", "evil.ini"]).is_err());
+        assert!(check_forbidden_pytest_args(&["-c=evil.ini"]).is_err());
+        assert!(check_forbidden_pytest_args(&["--config=evil.ini"]).is_err());
     }
 
     // ── pip deny ─────────────────────────────────────────────────────
