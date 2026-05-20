@@ -82,15 +82,32 @@ fn filter_curl_output(raw: &str, is_tty: bool) -> FilterResult<'_> {
         || (trimmed.starts_with('[') && trimmed.ends_with(']'))
         || (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2);
 
+    // JSON bodies: minify losslessly rather than pass through whole. Re-serialised
+    // JSON is still valid JSON (preserve_order keeps key ordering stable), so a
+    // downstream `curl ... | jq` keeps working — unlike mid-stream truncation,
+    // which is why #1536 left JSON untouched. If the body isn't strictly
+    // parseable, or is already minimal, fall through to plain passthrough.
+    if looks_like_json {
+        return match minify_json(trimmed) {
+            Some(min) => FilterResult {
+                content: Cow::Owned(min),
+                tee_hint: None,
+            },
+            None => FilterResult {
+                content: Cow::Borrowed(trimmed),
+                tee_hint: None,
+            },
+        };
+    }
+
     // Pass through unchanged when:
-    // - body looks like JSON (mid-stream truncation produces invalid JSON, #1536)
     // - stdout is not a terminal (pipes / redirects need the full body, #1282)
     // - body fits under the truncation threshold
     //
     // Critically, do NOT call `force_tee_hint` on this path — it has a side effect
     // (writes the raw body to a tee log file) and we don't need a recovery file
     // when the consumer already receives the full body.
-    if !is_tty || looks_like_json || trimmed.len() < MAX_RESPONSE_SIZE {
+    if !is_tty || trimmed.len() < MAX_RESPONSE_SIZE {
         return FilterResult {
             content: Cow::Borrowed(trimmed),
             tee_hint: None,
@@ -127,6 +144,22 @@ fn filter_curl_output(raw: &str, is_tty: bool) -> FilterResult<'_> {
 struct FilterResult<'a> {
     content: Cow<'a, str>,
     tee_hint: Option<String>,
+}
+
+/// Losslessly minify a JSON body: parse and re-serialise without whitespace.
+///
+/// Returns `None` when the body isn't strictly-valid JSON (so the caller passes
+/// it through untouched rather than risk corrupting it) or when minifying would
+/// not shrink it (already-compact input — avoids a needless allocation and a
+/// `Cow::Owned` clone of a multi-MB body).
+fn minify_json(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let minified = serde_json::to_string(&value).ok()?;
+    if minified.len() < raw.len() {
+        Some(minified)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +268,58 @@ mod tests {
         assert!(!result.content.contains("bytes total"));
         assert!(result.content.ends_with('}'));
         assert!(result.tee_hint.is_none());
+    }
+
+    // --- Tier 1: lossless JSON minification ---
+
+    #[test]
+    fn test_filter_curl_pretty_json_is_minified() {
+        // Pretty-printed JSON in → minified, still valid, smaller.
+        let pretty = "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2,\n    3\n  ]\n}";
+        let result = filter_curl_output(pretty, true);
+        assert_eq!(&*result.content, r#"{"a":1,"b":[1,2,3]}"#);
+        assert!(result.content.len() < pretty.len());
+        assert!(result.tee_hint.is_none());
+        // Output must round-trip as valid JSON (the whole point vs truncation).
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_pretty_json_minified_on_pipe_too() {
+        // Minification is lossless, so it applies on non-TTY (pipe to jq) as
+        // well — jq receives valid, smaller JSON.
+        let pretty = "[\n  {\n    \"id\": 1\n  }\n]";
+        let result = filter_curl_output(pretty, false);
+        assert_eq!(&*result.content, r#"[{"id":1}]"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_already_minified_json_passthrough_borrowed() {
+        // Already-compact JSON: minify_json returns None → borrowed passthrough,
+        // no needless allocation.
+        let compact = r#"{"a":1,"b":[1,2,3]}"#;
+        let result = filter_curl_output(compact, true);
+        assert_eq!(&*result.content, compact);
+        assert!(matches!(result.content, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_filter_curl_malformed_json_passthrough() {
+        // Looks JSON-ish (starts { ends }) but isn't valid → must pass through
+        // untouched rather than risk corrupting it.
+        let bad = "{not: valid, json at all}";
+        let result = filter_curl_output(bad, true);
+        assert_eq!(&*result.content, bad);
+        assert!(matches!(result.content, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_filter_curl_minified_json_preserves_key_order() {
+        // serde_json `preserve_order` feature keeps keys in source order.
+        let pretty = "{\n  \"zebra\": 1,\n  \"apple\": 2,\n  \"mango\": 3\n}";
+        let result = filter_curl_output(pretty, true);
+        assert_eq!(&*result.content, r#"{"zebra":1,"apple":2,"mango":3}"#);
     }
 
     // --- Cow optimization: passthrough must not allocate ---
