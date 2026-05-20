@@ -1567,6 +1567,19 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Process-wide lock for tests that mutate environment variables
+    /// (`RTK_DB_PATH`, `CONTEXTCRAWLER_TEST_MODE`) or otherwise depend on a
+    /// stable resolution of `get_db_path()`.
+    ///
+    /// `cargo test` runs test fns in parallel threads of one process, so env
+    /// vars are shared mutable state. Previously each test declared its *own*
+    /// local `static ENV_LOCK`, which serialised nothing — a write-then-read
+    /// test could still have `RTK_DB_PATH` swapped underneath it by a parallel
+    /// env-mutating test (issue #69). This single shared lock is the real
+    /// serialisation point; every env-touching test must hold it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn scrub_redacts_password_flag_with_equals() {
@@ -1769,18 +1782,17 @@ mod tests {
     // 3. Tracker::record + get_recent — round-trip DB
     #[test]
     fn test_tracker_record_and_recent() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        // In-memory tracker: fully isolated from other tests' writes, so the
+        // round-trip can't race against the process-shared test DB.
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
 
-        // Use unique test identifier to avoid conflicts with other tests
-        let test_cmd = format!("contextcrawler git status test_{}", std::process::id());
-
+        let test_cmd = "contextcrawler git status";
         tracker
-            .record("git status", &test_cmd, 100, 20, 50)
+            .record("git status", test_cmd, 100, 20, 50)
             .expect("Failed to record");
 
         let recent = tracker.get_recent(10).expect("Failed to get recent");
 
-        // Find our specific test record
         let test_record = recent
             .iter()
             .find(|r| r.rtk_cmd == test_cmd)
@@ -1793,21 +1805,20 @@ mod tests {
     // 4. track_passthrough doesn't dilute stats (input=0, output=0)
     #[test]
     fn test_track_passthrough_no_dilution() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        // In-memory tracker — isolated, no cross-test contention.
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
 
-        // Use unique test identifiers
-        let pid = std::process::id();
-        let cmd1 = format!("contextcrawler cmd1_test_{}", pid);
-        let cmd2 = format!("contextcrawler cmd2_passthrough_test_{}", pid);
+        let cmd1 = "contextcrawler cmd1";
+        let cmd2 = "contextcrawler cmd2_passthrough";
 
         // Record one real command with 80% savings
         tracker
-            .record("cmd1", &cmd1, 1000, 200, 10)
+            .record("cmd1", cmd1, 1000, 200, 10)
             .expect("Failed to record cmd1");
 
         // Record passthrough (0, 0)
         tracker
-            .record("cmd2", &cmd2, 0, 0, 5)
+            .record("cmd2", cmd2, 0, 0, 5)
             .expect("Failed to record passthrough");
 
         // Verify both records exist in recent history
@@ -1835,31 +1846,100 @@ mod tests {
     }
 
     // 5. TimedExecution::track records with exec_time > 0
+    /// Build an `rtk_cmd` marker unique to one test invocation.
+    ///
+    /// Every tracking test in a `cargo test` run writes to the same
+    /// process-shared test DB (see `is_test_context` / `get_db_path`). A
+    /// query that matches on a generic substring, or that scans only a small
+    /// `get_recent` window, races against parallel writers. A pid + nanosecond
+    /// marker makes each test's record unambiguously its own.
+    fn unique_marker(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}_{}_{}", label, std::process::id(), nanos)
+    }
+
+    // Wide enough that a test's own record can't be pushed out of the result
+    // set by parallel writers to the shared test DB.
+    const TEST_RECENT_WINDOW: usize = 5000;
+
+    /// RAII guard: pins `RTK_DB_PATH` to a private tempfile for the duration of
+    /// a test, then restores the prior value (and deletes the tempfile).
+    ///
+    /// `TimedExecution::track*` writes to whatever `get_db_path()` resolves —
+    /// it can't be handed an in-memory tracker. Setting `RTK_DB_PATH` makes
+    /// both the write and the subsequent `Tracker::new()` read hit one private
+    /// file, so the round-trip can't race other tests. Must be held alongside
+    /// `ENV_LOCK` since `RTK_DB_PATH` is process-global.
+    struct PinnedDb {
+        path: std::path::PathBuf,
+        prior: Option<String>,
+    }
+    impl PinnedDb {
+        fn new(label: &str) -> Self {
+            let prior = std::env::var("RTK_DB_PATH").ok();
+            let path = std::env::temp_dir().join(unique_marker(label) + ".db");
+            std::env::set_var("RTK_DB_PATH", &path);
+            PinnedDb { path, prior }
+        }
+    }
+    impl Drop for PinnedDb {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("RTK_DB_PATH", v),
+                None => std::env::remove_var("RTK_DB_PATH"),
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     #[test]
     fn test_timed_execution_records_time() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _db = PinnedDb::new("rtk_records_time");
+
+        let marker = "contextcrawler test records-time";
         let timer = TimedExecution::start();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        timer.track("test cmd", "rtk test", "raw input data", "filtered");
+        timer.track("test cmd", marker, "raw input data", "filtered");
 
-        // Verify via DB that record exists
         let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
-        assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
+        let recent = tracker
+            .get_recent(TEST_RECENT_WINDOW)
+            .expect("Failed to get recent");
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == marker),
+            "own record ({marker}) not found among {} rows in the pinned DB",
+            recent.len()
+        );
     }
 
     // 6. TimedExecution::track_passthrough records with 0 tokens
     #[test]
     fn test_timed_execution_passthrough() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _db = PinnedDb::new("rtk_passthrough");
+
+        let marker = "contextcrawler git tag (passthrough)";
         let timer = TimedExecution::start();
-        timer.track_passthrough("git tag", "rtk git tag (passthrough)");
+        timer.track_passthrough("git tag", marker);
 
         let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
+        let recent = tracker
+            .get_recent(TEST_RECENT_WINDOW)
+            .expect("Failed to get recent");
 
         let pt = recent
             .iter()
-            .find(|r| r.rtk_cmd.contains("passthrough"))
-            .expect("Passthrough record not found");
+            .find(|r| r.rtk_cmd == marker)
+            .unwrap_or_else(|| {
+                panic!(
+                    "own passthrough record ({marker}) not found among {} rows in the pinned DB",
+                    recent.len()
+                )
+            });
 
         // savings_pct should be 0 for passthrough
         assert_eq!(pt.savings_pct, 0.0);
@@ -1872,9 +1952,7 @@ mod tests {
     #[test]
     fn test_db_path_env_and_default() {
         use std::env;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
         env::set_var("RTK_DB_PATH", &custom_path);
@@ -1939,42 +2017,41 @@ mod tests {
     // 12. record_parse_failure + get_parse_failure_summary roundtrip
     #[test]
     fn test_parse_failure_roundtrip() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let test_cmd = format!("git -C /path status test_{}", std::process::id());
+        // In-memory tracker: isolated from the process-shared test DB, so the
+        // counts are exact rather than ">= 1" (Codex review of #69/#94).
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let test_cmd = "git -C /path status";
 
         tracker
-            .record_parse_failure(&test_cmd, "unrecognized subcommand", true)
+            .record_parse_failure(test_cmd, "unrecognized subcommand", true)
             .expect("Failed to record parse failure");
 
         let summary = tracker
             .get_parse_failure_summary()
             .expect("Failed to get summary");
 
-        assert!(summary.total >= 1);
+        assert_eq!(summary.total, 1);
         assert!(summary.recent.iter().any(|r| r.raw_command == test_cmd));
     }
 
     // 13. recovery_rate calculation
     #[test]
     fn test_parse_failure_recovery_rate() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let pid = std::process::id();
+        // In-memory tracker — isolation makes the rate exact, not a range.
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
 
-        // 2 successes, 1 failure
-        tracker
-            .record_parse_failure(&format!("cmd_ok1_{}", pid), "err", true)
-            .unwrap();
-        tracker
-            .record_parse_failure(&format!("cmd_ok2_{}", pid), "err", true)
-            .unwrap();
-        tracker
-            .record_parse_failure(&format!("cmd_fail_{}", pid), "err", false)
-            .unwrap();
+        // 2 recovered, 1 not → recovery_rate = 2/3.
+        tracker.record_parse_failure("cmd_ok1", "err", true).unwrap();
+        tracker.record_parse_failure("cmd_ok2", "err", true).unwrap();
+        tracker.record_parse_failure("cmd_fail", "err", false).unwrap();
 
         let summary = tracker.get_parse_failure_summary().unwrap();
-        // We can't assert exact rate because other tests may have added records,
-        // but we can verify recovery_rate is between 0 and 100
-        assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+        assert_eq!(summary.total, 3);
+        assert!(
+            (summary.recovery_rate - 200.0 / 3.0).abs() < 0.01,
+            "expected ~66.67% recovery, got {}",
+            summary.recovery_rate
+        );
     }
 
     // Issue #91 — `cargo test` must not write to production history.db.
@@ -1982,9 +2059,7 @@ mod tests {
     fn test_is_test_context_true_in_cargo_test() {
         // RTK_DB_PATH overrides the test-context check (explicit opt-in path).
         // Save/restore around the env mutation.
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RTK_DB_PATH").ok();
         std::env::remove_var("RTK_DB_PATH");
         assert!(
@@ -2003,9 +2078,7 @@ mod tests {
     /// production DB. Assert the sentinel path works.
     #[test]
     fn test_is_test_context_true_under_sentinel_env() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let prior_db = std::env::var("RTK_DB_PATH").ok();
         let prior_mode = std::env::var("CONTEXTCRAWLER_TEST_MODE").ok();
@@ -2033,9 +2106,7 @@ mod tests {
         // Resolves get_db_path() under the active test process — must NOT
         // point at the production history.db. The redirect target is a
         // per-process tmpfile.
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RTK_DB_PATH").ok();
         std::env::remove_var("RTK_DB_PATH");
         let p = get_db_path().expect("get_db_path");
@@ -2055,9 +2126,7 @@ mod tests {
 
     #[test]
     fn test_rtk_db_path_overrides_test_context() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RTK_DB_PATH").ok();
 
         let tmp = std::env::temp_dir().join(format!(

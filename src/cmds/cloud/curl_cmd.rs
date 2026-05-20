@@ -82,15 +82,32 @@ fn filter_curl_output(raw: &str, is_tty: bool) -> FilterResult<'_> {
         || (trimmed.starts_with('[') && trimmed.ends_with(']'))
         || (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2);
 
+    // JSON bodies: minify losslessly rather than pass through whole. Re-serialised
+    // JSON is still valid JSON (preserve_order keeps key ordering stable), so a
+    // downstream `curl ... | jq` keeps working — unlike mid-stream truncation,
+    // which is why #1536 left JSON untouched. If the body isn't strictly
+    // parseable, or is already minimal, fall through to plain passthrough.
+    if looks_like_json {
+        return match minify_json(trimmed) {
+            Some(min) => FilterResult {
+                content: Cow::Owned(min),
+                tee_hint: None,
+            },
+            None => FilterResult {
+                content: Cow::Borrowed(trimmed),
+                tee_hint: None,
+            },
+        };
+    }
+
     // Pass through unchanged when:
-    // - body looks like JSON (mid-stream truncation produces invalid JSON, #1536)
     // - stdout is not a terminal (pipes / redirects need the full body, #1282)
     // - body fits under the truncation threshold
     //
     // Critically, do NOT call `force_tee_hint` on this path — it has a side effect
     // (writes the raw body to a tee log file) and we don't need a recovery file
     // when the consumer already receives the full body.
-    if !is_tty || looks_like_json || trimmed.len() < MAX_RESPONSE_SIZE {
+    if !is_tty || trimmed.len() < MAX_RESPONSE_SIZE {
         return FilterResult {
             content: Cow::Borrowed(trimmed),
             tee_hint: None,
@@ -127,6 +144,54 @@ fn filter_curl_output(raw: &str, is_tty: bool) -> FilterResult<'_> {
 struct FilterResult<'a> {
     content: Cow<'a, str>,
     tee_hint: Option<String>,
+}
+
+/// Losslessly minify a JSON body by stripping insignificant whitespace only.
+///
+/// A serde parse/re-serialise round-trip is *not* lossless: numbers beyond f64
+/// precision (e.g. a JS millisecond timestamp with a fractional part like
+/// `1779167626250.6921`) get truncated when serde re-emits the parsed `f64`.
+/// So this validates the body with serde but then strips whitespace *textually*
+/// — numbers, key order and string contents stay byte-identical.
+///
+/// Returns `None` when the body isn't strictly-valid JSON (caller passes it
+/// through untouched) or when stripping wouldn't shrink it (already-compact —
+/// avoids a needless `Cow::Owned` clone of a multi-MB body).
+fn minify_json(raw: &str) -> Option<String> {
+    // Validity gate: only minify well-formed JSON. A malformed body passes
+    // through untouched rather than getting its whitespace mangled.
+    if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_err() {
+        return None;
+    }
+
+    // Strip whitespace outside string literals. The validity gate above
+    // guarantees every string is terminated, so the scan can't run off the end.
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if !matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            out.push(ch);
+        }
+    }
+
+    if out.len() < raw.len() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +300,169 @@ mod tests {
         assert!(!result.content.contains("bytes total"));
         assert!(result.content.ends_with('}'));
         assert!(result.tee_hint.is_none());
+    }
+
+    // --- Tier 1: lossless JSON minification ---
+
+    #[test]
+    fn test_filter_curl_pretty_json_is_minified() {
+        // Pretty-printed JSON in → minified, still valid, smaller.
+        let pretty = "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2,\n    3\n  ]\n}";
+        let result = filter_curl_output(pretty, true);
+        assert_eq!(&*result.content, r#"{"a":1,"b":[1,2,3]}"#);
+        assert!(result.content.len() < pretty.len());
+        assert!(result.tee_hint.is_none());
+        // Output must round-trip as valid JSON (the whole point vs truncation).
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_pretty_json_minified_on_pipe_too() {
+        // Minification is lossless, so it applies on non-TTY (pipe to jq) as
+        // well — jq receives valid, smaller JSON.
+        let pretty = "[\n  {\n    \"id\": 1\n  }\n]";
+        let result = filter_curl_output(pretty, false);
+        assert_eq!(&*result.content, r#"[{"id":1}]"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_already_minified_json_passthrough_borrowed() {
+        // Already-compact JSON: minify_json returns None → borrowed passthrough,
+        // no needless allocation.
+        let compact = r#"{"a":1,"b":[1,2,3]}"#;
+        let result = filter_curl_output(compact, true);
+        assert_eq!(&*result.content, compact);
+        assert!(matches!(result.content, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_filter_curl_malformed_json_passthrough() {
+        // Looks JSON-ish (starts { ends }) but isn't valid → must pass through
+        // untouched rather than risk corrupting it.
+        let bad = "{not: valid, json at all}";
+        let result = filter_curl_output(bad, true);
+        assert_eq!(&*result.content, bad);
+        assert!(matches!(result.content, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_filter_curl_minified_json_preserves_key_order() {
+        // Textual whitespace stripping keeps keys in source order trivially.
+        let pretty = "{\n  \"zebra\": 1,\n  \"apple\": 2,\n  \"mango\": 3\n}";
+        let result = filter_curl_output(pretty, true);
+        assert_eq!(&*result.content, r#"{"zebra":1,"apple":2,"mango":3}"#);
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_float_precision() {
+        // Regression: a serde parse/re-serialise round-trip drops precision on
+        // numbers beyond f64 range — e.g. a JS millisecond timestamp with a
+        // fractional part. Textual minification keeps the digits byte-identical.
+        let raw = "{\n  \"lastSession\": 1779167626250.6921\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, r#"{"lastSession":1779167626250.6921}"#);
+        assert!(result.content.contains("1779167626250.6921"));
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_whitespace_inside_strings() {
+        // Whitespace inside a string literal is significant — must survive.
+        let raw = "{\n  \"msg\": \"hello   world\\ttab\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"msg\":\"hello   world\\ttab\"}");
+    }
+
+    #[test]
+    fn test_filter_curl_json_escaped_quote_in_string() {
+        // An escaped quote must not be misread as the string terminator.
+        let raw = "{\n  \"q\": \"she said \\\"hi\\\"\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"q\":\"she said \\\"hi\\\"\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_json_braces_and_whitespace_inside_string_value() {
+        // A string value containing JSON-structural characters AND runs of
+        // whitespace — none of it must be touched. This is the case that
+        // would break a naive "strip all whitespace" minifier.
+        let raw = "{\n  \"tpl\": \"{  \\\"k\\\":  1  }\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"tpl\":\"{  \\\"k\\\":  1  }\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_unicode() {
+        let raw = "{\n  \"name\": \"café \\u00e9 日本語 🎉\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"name\":\"café \\u00e9 日本語 🎉\"}");
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_number_forms() {
+        // Negative, exponent, zero, high-precision fraction — all byte-exact.
+        let raw = "{\n  \"neg\": -42,\n  \"exp\": 6.022e23,\n  \"zero\": 0,\n  \"frac\": 0.1234567890123456\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(
+            &*result.content,
+            r#"{"neg":-42,"exp":6.022e23,"zero":0,"frac":0.1234567890123456}"#
+        );
+    }
+
+    #[test]
+    fn test_filter_curl_json_nested_structure_minified() {
+        let raw = "{\n  \"a\": {\n    \"b\": {\n      \"c\": [\n        1,\n        2\n      ]\n    }\n  }\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, r#"{"a":{"b":{"c":[1,2]}}}"#);
+    }
+
+    #[test]
+    fn test_filter_curl_json_escaped_backslash_before_quote() {
+        // Trailing escaped backslash inside a string: the `\\` must not let the
+        // following `"` be misread as still-inside-string.
+        let raw = "{\n  \"path\": \"C:\\\\dir\\\\\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"path\":\"C:\\\\dir\\\\\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_json_literal_escape_sequences_in_string() {
+        // `\n` `\t` inside the JSON string are two-char escape sequences, not
+        // real whitespace — they must survive verbatim.
+        let raw = "{\n  \"s\": \"line1\\nline2\\tcol\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"s\":\"line1\\nline2\\tcol\"}");
+    }
+
+    #[test]
+    fn test_filter_curl_json_empty_object_and_array_passthrough() {
+        // Already minimal — minify_json returns None → borrowed passthrough.
+        for body in ["{}", "[]", r#"{"a":[]}"#] {
+            let result = filter_curl_output(body, true);
+            assert_eq!(&*result.content, body);
+            assert!(matches!(result.content, Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn test_filter_curl_json_crlf_whitespace_stripped() {
+        // Windows-style CRLF indentation is insignificant whitespace too.
+        let raw = "{\r\n  \"a\": 1\r\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_filter_curl_json_minified_roundtrips_semantically() {
+        // The whole contract: filtered JSON parses to the SAME value as raw.
+        let raw = "{\n  \"id\": 7,\n  \"tags\": [\"x\", \"y\"],\n  \"meta\": {\"ok\": true}\n}";
+        let result = filter_curl_output(raw, true);
+        let raw_val: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let filt_val: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(raw_val, filt_val, "minified JSON must be the same value as raw");
     }
 
     // --- Cow optimization: passthrough must not allocate ---
