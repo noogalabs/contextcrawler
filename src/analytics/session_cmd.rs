@@ -27,11 +27,16 @@ impl SessionSummary {
 
 /// Count RTK-covered commands from extracted commands.
 /// A command is "covered" if it either:
-/// - starts with "rtk " (explicit rtk invocation), or
+/// - starts with "rtk " or "contextcrawler " (explicit invocation), or
 /// - would be rewritten by the hook (classify_command returns Supported)
 ///
-/// Chained commands (e.g. "cd ./path && rtk ls") are split so each part
-/// is classified independently — matching the discover module's behavior.
+/// Chained commands (e.g. "cd ./path && contextcrawler ls") are split so each
+/// part is classified independently — matching the discover module's behavior.
+///
+/// G7/#111: the live hook emits `contextcrawler <cmd>`; matching only the
+/// legacy `rtk ` prefix counted those as NOT adopted and understated the
+/// Adoption %. Reuses the same predicate logic as
+/// `discover::is_already_rtk_prefix`.
 fn count_rtk_commands(cmds: &[ExtractedCommand]) -> (usize, usize, usize) {
     let mut total: usize = 0;
     let mut rtk: usize = 0;
@@ -39,7 +44,10 @@ fn count_rtk_commands(cmds: &[ExtractedCommand]) -> (usize, usize, usize) {
         let parts = split_command_chain(&c.command);
         for part in &parts {
             total += 1;
-            if part.starts_with("rtk ")
+            let trimmed = part.trim_start();
+            // branding-lint: allow legacy
+            if trimmed.starts_with("rtk ")
+                || trimmed.starts_with("contextcrawler ")
                 || matches!(classify_command(part), Classification::Supported { .. })
             {
                 rtk += 1;
@@ -147,12 +155,12 @@ pub fn run(_verbose: u8) -> Result<()> {
     }
 
     // Display table
-    let header = "RTK Session Overview (last 10)";
+    let header = "Contextcrawler Session Overview (last 10)";
     println!("{}", header);
     println!("{}", "-".repeat(70));
     println!(
         "{:<12} {:<12} {:>5} {:>5} {:>9} {:<7} {:>8}",
-        "Session", "Date", "Cmds", "RTK", "Adoption", "", "Output"
+        "Session", "Date", "Cmds", "Ctxc", "Adoption", "", "Output"
     );
     println!("{}", "-".repeat(70));
 
@@ -262,6 +270,37 @@ mod tests {
         assert_eq!(total, 4);
         assert_eq!(rtk, 3); // rtk git status + git log + rtk cargo test
         assert_eq!(output, 6200);
+    }
+
+    #[test]
+    fn test_count_contextcrawler_prefixed_commands() {
+        // G7/#111: the live hook emits "contextcrawler <cmd>". Even commands
+        // the classifier does NOT support (e.g. an explicit contextcrawler
+        // meta invocation) must count as adopted via the prefix match.
+        let cmds = vec![
+            make_cmd("contextcrawler git status", Some(200)),
+            make_cmd("contextcrawler gain --history", Some(400)),
+            make_cmd("  contextcrawler discover  ", Some(100)),
+            make_cmd("echo hello", Some(50)),
+        ];
+        let (total, rtk, output) = count_rtk_commands(&cmds);
+        assert_eq!(total, 4);
+        // All three contextcrawler-prefixed commands count as adopted;
+        // echo does not.
+        assert_eq!(rtk, 3, "contextcrawler-prefixed commands must count as adopted");
+        assert_eq!(output, 750);
+    }
+
+    #[test]
+    fn test_count_mixed_rtk_and_contextcrawler_prefixes() {
+        // Legacy "rtk " and current "contextcrawler " prefixes both adopted.
+        let cmds = vec![
+            make_cmd("rtk git status", Some(100)),
+            make_cmd("contextcrawler cargo test", Some(100)),
+        ];
+        let (total, rtk, _) = count_rtk_commands(&cmds);
+        assert_eq!(total, 2);
+        assert_eq!(rtk, 2, "both legacy and current prefixes are adopted");
     }
 
     #[test]
