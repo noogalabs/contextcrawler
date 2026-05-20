@@ -3509,17 +3509,54 @@ pub fn secure_curl_command() -> Command {
     cmd
 }
 
-/// Normalise an option token to its flag *key* for deny-list comparison.
+/// Normalise a *long* option token to its flag *key* for deny-list comparison.
 ///
-/// curl and wget both accept an attached-value form (`-K=file`,
-/// `--config=file`). A deny-list that only compares the bare token (`-K`,
-/// `--config`) is bypassed by the attached form. This strips the leading
-/// dashes and everything from the first `=` onward, yielding just the flag
-/// key so a single equality check covers `--config`, `--config=file` and
-/// `-K=file` alike. Returns `None` for a non-option token (no leading `-`).
-fn option_key(arg: &str) -> Option<&str> {
-    let stripped = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+/// curl and wget accept an attached-value form for long options
+/// (`--config=file`). A deny-list that only compares the bare token
+/// (`--config`) is bypassed by the attached form. This strips the leading
+/// `--` and everything from the first `=` onward, yielding just the flag key
+/// so a single equality check covers `--config` and `--config=file` alike.
+///
+/// Returns `None` for anything that is not a long option (`--…`). Short
+/// options are deliberately NOT handled here — see `short_token_has_forbidden`.
+/// `option_key("--config")` and `option_key("--config=file")` both yield
+/// `Some("config")`; `option_key("-K")`, `option_key("-Kfile")` yield `None`.
+fn long_option_key(arg: &str) -> Option<&str> {
+    let stripped = arg.strip_prefix("--")?;
+    if stripped.is_empty() {
+        // A bare `--` is the option/operand separator, not a long option.
+        return None;
+    }
     Some(stripped.split('=').next().unwrap_or(stripped))
+}
+
+/// Scan a *single-dash short-flag token* for any forbidden short flag.
+///
+/// curl/wget short flags both bundle (`-sK` == `-s -K`) and accept attached
+/// values (`-Kfile`, `-Ourls`). A deny-list that compares the whole token
+/// (`-K`) or only its first char is bypassed by both shapes. Since a forbidden
+/// short flag (curl `-K`, wget `-O`/`-i`/`-e`) takes a value that consumes the
+/// rest of the token, once we see one anywhere in the bundle the token is
+/// rejected outright — we don't try to interpret the trailing chars.
+///
+/// Conservative by design: ANY forbidden char in a single-dash token rejects.
+/// `forbidden` is the small known set of forbidden short flags for the tool.
+///
+/// Returns `false` for non-short tokens: long options (`--…`), the bare `--`
+/// separator, and non-option args (no leading `-`).
+fn short_token_has_forbidden(arg: &str, forbidden: &[&str]) -> bool {
+    // Must start with exactly one dash (not `--`, not a bare operand).
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return false;
+    }
+    let body = &arg[1..];
+    if body.is_empty() {
+        return false; // a lone `-` is stdin, not a flag bundle
+    }
+    body.chars().any(|c| {
+        let mut buf = [0u8; 4];
+        forbidden.contains(&&*c.encode_utf8(&mut buf))
+    })
 }
 
 /// curl args that re-introduce the env-var threat shape:
@@ -3531,17 +3568,43 @@ fn option_key(arg: &str) -> Option<&str> {
 ///   target whose basename starts with `.` and ends with `rc`, or matches a
 ///   known rc-file name. Brittle by nature (false negatives possible); v1.
 pub fn check_forbidden_curl_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    // Forbidden long keys (compared against the normalised `--key`).
+    const FORBIDDEN_LONG: &[&str] = &["config"];
+    // Forbidden single-letter short flags. `-K` takes a value that consumes
+    // the rest of the token, so any occurrence in a single-dash bundle rejects.
+    const FORBIDDEN_SHORT: &[&str] = &["K"];
+
     let mut i = 0;
+    let mut operands_only = false;
     while i < args.len() {
         let a = args[i].as_ref();
 
-        // --config / -K — match the bare token AND the attached-value form
-        // (`--config=file`, `-K=file`). curl accepts both; comparing the
-        // normalised key closes the `-K=file` injection hole.
-        if let Some(key) = option_key(a) {
-            if key == "config" || key == "K" {
+        // A bare `--` ends option parsing — everything after it is a
+        // positional operand (a URL, a literal path), not a flag. Stop
+        // applying the forbidden-flag check so `curl https://x -- -K` does
+        // not reject the operand `-K`. See finding G4/#100 (second pass).
+        if a == "--" {
+            operands_only = true;
+            i += 1;
+            continue;
+        }
+        if operands_only {
+            i += 1;
+            continue;
+        }
+
+        // --config / -K — match the bare token AND every bypass shape:
+        // long attached-value (`--config=file`), short attached-value
+        // (`-Kfile`), short bundling (`-sK`, `-sKfile`). The long key is
+        // normalised; the short token is char-scanned so a forbidden flag
+        // anywhere in a single-dash bundle rejects. See G4/#100.
+        if let Some(key) = long_option_key(a) {
+            if FORBIDDEN_LONG.contains(&key) {
                 return Err(cloud_deny_message("curl", a));
             }
+        }
+        if short_token_has_forbidden(a, FORBIDDEN_SHORT) {
+            return Err(cloud_deny_message("curl", a));
         }
 
         // --output <path> / -o <path>
@@ -3633,9 +3696,11 @@ pub fn secure_wget_command() -> Command {
 /// - `--load-cookies`: loads a cookie jar from an arbitrary path, a
 ///   cookie-theft pivot if pointed at another tool's session store.
 ///
-/// All matches use `option_key` so the attached-value form (`-O=x`,
-/// `--output-document=x`) is caught alongside the bare and space-separated
-/// forms — see finding G4/#100.
+/// Long flags use `long_option_key` so the attached-value form
+/// (`--output-document=x`) is caught alongside the bare and space-separated
+/// forms. Short flags use `short_token_has_forbidden` so bundling (`-qO`) and
+/// attached values (`-Ofile`, `-O=x`) are caught too. A bare `--` ends option
+/// parsing — subsequent operands are not checked. See finding G4/#100.
 pub fn check_forbidden_wget_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
     // Long-form keys (compared against the normalised `--key` of each arg).
     const FORBIDDEN_LONG: &[&str] = &[
@@ -3646,15 +3711,34 @@ pub fn check_forbidden_wget_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
         "input-file",
         "load-cookies",
     ];
-    // Single-letter short keys.
+    // Single-letter short flags. Each (`-e`, `-O`, `-i`) takes a value that
+    // consumes the rest of its token, so any occurrence in a single-dash
+    // bundle (`-qO`, `-Ofile`, `-iurls.txt`) rejects.
     const FORBIDDEN_SHORT: &[&str] = &["e", "O", "i"];
 
+    let mut operands_only = false;
     for arg in args {
         let a = arg.as_ref();
-        if let Some(key) = option_key(a) {
-            if FORBIDDEN_LONG.contains(&key) || FORBIDDEN_SHORT.contains(&key) {
+
+        // A bare `--` ends option parsing — subsequent args are operands.
+        // See finding G4/#100 (second pass).
+        if a == "--" {
+            operands_only = true;
+            continue;
+        }
+        if operands_only {
+            continue;
+        }
+
+        // Long attached-value form (`--output-document=x`) via normalised key;
+        // short bundling / attached-value form (`-Ofile`, `-qO`) via char-scan.
+        if let Some(key) = long_option_key(a) {
+            if FORBIDDEN_LONG.contains(&key) {
                 return Err(cloud_deny_message("wget", a));
             }
+        }
+        if short_token_has_forbidden(a, FORBIDDEN_SHORT) {
+            return Err(cloud_deny_message("wget", a));
         }
     }
     Ok(())
@@ -3903,6 +3987,41 @@ mod secure_cloud_tests {
         assert!(check_forbidden_curl_args(&["-K=/tmp/x", "https://x"]).is_err());
     }
 
+    // G4/#100 (second pass): short-flag bundling (`-sK`) and attached-value
+    // (`-Kfile`) are valid curl syntax — a forbidden short flag anywhere in a
+    // single-dash token must reject.
+    #[test]
+    fn rejects_curl_short_flag_bundle_and_attached_value() {
+        // attached value, no `=`
+        assert!(check_forbidden_curl_args(&["-Kfile"]).is_err());
+        // bundled: -s then -K
+        assert!(check_forbidden_curl_args(&["-sK"]).is_err());
+        // bundled with attached value: -s then -K with value
+        assert!(check_forbidden_curl_args(&["-sKfile"]).is_err());
+        // attached-value with `=`
+        assert!(check_forbidden_curl_args(&["-K=file"]).is_err());
+        // space-separated
+        assert!(check_forbidden_curl_args(&["-K", "file"]).is_err());
+        // long attached-value
+        assert!(check_forbidden_curl_args(&["--config=file"]).is_err());
+    }
+
+    // G4/#100 (second pass): `--` ends option parsing — a literal `-K`
+    // operand after it is NOT a flag and must not be rejected.
+    #[test]
+    fn curl_double_dash_separator_ends_flag_check() {
+        assert!(check_forbidden_curl_args(&["https://x", "--", "-K"]).is_ok());
+        // a real `-K` before `--` is still rejected
+        assert!(check_forbidden_curl_args(&["-K", "f", "--", "-K"]).is_err());
+    }
+
+    // G4/#100 (second pass): a benign single-dash bundle with no forbidden
+    // char must still be allowed.
+    #[test]
+    fn allows_benign_curl_short_bundle() {
+        assert!(check_forbidden_curl_args(&["-sL", "https://x"]).is_ok());
+    }
+
     #[test]
     fn rejects_curl_output_to_rc_files() {
         assert!(check_forbidden_curl_args(&["https://x", "--output", "/home/u/.bashrc"]).is_err());
@@ -3965,6 +4084,24 @@ mod secure_cloud_tests {
     fn rejects_wget_load_cookies_all_forms() {
         assert!(check_forbidden_wget_args(&["--load-cookies", "/tmp/jar"]).is_err());
         assert!(check_forbidden_wget_args(&["--load-cookies=/tmp/jar"]).is_err());
+    }
+
+    // G4/#100 (second pass): wget short flags also bundle and accept attached
+    // values — `-Ofile`, `-iurls.txt`, `-qO` must all reject.
+    #[test]
+    fn rejects_wget_short_flag_bundle_and_attached_value() {
+        assert!(check_forbidden_wget_args(&["-Ofile"]).is_err());
+        assert!(check_forbidden_wget_args(&["-iurls.txt"]).is_err());
+        assert!(check_forbidden_wget_args(&["-O=x"]).is_err());
+        assert!(check_forbidden_wget_args(&["-qO", "x"]).is_err());
+        assert!(check_forbidden_wget_args(&["--output-document=x"]).is_err());
+    }
+
+    // G4/#100 (second pass): `--` ends wget option parsing.
+    #[test]
+    fn wget_double_dash_separator_ends_flag_check() {
+        assert!(check_forbidden_wget_args(&["https://x", "--", "-O"]).is_ok());
+        assert!(check_forbidden_wget_args(&["-O", "f", "--", "-O"]).is_err());
     }
 
     #[test]
