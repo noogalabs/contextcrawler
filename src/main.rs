@@ -650,9 +650,14 @@ enum Commands {
         /// SECURITY: by default `args` is passed verbatim as argv —
         /// `args[0]` is the binary, `args[1..]` its arguments — so a binary
         /// path containing whitespace can never be split into the wrong
-        /// program. `--shell` is the explicit opt-in for callers that
+        /// program. `--via-shell` is the explicit opt-in for callers that
         /// genuinely need shell word-splitting / quoting of a single arg.
-        #[arg(long)]
+        ///
+        /// The flag is `--via-shell` (not `--shell`, #100 G2 Codex 2nd pass
+        /// PARTIAL 3) so a proxied child whose own arg is literally `--shell`
+        /// is not stolen by clap. Either way, everything after a `--`
+        /// separator is the verbatim child argv.
+        #[arg(long = "via-shell")]
         shell: bool,
 
         /// Command and arguments to execute
@@ -1449,6 +1454,21 @@ fn bin_basename(bin: &str) -> &str {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(bin)
+}
+
+/// `true` when a proxy/meta `argv[0]` token contains a path separator
+/// (`/` or `\`).
+///
+/// SECURITY (#100 G2 Codex 2nd pass — CRITICAL 2): `bin_basename` normalises
+/// a token ONLY for the `META_PASSTHROUGH_BINS` membership check, but the
+/// actual spawn ran the RAW token. `contextcrawler proxy ../../evil/npm` then
+/// passed the `npm` membership/hardening check while executing the attacker's
+/// `../../evil/npm`. Proxied/meta commands must be bare tool names resolved
+/// via `PATH`, never a caller-smuggled path. Reject anything with a
+/// separator at both call sites so hardening is applied to the binary that
+/// actually runs.
+fn token_has_path_separator(token: &str) -> bool {
+    token.contains('/') || token.contains('\\')
 }
 
 /// `true` when the proxy nudge should be printed to stderr. Three independent
@@ -2586,6 +2606,20 @@ fn run_cli() -> Result<i32> {
             // hardening path uses (`cloud_fallback_hardening`).
             let bin_base = bin_basename(bin);
             if META_PASSTHROUGH_BINS.contains(&bin_base) && cmd_has_meta_flag(&raw_args[1..]) {
+                // SECURITY (#100 G2 Codex 2nd pass — CRITICAL 2): refuse a
+                // path-bearing token. `bin_basename` would let
+                // `contextcrawler ../../evil/npm --version` pass the
+                // membership check; `run_simple_passthrough` would then spawn
+                // a binary other than the one the basename matched. A
+                // meta-flag passthrough target must be a bare tool name
+                // resolved via PATH.
+                if token_has_path_separator(bin) {
+                    anyhow::bail!(
+                        "contextcrawler: refusing to passthrough a path-bearing \
+                         command token `{bin}` — pass a bare tool name resolved \
+                         via PATH"
+                    );
+                }
                 return run_simple_passthrough(bin_base, &raw_args[1..]);
             }
         }
@@ -3494,7 +3528,6 @@ fn run_cli() -> Result<i32> {
         Commands::Proxy { shell, args } => {
             use std::ffi::OsString;
             use std::io::{Read, Write};
-            use std::process::Command as ProcCommand;
             use std::process::Stdio;
             use std::sync::atomic::{AtomicU32, Ordering};
             use std::thread;
@@ -3530,11 +3563,26 @@ fn run_cli() -> Result<i32> {
                         OsString::from(first),
                         rest.iter().map(OsString::from).collect(),
                     ),
-                    None => anyhow::bail!("proxy --shell: empty command line"),
+                    None => anyhow::bail!("proxy --via-shell: empty command line"),
                 }
             } else {
                 (args[0].clone(), args[1..].to_vec())
             };
+
+            // SECURITY (#100 G2 Codex 2nd pass — CRITICAL 2): refuse a
+            // path-bearing `argv[0]`. The spawn below would otherwise exec
+            // the RAW token, while any basename-normalised hardening/nudge
+            // was computed for the bare tool name — i.e. hardening applied
+            // cosmetically to the wrong binary
+            // (`proxy ../../evil/npm ...`). Proxied commands must be bare
+            // tool names resolved via PATH.
+            if token_has_path_separator(&cmd_name.to_string_lossy()) {
+                anyhow::bail!(
+                    "contextcrawler: refusing to proxy a path-bearing command \
+                     token `{}` — pass a bare tool name resolved via PATH",
+                    cmd_name.to_string_lossy()
+                );
+            }
 
             // Lossy String forms — used ONLY for display, the nudge and
             // usage tracking, never for spawning the process.
@@ -3619,23 +3667,13 @@ fn run_cli() -> Result<i32> {
                 }
             }
 
-            // SECURITY: spawn argv[0] as an OsStr. If it contains a path
-            // separator the user gave an explicit path — exec it directly,
-            // no PATH lookup. Otherwise resolve the bare name via PATH.
-            // Either way argv[0] and argv[1..] stay OsString — never
-            // word-split, never shell-interpreted.
-            let mut proc_cmd = {
-                let has_sep = std::path::Path::new(&cmd_name)
-                    .components()
-                    .nth(1)
-                    .is_some()
-                    || cmd_name.to_string_lossy().contains(std::path::MAIN_SEPARATOR);
-                if has_sep {
-                    ProcCommand::new(&cmd_name)
-                } else {
-                    core::utils::resolved_command(&cmd_name_display)
-                }
-            };
+            // SECURITY (#100 G2 Codex 2nd pass — CRITICAL 2): `cmd_name` is
+            // guaranteed separator-free at this point (path-bearing tokens
+            // are rejected above), so always resolve the bare name via PATH.
+            // argv[0] and argv[1..] stay OsString — never word-split, never
+            // shell-interpreted.
+            let mut proc_cmd = core::utils::resolved_command(&cmd_name_display);
+            let _ = &cmd_name; // OsString retained for argv-shape guarantees
             let mut child = ChildGuard(Some(
                 proc_cmd
                     .args(&cmd_args)

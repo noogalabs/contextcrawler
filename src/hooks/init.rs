@@ -2793,8 +2793,16 @@ fn resolve_home_subdir(subdir: &str) -> Result<PathBuf> {
 /// project `.env`) to a write/delete root outside the user's home.
 const ALLOW_NONHOME_ROOT_ENV: &str = "CONTEXTCRAWLER_ALLOW_NONHOME_ROOT";
 
+/// Cache for the opt-in flag. The env var is read EXACTLY ONCE, on first use
+/// (#100 G2 Codex 2nd pass — PARTIAL 4): reading it per-call left a
+/// theoretical TOCTOU window where a mid-run env change could flip the
+/// escape-hatch decision between two `validate_env_root` calls.
+static NONHOME_ROOT_ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn nonhome_root_allowed() -> bool {
-    std::env::var_os(ALLOW_NONHOME_ROOT_ENV).is_some_and(|v| !v.is_empty())
+    *NONHOME_ROOT_ALLOWED.get_or_init(|| {
+        std::env::var_os(ALLOW_NONHOME_ROOT_ENV).is_some_and(|v| !v.is_empty())
+    })
 }
 
 /// `true` if `root`, after best-effort canonicalisation, does not start with
