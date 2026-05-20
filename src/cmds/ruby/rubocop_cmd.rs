@@ -106,6 +106,13 @@ fn severity_rank(severity: &str) -> u8 {
 /// Colour codes embedded in the JSON break `serde_json`, and codes
 /// wrapping `offenses` / severity markers evade the text-fallback
 /// matching — silently hiding offences (G6 #100).
+///
+/// Codex G6 follow-up — no user-visible colour regression:
+/// `filter_rubocop_json` / `filter_rubocop_text` both emit a
+/// synthesised compact summary ("RuboCop: N files inspected, M
+/// offense(s)"). rubocop's original coloured lines are never echoed
+/// verbatim, so the strip discards no colour the user previously saw
+/// — no split matcher/display paths needed.
 fn filter_rubocop_dispatch(stdout: &str, use_text_filter: bool) -> String {
     let stdout = strip_ansi(stdout);
     if use_text_filter {

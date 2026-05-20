@@ -3217,6 +3217,89 @@ mod secure_pyrbjvmdotnet_tests {
         let _ = secure_go_command("go");
     }
 
+    // ── spawn-based hardening verification (Codex G6 follow-up) ───────
+    //
+    // The structural tests above inspect `Command::get_envs()` — they
+    // confirm the builder *logged* an `env_remove`, but never confirm
+    // the var is actually absent from a real child's environment. The
+    // tests below spawn `/usr/bin/env` *through the real builder* (a
+    // builder takes a program name; `which` resolves an absolute path
+    // to itself, so `secure_jvm_command("/usr/bin/env")` yields a
+    // genuine, fully-hardened, spawnable Command) and grep the child's
+    // printed environment. This is the spawn-and-verify model used by
+    // tests/runtime_hardening.rs and tests/cargo_hardening.rs.
+
+    /// Serializes the spawn tests below — they mutate process-global
+    /// env, which parallel tests would otherwise observe.
+    static SPAWN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Spawn `builder("/usr/bin/env")` and return the child's printed
+    /// environment as one string. Returns `None` if `/usr/bin/env` is
+    /// not present (non-standard layout) so the caller can skip.
+    #[cfg(unix)]
+    fn child_env_via_builder(builder: fn(&str) -> Command) -> Option<String> {
+        const ENV_BIN: &str = "/usr/bin/env";
+        if !std::path::Path::new(ENV_BIN).exists() {
+            return None;
+        }
+        let out = builder(ENV_BIN)
+            .output()
+            .expect("spawn /usr/bin/env via secure builder");
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// G6 finding 1 (spawn-verified): set `_JAVA_OPTIONS` in this
+    /// process, build a JVM command via `secure_jvm_command`, spawn the
+    /// child, and assert the var is genuinely absent from the child's
+    /// real environment — not merely flagged for removal on the parent.
+    #[test]
+    #[cfg(unix)]
+    fn secure_jvm_command_strips_underscore_java_options_in_child() {
+        let _guard = SPAWN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sentinel = "-javaagent:/tmp/cc-g6-evil-DOES-NOT-EXIST.jar";
+        unsafe {
+            std::env::set_var("_JAVA_OPTIONS", sentinel);
+        }
+        let child_env = child_env_via_builder(secure_jvm_command);
+        unsafe {
+            std::env::remove_var("_JAVA_OPTIONS");
+        }
+        let Some(child_env) = child_env else {
+            eprintln!("skip: /usr/bin/env not present");
+            return;
+        };
+        assert!(
+            !child_env.contains("_JAVA_OPTIONS") && !child_env.contains(sentinel),
+            "_JAVA_OPTIONS reached the JVM child environment:\n{child_env}"
+        );
+    }
+
+    /// G6 finding 4 (spawn-verified): set `GOENV` in this process, build
+    /// a `go` command via `secure_go_command`, spawn the child, and
+    /// assert `GOENV` is genuinely absent from the child's real
+    /// environment.
+    #[test]
+    #[cfg(unix)]
+    fn secure_go_command_strips_goenv_in_child() {
+        let _guard = SPAWN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sentinel = "/tmp/cc-g6-evil-goenv-DOES-NOT-EXIST";
+        unsafe {
+            std::env::set_var("GOENV", sentinel);
+        }
+        let child_env = child_env_via_builder(secure_go_command);
+        unsafe {
+            std::env::remove_var("GOENV");
+        }
+        let Some(child_env) = child_env else {
+            eprintln!("skip: /usr/bin/env not present");
+            return;
+        };
+        assert!(
+            !child_env.contains("GOENV") && !child_env.contains(sentinel),
+            "GOENV reached the go child environment:\n{child_env}"
+        );
+    }
+
     // ── pytest deny ──────────────────────────────────────────────────
 
     #[test]

@@ -66,6 +66,15 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
     // `=== ... ===` section markers / `FAILED`/`passed` summary tokens
     // would evade the `starts_with`/`contains` state machine below,
     // silently hiding failures (G6 #100).
+    //
+    // Codex G6 follow-up — no user-visible colour regression: this
+    // filter emits a fully synthesised compact summary (see
+    // `build_pytest_summary`: "Pytest: N passed, M failed", "[FAIL]
+    // <name>", truncated error lines). It never echoes pytest's
+    // original lines verbatim, so pytest's TTY colour was already
+    // discarded by the reformatting before this change. Stripping
+    // here only affects the matcher's input — there is no original
+    // colour left to preserve, so no split matcher/display paths.
     let output = strip_ansi(output);
     let output = output.as_str();
 

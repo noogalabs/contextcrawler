@@ -174,6 +174,13 @@ fn filter_rspec_output(output: &str) -> String {
     // codes wrapping `Failures:` / `examples, ... failures` markers
     // would evade the text-fallback state machine — silently hiding
     // failures (G6 #100).
+    //
+    // Codex G6 follow-up — no user-visible colour regression: both the
+    // JSON path (`build_rspec_summary`) and the text fallback emit a
+    // synthesised compact summary ("RSpec: N passed, M failed", "❌
+    // <description>"). rspec's original coloured lines are never shown
+    // verbatim, so the strip removes no colour the user previously
+    // had — no split matcher/display paths needed.
     let output = strip_ansi(output);
     let output = output.as_str();
 
