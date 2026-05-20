@@ -6,7 +6,9 @@
 //! fails to parse.
 
 use crate::core::runner;
-use crate::core::utils::{check_forbidden_rspec_args, fallback_tail, ruby_exec, truncate};
+use crate::core::utils::{
+    check_forbidden_rspec_args, fallback_tail, ruby_exec, strip_ansi, truncate,
+};
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -166,6 +168,21 @@ fn filter_rspec_output(output: &str) -> String {
     if output.trim().is_empty() {
         return "RSpec: No output".to_string();
     }
+
+    // Strip ANSI escapes up-front: rspec colourises output on a TTY and
+    // colour codes embedded in the JSON would break `serde_json`, while
+    // codes wrapping `Failures:` / `examples, ... failures` markers
+    // would evade the text-fallback state machine — silently hiding
+    // failures (G6 #100).
+    //
+    // Codex G6 follow-up — no user-visible colour regression: both the
+    // JSON path (`build_rspec_summary`) and the text fallback emit a
+    // synthesised compact summary ("RSpec: N passed, M failed", "❌
+    // <description>"). rspec's original coloured lines are never shown
+    // verbatim, so the strip removes no colour the user previously
+    // had — no split matcher/display paths needed.
+    let output = strip_ansi(output);
+    let output = output.as_str();
 
     // Try parsing as JSON first (happy path when --format json is injected)
     if let Ok(rspec) = serde_json::from_str::<RspecOutput>(output) {
@@ -672,6 +689,30 @@ Failures:
         assert!(result.contains("RSpec:"));
         assert!(result.contains("4 examples, 1 failure"));
         assert!(result.contains("❌"), "should show failure marker");
+    }
+
+    /// G6 #100: rspec colourises text output on a TTY. ANSI escapes
+    /// wrapping `Failures:` and the `N examples, M failures` count line
+    /// must be stripped before the text-fallback state machine runs.
+    #[test]
+    fn test_filter_rspec_ansi_wrapped_failures_still_detected() {
+        let text = "Randomized with seed 1\n\
+\x1b[31m..F..\x1b[0m\n\n\
+\x1b[31mFailures:\x1b[0m\n\n\
+  1) User is valid\n\
+     Failure/Error: expect(user).to be_valid\n\
+       expected true got false\n\
+     # ./spec/models/user_spec.rb:5\n\n\
+\x1b[31m4 examples, 1 failure\x1b[0m\n";
+        let result = filter_rspec_output(text);
+        assert!(
+            result.contains("4 examples, 1 failure"),
+            "ANSI-wrapped failure count must still be detected, got: {result:?}"
+        );
+        assert!(
+            !result.contains('\x1b'),
+            "no raw ANSI escapes should survive into the filtered output"
+        );
     }
 
     #[test]

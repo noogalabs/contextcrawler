@@ -845,7 +845,6 @@ const ALLOWLIST_RULES: &[AllowlistRule] = &[
                 || line.contains("Doc-tests rtk")
                 || line.contains("/tmp/rtk-")
                 || line.contains("/tmp/rtk/")
-                || line.contains("rtk_dotnet_")
                 || line.contains(".contains(\"rtk")
                 || line.contains(".starts_with(\"rtk")
                 || line.contains(".strip_prefix(\"rtk")

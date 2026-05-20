@@ -6,7 +6,7 @@
 //! to parse.
 
 use crate::core::runner;
-use crate::core::utils::{check_forbidden_rubocop_args, ruby_exec};
+use crate::core::utils::{check_forbidden_rubocop_args, ruby_exec, strip_ansi};
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -83,13 +83,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         cmd,
         "rubocop",
         &args.join(" "),
-        move |stdout| {
-            if has_format || is_autocorrect {
-                filter_rubocop_text(stdout)
-            } else {
-                filter_rubocop_json(stdout)
-            }
-        },
+        move |stdout| filter_rubocop_dispatch(stdout, has_format || is_autocorrect),
         runner::RunOptions::stdout_only().tee("rubocop"),
     )
 }
@@ -103,6 +97,28 @@ fn severity_rank(severity: &str) -> u8 {
         "warning" => 1,
         "convention" | "refactor" | "info" => 2,
         _ => 3,
+    }
+}
+
+/// Strip ANSI escapes, then route to the JSON or text filter.
+///
+/// Stripping happens up-front: rubocop colourises output on a TTY.
+/// Colour codes embedded in the JSON break `serde_json`, and codes
+/// wrapping `offenses` / severity markers evade the text-fallback
+/// matching — silently hiding offences (G6 #100).
+///
+/// Codex G6 follow-up — no user-visible colour regression:
+/// `filter_rubocop_json` / `filter_rubocop_text` both emit a
+/// synthesised compact summary ("RuboCop: N files inspected, M
+/// offense(s)"). rubocop's original coloured lines are never echoed
+/// verbatim, so the strip discards no colour the user previously saw
+/// — no split matcher/display paths needed.
+fn filter_rubocop_dispatch(stdout: &str, use_text_filter: bool) -> String {
+    let stdout = strip_ansi(stdout);
+    if use_text_filter {
+        filter_rubocop_text(&stdout)
+    } else {
+        filter_rubocop_json(&stdout)
     }
 }
 
@@ -573,6 +589,31 @@ mod tests {
 5 files inspected, 1 offense detected"#;
         let result = filter_rubocop_text(text);
         assert_eq!(result, "RuboCop: 5 files inspected, 1 offense detected");
+    }
+
+    /// G6 #100: rubocop colourises output on a TTY. ANSI escapes
+    /// wrapping the `N files inspected, M offense(s)` marker must be
+    /// stripped before the text fallback runs, or offences are hidden.
+    #[test]
+    fn test_filter_rubocop_dispatch_strips_ansi_text() {
+        let text = "Inspecting 5 files\n\
+\x1b[33m..C..\x1b[0m\n\n\
+\x1b[31m5 files inspected, 1 offense detected\x1b[0m";
+        let result = filter_rubocop_dispatch(text, true);
+        assert_eq!(result, "RuboCop: 5 files inspected, 1 offense detected");
+        assert!(!result.contains('\x1b'), "no raw ANSI should survive");
+    }
+
+    /// ANSI codes embedded in the JSON would break `serde_json`; the
+    /// dispatch strip must clear them so the JSON path still parses.
+    #[test]
+    fn test_filter_rubocop_dispatch_strips_ansi_json() {
+        let json = format!("\x1b[2K{}\x1b[0m", no_offenses_json());
+        let result = filter_rubocop_dispatch(&json, false);
+        assert!(
+            result.contains("ok"),
+            "ANSI-wrapped clean JSON must still parse, got: {result:?}"
+        );
     }
 
     #[test]

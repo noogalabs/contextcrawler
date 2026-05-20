@@ -1,11 +1,30 @@
 //! Parses .trx test result files (Visual Studio XML format) into compact summaries.
 
-use crate::binlog::{FailedTest, TestSummary};
+use crate::binlog::{FailedTest, TestSummary, MAX_ARTIFACT_BYTES};
 use chrono::{DateTime, FixedOffset};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+/// Read a `.trx` file to a string, refusing it if it exceeds the
+/// [`MAX_ARTIFACT_BYTES`] cap. Returns `None` on an oversize, missing,
+/// or unreadable file — matching the error-swallowing contract of the
+/// `parse_trx_*` API. An oversize file is logged to stderr so it isn't
+/// silently dropped.
+fn read_trx_capped(path: &Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > MAX_ARTIFACT_BYTES {
+        eprintln!(
+            "[contextcrawler] refusing trx {}: {} bytes exceeds the {} byte cap",
+            path.display(),
+            len,
+            MAX_ARTIFACT_BYTES
+        );
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
 
 fn local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|b| *b == b':').next().unwrap_or(name)
@@ -92,7 +111,7 @@ fn parse_trx_time_bounds(content: &str) -> Option<(DateTime<FixedOffset>, DateTi
 /// Parse TRX (Visual Studio Test Results) file to extract test summary.
 /// Returns None if the file doesn't exist or isn't a valid TRX file.
 pub fn parse_trx_file(path: &Path) -> Option<TestSummary> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = read_trx_capped(path)?;
     parse_trx_content(&content)
 }
 
@@ -137,9 +156,9 @@ pub fn parse_trx_files_in_dir_since(dir: &Path, since: Option<SystemTime>) -> Op
             }
         }
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => continue,
+        let content = match read_trx_capped(&path) {
+            Some(content) => content,
+            None => continue,
         };
 
         if let Some((start, finish)) = parse_trx_time_bounds(&content) {
@@ -386,6 +405,23 @@ fn parse_trx_content(content: &str) -> Option<TestSummary> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// G6 #100: an oversize `.trx` must be rejected (returns `None`)
+    /// before being read into memory — no OOM on a hostile file.
+    #[test]
+    fn parse_trx_file_rejects_oversize() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cc_g6_trx_oversize_{}.trx",
+            std::process::id()
+        ));
+        let f = std::fs::File::create(&tmp).expect("create temp");
+        f.set_len(MAX_ARTIFACT_BYTES + 1).expect("set_len");
+        drop(f);
+
+        let result = parse_trx_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_none(), "oversize trx must be rejected");
+    }
 
     #[test]
     fn test_parse_trx_content_extracts_passed_counts() {
