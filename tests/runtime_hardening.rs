@@ -267,6 +267,114 @@ fn mypy_config_file_is_rejected() {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Go build-tool RCE coverage (issue #111 G6)
+// ════════════════════════════════════════════════════════════════════
+// `-toolexec` / `-exec` run an arbitrary binary during the build / test.
+// They are CLI flags (not env vars), so `secure_go_command` does NOT
+// defend them. The deny check fires before any spawn → exit 2.
+
+#[test]
+fn go_build_toolexec_is_rejected() {
+    let out = run_with_env(&["go", "build", "-toolexec=/tmp/evil", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build -toolexec should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_test_exec_is_rejected() {
+    let out = run_with_env(&["go", "test", "-exec", "/tmp/evil", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go test -exec should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_build_gcflags_toolexec_smuggling_is_rejected() {
+    let out = run_with_env(&["go", "build", "-gcflags=-toolexec=/tmp/evil", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build -gcflags=-toolexec= should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_build_plain_invocation_is_not_rejected() {
+    // `go build ./...` carries no dangerous flag — must not be denied.
+    let out = run_with_env(&["go", "build", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "plain `go build ./...` got rejected. stderr={}",
+        stderr
+    );
+}
+
+#[test]
+fn pytest_config_file_is_rejected() {
+    // `-c evil.ini` points pytest at an attacker pytest.ini that can set
+    // `addopts = -p /tmp/evil_plugin.py` — bypassing the `-p` block.
+    let out = run_with_env(&["pytest", "-c", "evil.ini"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "pytest -c evil.ini should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn gradle_glued_init_script_is_rejected() {
+    // `-I/path/init.gradle` (no space) — glued form of `-I`.
+    let out = run_with_env(&["gradlew", "-I/tmp/evil.gradle", "tasks"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "gradlew -I/tmp/evil.gradle should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn gradle_settings_file_is_rejected() {
+    // `-c x.gradle` loads an attacker settings.gradle (arbitrary Groovy).
+    let out = run_with_env(&["gradlew", "-c", "evil.gradle", "tasks"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "gradlew -c evil.gradle should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn golangci_config_file_is_rejected() {
+    // golangci-lint loads custom .so plugin linters from its config file.
+    let out = run_with_env(&["golangci-lint", "-c", "evil.yml", "run"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "golangci-lint -c evil.yml should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Positive tests — normal invocations still work end-to-end.
 // ════════════════════════════════════════════════════════════════════
 

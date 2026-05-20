@@ -3,9 +3,15 @@
 use crate::core::runner;
 use crate::core::tracking;
 // `secure_go_command` strips GOFLAGS / GOPATH / GOROOT / GOPROXY / CC /
-// CXX / PKG_CONFIG from inherited env so a tainted parent can't inject
-// `-toolexec=/tmp/evil` (RCE via cgo / build toolchain). See issue #36.
-use crate::core::utils::{exit_code_from_output, secure_go_command, truncate};
+// CXX / PKG_CONFIG from inherited env so a tainted parent can't sideload
+// a tainted toolchain / cgo compiler. See issue #36.
+//
+// `-toolexec` / `-exec` are CLI FLAGS, not env vars — `secure_go_command`
+// does NOT defend them. `check_forbidden_go_args` rejects them (and the
+// `-gcflags=-toolexec=...` smuggling form) before any spawn. See #111 G6.
+use crate::core::utils::{
+    check_forbidden_go_args, exit_code_from_output, secure_go_command, truncate,
+};
 use crate::golangci_cmd;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -46,6 +52,11 @@ struct PackageResult {
 }
 
 pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
+    if let Err(msg) = check_forbidden_go_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let mut cmd = secure_go_command("go");
     cmd.arg("test");
 
@@ -83,6 +94,11 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub fn run_build(args: &[String], verbose: u8) -> Result<i32> {
+    if let Err(msg) = check_forbidden_go_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let mut cmd = secure_go_command("go");
     cmd.arg("build");
 
@@ -104,6 +120,11 @@ pub fn run_build(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub fn run_vet(args: &[String], verbose: u8) -> Result<i32> {
+    if let Err(msg) = check_forbidden_go_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let mut cmd = secure_go_command("go");
     cmd.arg("vet");
 
@@ -134,6 +155,15 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<i32> {
         match tool {
             GoTool::GolangciLint => return run_go_tool_golangci_lint(tool_args, verbose),
         }
+    }
+
+    // `go run` (and others) also accept `-toolexec` / `-exec`. Reject the
+    // dangerous flags before any spawn — these are CLI flags, not env vars,
+    // so `secure_go_command` does not defend them. See #111 G6.
+    let str_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Err(msg) = check_forbidden_go_args(&str_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
     }
 
     let timer = tracking::TimedExecution::start();
@@ -235,6 +265,14 @@ fn match_go_tool(args: &[OsString]) -> Option<(GoTool, &[OsString])> {
 /// Run `go tool golangci-lint` and filter its output via the golangci JSON filter.
 /// Reusing parts of golangci_cmd.
 fn run_go_tool_golangci_lint(args: &[OsString], verbose: u8) -> Result<i32> {
+    // golangci-lint loads custom .so plugin linters from its config file,
+    // so `-c <attacker.yml>` is RCE-equivalent. Reject before spawn. #111 G6.
+    let str_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Err(msg) = crate::core::utils::check_forbidden_golangci_args(&str_args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     let version = detect_go_tool_golangci_version();
