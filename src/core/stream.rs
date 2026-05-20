@@ -266,6 +266,16 @@ const STREAM_CHANNEL_CAP: usize = 4096;
 /// input; bound the filtered buffer independently so capture stays O(RAW_CAP).
 const FILTERED_CAP: usize = RAW_CAP;
 
+/// Bound on the sink channel feeding the dedicated writer thread. The writer
+/// thread drains filtered chunks to the real stdout/stderr. If the terminal
+/// wedges, the writer stalls and queued chunks accumulate here. An *unbounded*
+/// channel would grow without limit (OOM) while the child floods output — so
+/// the channel is bounded and the consumer uses `try_send`: a full channel
+/// means the chunk is dropped (and accounted), never blocked on. The child
+/// drain therefore never stalls on a wedged sink. 8192 buffered chunks is
+/// generous headroom for a transient terminal hiccup while capping memory.
+const SINK_CHANNEL_CAP: usize = 8192;
+
 /// Read a child stream line-by-line as raw bytes, yielding lossy-UTF-8 strings.
 ///
 /// `BufRead::lines()` is strict UTF-8 and `.map_while(Result::ok)` silently
@@ -298,6 +308,23 @@ pub fn run_streaming(
     cmd: &mut Command,
     stdin_mode: StdinMode,
     stdout_mode: FilterMode<'_>,
+) -> Result<StreamResult> {
+    run_streaming_with_sink(cmd, stdin_mode, stdout_mode, None)
+}
+
+/// Optional override for the sink-writer thread's destinations: `(stdout-like,
+/// stderr-like)`. Production passes `None` (real stdout/stderr); tests inject a
+/// `Write` that can be wedged to exercise the bounded-sink drop-on-overflow
+/// path without hanging the test runner.
+type SinkOverride = Option<(Box<dyn Write + Send>, Box<dyn Write + Send>)>;
+
+/// Implementation of [`run_streaming`] with an injectable sink destination.
+/// See [`SinkOverride`]. All public callers go through `run_streaming`.
+fn run_streaming_with_sink(
+    cmd: &mut Command,
+    stdin_mode: StdinMode,
+    stdout_mode: FilterMode<'_>,
+    sink_override: SinkOverride,
 ) -> Result<StreamResult> {
     if matches!(stdout_mode, FilterMode::Passthrough) {
         match &stdin_mode {
@@ -420,20 +447,31 @@ pub fn run_streaming(
         // Decouple draining from sink writes. The consumer loop below drains
         // the bounded child channel (`rx`) AND must never block on a slow
         // terminal — if it did, the reader threads would fill `rx` and the
-        // child's own writes would stall. So sink writes are handed to a
-        // dedicated writer thread over an *unbounded* channel: the consumer
+        // child's own writes would stall. Sink writes are handed to a
+        // dedicated writer thread over a *bounded* channel: the consumer
         // always makes progress draining the child, and back-pressure from a
-        // blocked terminal is absorbed here in memory rather than upstream.
-        let (sink_tx, sink_rx) = mpsc::channel::<SinkMsg>();
+        // wedged terminal is absorbed here — but only up to SINK_CHANNEL_CAP
+        // chunks. An unbounded channel would let a wedged sink grow memory
+        // without limit (OOM) while the child floods output. Past the cap the
+        // consumer DROPS the chunk (via `try_send`) and accounts the bytes;
+        // it never blocks. The terminal output is lost in that scenario, but
+        // it was un-writable anyway, and the child drain is never stalled.
+        let (sink_tx, sink_rx) = mpsc::sync_channel::<SinkMsg>(SINK_CHANNEL_CAP);
         let sink_thread = std::thread::spawn(move || {
+            // Either the real stdout/stderr locks, or test-injected sinks.
             let stdout_handle = io::stdout();
-            let mut out = stdout_handle.lock();
             let stderr_handle = io::stderr();
-            let mut err_out = stderr_handle.lock();
+            let (mut out, mut err_out): (Box<dyn Write>, Box<dyn Write>) = match sink_override {
+                Some((o, e)) => (o, e),
+                None => (
+                    Box::new(stdout_handle.lock()),
+                    Box::new(stderr_handle.lock()),
+                ),
+            };
             for msg in sink_rx {
                 let (text, dest): (String, &mut dyn Write) = match msg {
-                    SinkMsg::Out(t) => (t, &mut out),
-                    SinkMsg::Err(t) => (t, &mut err_out),
+                    SinkMsg::Out(t) => (t, &mut *out),
+                    SinkMsg::Err(t) => (t, &mut *err_out),
                 };
                 // Broken pipe / IO error on the sink: stop writing but keep
                 // draining the channel so senders never block. The child
@@ -443,6 +481,45 @@ pub fn run_streaming(
             let _ = out.flush();
             let _ = err_out.flush();
         });
+
+        // Drop-on-overflow accounting for the bounded sink channel. When the
+        // sink writer wedges and the channel fills, chunks are dropped here
+        // instead of blocking the child drain. `dropped_bytes` totals what was
+        // lost so one summary marker can be emitted at the end.
+        let mut dropped_bytes: usize = 0;
+        let mut dropped = false;
+        let mut sink_gone = false;
+
+        // Hand a SinkMsg to the writer thread without EVER blocking the child
+        // drain: `try_send` only. `Full` → drop the chunk + account its bytes;
+        // `Disconnected` → writer is gone, stop trying. The child drain in the
+        // loop below proceeds regardless — this is the invariant that keeps
+        // the deadlock fix from re-introducing a stall (and the bounded
+        // channel keeps it from OOMing).
+        let sink_send = |tx: &mpsc::SyncSender<SinkMsg>,
+                         msg: SinkMsg,
+                         dropped_bytes: &mut usize,
+                         dropped: &mut bool,
+                         sink_gone: &mut bool| {
+            let len = |m: &SinkMsg| match m {
+                SinkMsg::Out(t) | SinkMsg::Err(t) => t.len(),
+            };
+            if *sink_gone {
+                *dropped_bytes += len(&msg);
+                *dropped = true;
+                return;
+            }
+            match tx.try_send(msg) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(m)) => {
+                    *dropped_bytes += len(&m);
+                    *dropped = true;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    *sink_gone = true;
+                }
+            }
+        };
 
         if let FilterMode::Streaming(mut filter) = stdout_mode {
             for msg in rx {
@@ -492,18 +569,30 @@ pub fn run_streaming(
                         } else {
                             SinkMsg::Out(marker)
                         };
-                        let _ = sink_tx.send(mm);
+                        sink_send(
+                            &sink_tx,
+                            mm,
+                            &mut dropped_bytes,
+                            &mut dropped,
+                            &mut sink_gone,
+                        );
                     }
                     let m = if is_stderr {
                         SinkMsg::Err(output)
                     } else {
                         SinkMsg::Out(output)
                     };
-                    // Unbounded send to the writer thread: never blocks the
-                    // child drain even if the terminal is wedged.
-                    if sink_tx.send(m).is_err() {
-                        break; // writer thread gone
-                    }
+                    // Bounded `try_send` to the writer thread: never blocks
+                    // the child drain even if the terminal is wedged. A full
+                    // channel drops the chunk (accounted in `dropped_bytes`)
+                    // rather than stalling — the drain keeps going.
+                    sink_send(
+                        &sink_tx,
+                        m,
+                        &mut dropped_bytes,
+                        &mut dropped,
+                        &mut sink_gone,
+                    );
                 }
             }
             let tail = filter.flush();
@@ -521,16 +610,57 @@ pub fn run_streaming(
                 } else {
                     SinkMsg::Out(marker)
                 };
-                let _ = sink_tx.send(mm);
+                sink_send(
+                    &sink_tx,
+                    mm,
+                    &mut dropped_bytes,
+                    &mut dropped,
+                    &mut sink_gone,
+                );
             }
             let tail_msg = if filter_fd_is_stderr {
                 SinkMsg::Err(tail)
             } else {
                 SinkMsg::Out(tail)
             };
-            let _ = sink_tx.send(tail_msg);
+            sink_send(
+                &sink_tx,
+                tail_msg,
+                &mut dropped_bytes,
+                &mut dropped,
+                &mut sink_gone,
+            );
             saved_filter = Some(filter);
         }
+
+        // If the sink wedged and chunks were dropped, emit ONE summary marker
+        // — both into the `filtered` accumulator (so the captured output
+        // records the loss) and, best-effort, to the sink itself. This
+        // mirrors the `truncated_filtered` marker pattern above.
+        if dropped {
+            let marker = format!(
+                "\n[contextcrawler: {} bytes dropped — output sink stalled]\n",
+                dropped_bytes
+            );
+            if filtered.len() + marker.len() <= FILTERED_CAP {
+                filtered.push_str(&marker);
+            }
+            let mm = if filter_fd_is_stderr {
+                SinkMsg::Err(marker)
+            } else {
+                SinkMsg::Out(marker)
+            };
+            // One final best-effort attempt; if the channel is still full or
+            // the writer is gone this is simply dropped too.
+            sink_send(
+                &sink_tx,
+                mm,
+                &mut dropped_bytes,
+                &mut dropped,
+                &mut sink_gone,
+            );
+        }
+
         // Drop our sender so the writer thread sees the channel close and
         // exits once it has flushed every queued chunk.
         drop(sink_tx);
@@ -619,6 +749,15 @@ pub fn run_streaming(
     if let Some(mut f) = saved_filter {
         if let Some(post) = f.on_exit(exit_code, &raw) {
             filtered.push_str(&post);
+            // `post` is written directly to stdout/stderr rather than routed
+            // through the sink channel. This is safe and race-free: the
+            // sink-writer thread was already joined above (`sink_thread.join`),
+            // so there is no concurrent writer to the same fd. Routing it
+            // through the channel would mean resurrecting the joined writer,
+            // which buys nothing here. A wedged terminal can still block this
+            // one trailing write, but the child has already exited by now —
+            // there is no drain left to stall, so the OOM/deadlock concern
+            // that motivated the bounded sink channel does not apply.
             let mut dest: Box<dyn Write> = if filter_fd_is_stderr {
                 Box::new(io::stderr().lock())
             } else {
@@ -1821,6 +1960,180 @@ pub(crate) mod tests {
             elapsed < Duration::from_secs(20),
             "drain must not stall, took {:?}",
             elapsed
+        );
+    }
+
+    /// A `Write` sink that BLOCKS on every write until a shared gate is
+    /// opened. This models a terminal whose reader has stalled (a paused
+    /// pager, or a pipe whose far end is not reading). It counts writes/bytes
+    /// it has accepted so a test can prove the bounded sink channel — not the
+    /// writer — absorbed the back-pressure while wedged.
+    struct WedgedSink {
+        bytes_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        writes_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for WedgedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // Block until the test opens the gate. While wedged, the
+            // sink-writer thread is parked here and cannot drain the channel.
+            let (lock, cvar) = &*self.gate;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cvar.wait(open).unwrap();
+            }
+            drop(open);
+            self.bytes_seen
+                .fetch_add(buf.len(), std::sync::atomic::Ordering::SeqCst);
+            self.writes_seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_wedged_sink_bounds_memory_and_drops_with_marker() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Fourth-pass regression (Codex re-review): the deadlock fix added a
+        // dedicated sink-writer thread fed by an UNBOUNDED channel. If the
+        // sink wedges while the child floods output, that channel grows
+        // without limit → OOM. The fix bounds the channel (SINK_CHANNEL_CAP)
+        // and the consumer uses `try_send`: a full channel DROPS the chunk
+        // (accounted) instead of blocking the child drain.
+        //
+        // This test ACTUALLY wedges the sink — `WedgedSink::write` blocks on
+        // a condvar gate that stays shut for the whole child run — and
+        // asserts:
+        //   (a) the child drain still completes — last line present, no hang;
+        //   (b) memory is bounded — while wedged the writer accepted at most
+        //       ONE chunk, so peak buffered output is the bounded channel
+        //       (≤ SINK_CHANNEL_CAP chunks) plus that one in-flight chunk,
+        //       NOT the whole 50k-chunk flood;
+        //   (c) dropped_bytes > 0 and the dropped-output marker is emitted.
+        //
+        // A pure high-volume test (above) does not prove (b)/(c): with a
+        // fast real sink nothing is ever dropped. The gate is opened by a
+        // watchdog thread AFTER the wedged window, so the sink-writer thread
+        // can finally drain its (bounded) backlog and `run_streaming` returns.
+        let bytes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        // Snapshot of `writes_seen` taken by the watchdog at the instant it
+        // opens the gate — i.e. the count accumulated DURING the wedged
+        // window, before the writer drains its backlog.
+        let writes_while_wedged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let out_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+        let err_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+
+        // Watchdog: keep the sink wedged for a window long enough for the
+        // child to flood and the bounded channel to overflow, then snapshot
+        // the wedged-window write count and open the gate so the run can
+        // finish. This proves the child drain never depended on the sink.
+        let wd_gate = gate.clone();
+        let wd_writes_seen = writes_seen.clone();
+        let wd_snapshot = writes_while_wedged.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            wd_snapshot.store(wd_writes_seen.load(SeqCst), SeqCst);
+            let (lock, cvar) = &*wd_gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+
+        // Child floods 20k lines, each expanded to a 200-byte chunk by the
+        // filter. 20k >> SINK_CHANNEL_CAP (8192), so once the wedged writer
+        // parks and the channel fills, every further chunk must be dropped.
+        // Total filtered output (~4 MiB) stays under FILTERED_CAP (10 MiB) so
+        // the dropped-output marker is not itself elided by FILTERED_CAP —
+        // this isolates the sink-overflow path from the accumulator-cap path.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 20000); do echo line $i; done"]);
+        let chunk = "Z".repeat(200);
+        let filter = LineFilter::new(move |l| Some(format!("{} {}\n", l, chunk)));
+
+        let start = std::time::Instant::now();
+        let result = run_streaming_with_sink(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+            Some((Box::new(out_sink), Box::new(err_sink))),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        watchdog.join().ok();
+
+        // (a) child drain completed despite the wedged sink.
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.raw_stdout.contains("line 20000"),
+            "child must fully drain even though the sink was wedged"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "wedged sink must not deadlock the child drain, took {:?}",
+            elapsed
+        );
+
+        // (b) memory bounded: while wedged the writer parked on its first
+        // write, so it pulled at most one chunk off the channel. Peak
+        // buffered output is therefore the bounded channel (≤
+        // SINK_CHANNEL_CAP) plus that single in-flight chunk — never the full
+        // flood. With an unbounded channel the consumer would have queued all
+        // ~50k chunks instead.
+        let writes_wedged = writes_while_wedged.load(SeqCst);
+        assert!(
+            writes_wedged <= 1,
+            "while wedged the writer must accept at most one chunk, saw {}",
+            writes_wedged
+        );
+
+        // (c) the overflow was detected: dropped chunks accounted, and ONE
+        // summary marker emitted into the filtered accumulator.
+        assert!(
+            result
+                .filtered
+                .contains("bytes dropped — output sink stalled"),
+            "dropped-output marker must be emitted when the sink wedges, filtered tail: {}",
+            &result.filtered[result.filtered.len().saturating_sub(200)..]
+        );
+        let marker_has_bytes = result
+            .filtered
+            .lines()
+            .any(|ln| ln.contains("bytes dropped") && !ln.contains("[contextcrawler: 0 bytes"));
+        assert!(
+            marker_has_bytes,
+            "dropped-output marker must report a non-zero byte count, got: {}",
+            result
+                .filtered
+                .lines()
+                .filter(|l| l.contains("dropped"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        // Exactly ONE marker — not one per dropped chunk.
+        assert_eq!(
+            result
+                .filtered
+                .matches("bytes dropped — output sink stalled")
+                .count(),
+            1,
+            "exactly one dropped-output summary marker expected"
         );
     }
 
