@@ -484,7 +484,7 @@ fn process_claude_payload_with(
                 // command — e.g. a gate false-positive on `ls` — would
                 // otherwise be blocked with no operator-visible reason. Emit
                 // a clear stderr line so the WHY is observable.
-                eprintln!("{}", gate_no_rewrite_deny_log(cmd));
+                let _ = writeln!(io::stderr(), "{}", gate_no_rewrite_deny_log(cmd));
                 return PayloadAction::Deny {
                     reason: "contextcrawler: defence-in-depth gate flagged this command \
                              and it has no contextcrawler rewrite; denying for review"
