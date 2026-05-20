@@ -10,8 +10,15 @@ strip_lines_matching = [
   # not mistaken for a clean run.
   "^Found 0 warnings? and 0 errors?",
 ]
+# tail_lines runs before max_lines (stages 6 then 7). Reserving the tail keeps
+# oxlint's trailing summary line ("Found N warnings ...") and any trailing
+# `error:` diagnostics from being head-truncated away on an overflowing run.
+tail_lines = 49
 max_lines = 50
-on_empty = "oxlint: ok"
+# NOTE (#111/G8): on_empty must NOT assert success. oxlint can exit with no
+# stdout on a hard crash (segfault, killed). Passing empty output through ("")
+# lets the agent see the real empty result + exit code, not a false "ok".
+on_empty = ""
 
 [[tests.oxlint]]
 name = "strips noise, keeps diagnostics and warning summary"
@@ -34,21 +41,130 @@ Finished in 12ms on 100 files.
 expected = "  × eslint(no-console): Unexpected console statement.\n   ╭─[src/app.ts:5:3]\n 5 │   console.log(\"debug\");\n   │   ^^^^^^^^^^^\n   ╰────\n  × eslint(no-unused-vars): 'x' is defined but never used.\n   ╭─[src/utils.ts:2:7]\n 2 │   let x = 42;\n   │       ^\n   ╰────\nFound 2 warnings on 2 files."
 
 [[tests.oxlint]]
-name = "all-clear summary stripped to on_empty"
+name = "all-clear summary stripped to empty (crash not masked as ok)"
 input = """
 Found 0 warnings and 0 errors.
 Finished in 5ms on 100 files.
 """
-expected = "oxlint: ok"
+expected = ""
 
 [[tests.oxlint]]
-name = "clean output"
+name = "clean output passes through as empty"
 input = """
 Finished in 5ms on 100 files.
 """
-expected = "oxlint: ok"
+expected = ""
 
 [[tests.oxlint]]
-name = "empty input returns on_empty message"
+name = "empty input passes through (crash not masked as ok)"
 input = ""
-expected = "oxlint: ok"
+expected = ""
+
+[[tests.oxlint]]
+name = "overflow keeps trailing summary past max_lines"
+input = """
+  × eslint(no-console): Unexpected console statement at line 1
+  × eslint(no-console): Unexpected console statement at line 2
+  × eslint(no-console): Unexpected console statement at line 3
+  × eslint(no-console): Unexpected console statement at line 4
+  × eslint(no-console): Unexpected console statement at line 5
+  × eslint(no-console): Unexpected console statement at line 6
+  × eslint(no-console): Unexpected console statement at line 7
+  × eslint(no-console): Unexpected console statement at line 8
+  × eslint(no-console): Unexpected console statement at line 9
+  × eslint(no-console): Unexpected console statement at line 10
+  × eslint(no-console): Unexpected console statement at line 11
+  × eslint(no-console): Unexpected console statement at line 12
+  × eslint(no-console): Unexpected console statement at line 13
+  × eslint(no-console): Unexpected console statement at line 14
+  × eslint(no-console): Unexpected console statement at line 15
+  × eslint(no-console): Unexpected console statement at line 16
+  × eslint(no-console): Unexpected console statement at line 17
+  × eslint(no-console): Unexpected console statement at line 18
+  × eslint(no-console): Unexpected console statement at line 19
+  × eslint(no-console): Unexpected console statement at line 20
+  × eslint(no-console): Unexpected console statement at line 21
+  × eslint(no-console): Unexpected console statement at line 22
+  × eslint(no-console): Unexpected console statement at line 23
+  × eslint(no-console): Unexpected console statement at line 24
+  × eslint(no-console): Unexpected console statement at line 25
+  × eslint(no-console): Unexpected console statement at line 26
+  × eslint(no-console): Unexpected console statement at line 27
+  × eslint(no-console): Unexpected console statement at line 28
+  × eslint(no-console): Unexpected console statement at line 29
+  × eslint(no-console): Unexpected console statement at line 30
+  × eslint(no-console): Unexpected console statement at line 31
+  × eslint(no-console): Unexpected console statement at line 32
+  × eslint(no-console): Unexpected console statement at line 33
+  × eslint(no-console): Unexpected console statement at line 34
+  × eslint(no-console): Unexpected console statement at line 35
+  × eslint(no-console): Unexpected console statement at line 36
+  × eslint(no-console): Unexpected console statement at line 37
+  × eslint(no-console): Unexpected console statement at line 38
+  × eslint(no-console): Unexpected console statement at line 39
+  × eslint(no-console): Unexpected console statement at line 40
+  × eslint(no-console): Unexpected console statement at line 41
+  × eslint(no-console): Unexpected console statement at line 42
+  × eslint(no-console): Unexpected console statement at line 43
+  × eslint(no-console): Unexpected console statement at line 44
+  × eslint(no-console): Unexpected console statement at line 45
+  × eslint(no-console): Unexpected console statement at line 46
+  × eslint(no-console): Unexpected console statement at line 47
+  × eslint(no-console): Unexpected console statement at line 48
+  × eslint(no-console): Unexpected console statement at line 49
+  × eslint(no-console): Unexpected console statement at line 50
+  × eslint(no-console): Unexpected console statement at line 51
+Found 51 warnings on 30 files.
+"""
+expected = """
+... (3 lines omitted)
+  × eslint(no-console): Unexpected console statement at line 4
+  × eslint(no-console): Unexpected console statement at line 5
+  × eslint(no-console): Unexpected console statement at line 6
+  × eslint(no-console): Unexpected console statement at line 7
+  × eslint(no-console): Unexpected console statement at line 8
+  × eslint(no-console): Unexpected console statement at line 9
+  × eslint(no-console): Unexpected console statement at line 10
+  × eslint(no-console): Unexpected console statement at line 11
+  × eslint(no-console): Unexpected console statement at line 12
+  × eslint(no-console): Unexpected console statement at line 13
+  × eslint(no-console): Unexpected console statement at line 14
+  × eslint(no-console): Unexpected console statement at line 15
+  × eslint(no-console): Unexpected console statement at line 16
+  × eslint(no-console): Unexpected console statement at line 17
+  × eslint(no-console): Unexpected console statement at line 18
+  × eslint(no-console): Unexpected console statement at line 19
+  × eslint(no-console): Unexpected console statement at line 20
+  × eslint(no-console): Unexpected console statement at line 21
+  × eslint(no-console): Unexpected console statement at line 22
+  × eslint(no-console): Unexpected console statement at line 23
+  × eslint(no-console): Unexpected console statement at line 24
+  × eslint(no-console): Unexpected console statement at line 25
+  × eslint(no-console): Unexpected console statement at line 26
+  × eslint(no-console): Unexpected console statement at line 27
+  × eslint(no-console): Unexpected console statement at line 28
+  × eslint(no-console): Unexpected console statement at line 29
+  × eslint(no-console): Unexpected console statement at line 30
+  × eslint(no-console): Unexpected console statement at line 31
+  × eslint(no-console): Unexpected console statement at line 32
+  × eslint(no-console): Unexpected console statement at line 33
+  × eslint(no-console): Unexpected console statement at line 34
+  × eslint(no-console): Unexpected console statement at line 35
+  × eslint(no-console): Unexpected console statement at line 36
+  × eslint(no-console): Unexpected console statement at line 37
+  × eslint(no-console): Unexpected console statement at line 38
+  × eslint(no-console): Unexpected console statement at line 39
+  × eslint(no-console): Unexpected console statement at line 40
+  × eslint(no-console): Unexpected console statement at line 41
+  × eslint(no-console): Unexpected console statement at line 42
+  × eslint(no-console): Unexpected console statement at line 43
+  × eslint(no-console): Unexpected console statement at line 44
+  × eslint(no-console): Unexpected console statement at line 45
+  × eslint(no-console): Unexpected console statement at line 46
+  × eslint(no-console): Unexpected console statement at line 47
+  × eslint(no-console): Unexpected console statement at line 48
+  × eslint(no-console): Unexpected console statement at line 49
+  × eslint(no-console): Unexpected console statement at line 50
+  × eslint(no-console): Unexpected console statement at line 51
+Found 51 warnings on 30 files.
+"""

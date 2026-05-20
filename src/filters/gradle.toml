@@ -17,11 +17,10 @@ strip_lines_matching = [
 ]
 truncate_lines_at = 150
 max_lines = 50
-# NOTE (#100/G8): on_empty also fires when gradle crashes with no stdout
-# (e.g. JVM failure). The TOML filter schema has no exit-code field — the
-# engine only sees output text — so this cannot be gated on exit status
-# without an engine change (out of scope here). Accepted limitation.
-on_empty = "gradle: ok"
+# NOTE (#111/G8): on_empty must NOT assert success. gradle can exit with no
+# stdout on a hard crash (JVM OOM, daemon killed). Passing empty output through
+# ("") lets the agent see the real empty result + exit code, not a false "ok".
+on_empty = ""
 
 [[tests.gradle]]
 name = "strips UP-TO-DATE tasks, keeps build result"
@@ -34,6 +33,11 @@ input = "BUILD SUCCESSFUL in 8s\n7 actionable tasks: 7 executed"
 expected = "BUILD SUCCESSFUL in 8s\n7 actionable tasks: 7 executed"
 
 [[tests.gradle]]
-name = "empty after stripping"
+name = "empty after stripping passes through (crash not masked as ok)"
 input = "> Configuring project :app\n"
-expected = "gradle: ok"
+expected = ""
+
+[[tests.gradle]]
+name = "crash with no stdout passes through (not masked as ok)"
+input = ""
+expected = ""

@@ -9,8 +9,15 @@ strip_lines_matching = [
   "^Pyright \\d+\\.\\d+",
   "^basedpyright \\d+\\.\\d+",
 ]
+# tail_lines runs before max_lines (stages 6 then 7). Reserving the tail keeps
+# basedpyright's trailing summary line ("N errors, M warnings, ...") from being
+# head-truncated away on an overflowing run.
+tail_lines = 49
 max_lines = 50
-on_empty = "basedpyright: ok"
+# NOTE (#111/G8): on_empty must NOT assert success. basedpyright can exit with
+# no stdout on a hard crash (segfault, killed). Passing empty output through
+# ("") lets the agent see the real empty result + exit code, not a false "ok".
+on_empty = ""
 
 [[tests.basedpyright]]
 name = "strips noise, keeps errors and summary"
@@ -42,6 +49,115 @@ Found 10 source files
 expected = "0 errors, 0 warnings, 0 informations"
 
 [[tests.basedpyright]]
-name = "empty input returns on_empty message"
+name = "empty input passes through (crash not masked as ok)"
 input = ""
-expected = "basedpyright: ok"
+expected = ""
+
+[[tests.basedpyright]]
+name = "overflow keeps trailing summary past max_lines"
+input = """
+  /home/user/app/m.py:1:5 - warning: Variable "v1" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:2:5 - warning: Variable "v2" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:3:5 - warning: Variable "v3" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:4:5 - warning: Variable "v4" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:5:5 - warning: Variable "v5" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:6:5 - warning: Variable "v6" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:7:5 - warning: Variable "v7" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:8:5 - warning: Variable "v8" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:9:5 - warning: Variable "v9" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:10:5 - warning: Variable "v10" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:11:5 - warning: Variable "v11" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:12:5 - warning: Variable "v12" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:13:5 - warning: Variable "v13" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:14:5 - warning: Variable "v14" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:15:5 - warning: Variable "v15" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:16:5 - warning: Variable "v16" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:17:5 - warning: Variable "v17" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:18:5 - warning: Variable "v18" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:19:5 - warning: Variable "v19" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:20:5 - warning: Variable "v20" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:21:5 - warning: Variable "v21" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:22:5 - warning: Variable "v22" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:23:5 - warning: Variable "v23" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:24:5 - warning: Variable "v24" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:25:5 - warning: Variable "v25" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:26:5 - warning: Variable "v26" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:27:5 - warning: Variable "v27" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:28:5 - warning: Variable "v28" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:29:5 - warning: Variable "v29" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:30:5 - warning: Variable "v30" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:31:5 - warning: Variable "v31" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:32:5 - warning: Variable "v32" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:33:5 - warning: Variable "v33" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:34:5 - warning: Variable "v34" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:35:5 - warning: Variable "v35" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:36:5 - warning: Variable "v36" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:37:5 - warning: Variable "v37" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:38:5 - warning: Variable "v38" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:39:5 - warning: Variable "v39" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:40:5 - warning: Variable "v40" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:41:5 - warning: Variable "v41" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:42:5 - warning: Variable "v42" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:43:5 - warning: Variable "v43" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:44:5 - warning: Variable "v44" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:45:5 - warning: Variable "v45" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:46:5 - warning: Variable "v46" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:47:5 - warning: Variable "v47" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:48:5 - warning: Variable "v48" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:49:5 - warning: Variable "v49" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:50:5 - warning: Variable "v50" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:51:5 - warning: Variable "v51" is not accessed (reportUnusedVariable)
+51 errors, 51 warnings, 0 informations
+"""
+expected = """
+... (3 lines omitted)
+  /home/user/app/m.py:4:5 - warning: Variable "v4" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:5:5 - warning: Variable "v5" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:6:5 - warning: Variable "v6" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:7:5 - warning: Variable "v7" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:8:5 - warning: Variable "v8" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:9:5 - warning: Variable "v9" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:10:5 - warning: Variable "v10" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:11:5 - warning: Variable "v11" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:12:5 - warning: Variable "v12" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:13:5 - warning: Variable "v13" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:14:5 - warning: Variable "v14" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:15:5 - warning: Variable "v15" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:16:5 - warning: Variable "v16" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:17:5 - warning: Variable "v17" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:18:5 - warning: Variable "v18" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:19:5 - warning: Variable "v19" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:20:5 - warning: Variable "v20" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:21:5 - warning: Variable "v21" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:22:5 - warning: Variable "v22" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:23:5 - warning: Variable "v23" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:24:5 - warning: Variable "v24" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:25:5 - warning: Variable "v25" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:26:5 - warning: Variable "v26" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:27:5 - warning: Variable "v27" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:28:5 - warning: Variable "v28" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:29:5 - warning: Variable "v29" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:30:5 - warning: Variable "v30" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:31:5 - warning: Variable "v31" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:32:5 - warning: Variable "v32" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:33:5 - warning: Variable "v33" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:34:5 - warning: Variable "v34" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:35:5 - warning: Variable "v35" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:36:5 - warning: Variable "v36" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:37:5 - warning: Variable "v37" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:38:5 - warning: Variable "v38" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:39:5 - warning: Variable "v39" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:40:5 - warning: Variable "v40" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:41:5 - warning: Variable "v41" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:42:5 - warning: Variable "v42" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:43:5 - warning: Variable "v43" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:44:5 - warning: Variable "v44" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:45:5 - warning: Variable "v45" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:46:5 - warning: Variable "v46" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:47:5 - warning: Variable "v47" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:48:5 - warning: Variable "v48" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:49:5 - warning: Variable "v49" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:50:5 - warning: Variable "v50" is not accessed (reportUnusedVariable)
+  /home/user/app/m.py:51:5 - warning: Variable "v51" is not accessed (reportUnusedVariable)
+51 errors, 51 warnings, 0 informations
+"""

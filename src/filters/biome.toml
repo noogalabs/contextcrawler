@@ -9,8 +9,15 @@ strip_lines_matching = [
   "^The following command",
   "^Run it with",
 ]
+# tail_lines runs before max_lines (stages 6 then 7). Reserving the tail keeps
+# Biome's trailing summary line ("Found N errors.") from being head-truncated
+# away on an overflowing run.
+tail_lines = 49
 max_lines = 50
-on_empty = "biome: ok"
+# NOTE (#111/G8): on_empty must NOT assert success. biome can exit with no
+# stdout on a hard crash (segfault, killed). Passing empty output through ("")
+# lets the agent see the real empty result + exit code, not a false "ok".
+on_empty = ""
 
 [[tests.biome]]
 name = "lint strips noise, keeps diagnostics"
@@ -33,13 +40,122 @@ Found 2 errors.
 expected = "src/app.tsx:5:3 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━\n  × Unexpected any. Specify a different type.\n  3 │ interface Props {\n  4 │   data: any;\n  5 │         ^^^\nsrc/utils.ts:12:1 lint/complexity/noForEach ━━━━━━━━━━━━━━━━━━━━\n  × Prefer for...of instead of forEach.\n 12 │ items.forEach(item => process(item));\n    │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFound 2 errors."
 
 [[tests.biome]]
-name = "clean check"
+name = "clean check passes through as empty"
 input = """
 Checked 42 files in 0.3s
 """
-expected = "biome: ok"
+expected = ""
 
 [[tests.biome]]
-name = "empty input returns on_empty message"
+name = "empty input passes through (crash not masked as ok)"
 input = ""
-expected = "biome: ok"
+expected = ""
+
+[[tests.biome]]
+name = "overflow keeps trailing summary past max_lines"
+input = """
+src/f1.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 1
+src/f2.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 2
+src/f3.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 3
+src/f4.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 4
+src/f5.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 5
+src/f6.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 6
+src/f7.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 7
+src/f8.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 8
+src/f9.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 9
+src/f10.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 10
+src/f11.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 11
+src/f12.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 12
+src/f13.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 13
+src/f14.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 14
+src/f15.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 15
+src/f16.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 16
+src/f17.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 17
+src/f18.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 18
+src/f19.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 19
+src/f20.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 20
+src/f21.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 21
+src/f22.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 22
+src/f23.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 23
+src/f24.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 24
+src/f25.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 25
+src/f26.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 26
+src/f27.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 27
+src/f28.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 28
+src/f29.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 29
+src/f30.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 30
+src/f31.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 31
+src/f32.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 32
+src/f33.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 33
+src/f34.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 34
+src/f35.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 35
+src/f36.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 36
+src/f37.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 37
+src/f38.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 38
+src/f39.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 39
+src/f40.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 40
+src/f41.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 41
+src/f42.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 42
+src/f43.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 43
+src/f44.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 44
+src/f45.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 45
+src/f46.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 46
+src/f47.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 47
+src/f48.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 48
+src/f49.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 49
+src/f50.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 50
+src/f51.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 51
+Found 51 errors.
+"""
+expected = """
+... (3 lines omitted)
+src/f4.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 4
+src/f5.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 5
+src/f6.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 6
+src/f7.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 7
+src/f8.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 8
+src/f9.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 9
+src/f10.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 10
+src/f11.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 11
+src/f12.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 12
+src/f13.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 13
+src/f14.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 14
+src/f15.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 15
+src/f16.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 16
+src/f17.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 17
+src/f18.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 18
+src/f19.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 19
+src/f20.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 20
+src/f21.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 21
+src/f22.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 22
+src/f23.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 23
+src/f24.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 24
+src/f25.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 25
+src/f26.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 26
+src/f27.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 27
+src/f28.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 28
+src/f29.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 29
+src/f30.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 30
+src/f31.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 31
+src/f32.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 32
+src/f33.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 33
+src/f34.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 34
+src/f35.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 35
+src/f36.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 36
+src/f37.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 37
+src/f38.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 38
+src/f39.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 39
+src/f40.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 40
+src/f41.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 41
+src/f42.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 42
+src/f43.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 43
+src/f44.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 44
+src/f45.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 45
+src/f46.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 46
+src/f47.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 47
+src/f48.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 48
+src/f49.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 49
+src/f50.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 50
+src/f51.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any at file 51
+Found 51 errors.
+"""

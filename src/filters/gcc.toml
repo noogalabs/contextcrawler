@@ -10,8 +10,16 @@ strip_lines_matching = [
   "^\\d+ warnings? generated",
   "^\\d+ errors? generated",
 ]
+# tail_lines runs before max_lines (stages 6 then 7). Reserving the tail keeps
+# the trailing `error:` lines and linker summary (e.g. "ld returned 1 exit
+# status") from being head-truncated away on an overflowing run.
+tail_lines = 49
 max_lines = 50
-on_empty = "gcc: ok"
+# NOTE (#111/G8): on_empty must NOT assert success. gcc/g++ can exit with no
+# stdout on a hard crash (internal compiler error killed, segfault). Passing
+# empty output through ("") lets the agent see the real empty result + exit
+# code, not a false "ok".
+on_empty = ""
 
 [[tests.gcc]]
 name = "strips include chain, keeps errors and warnings"
@@ -30,10 +38,10 @@ main.c:15:12: warning: unused variable 'x' [-Wunused-variable]
 expected = "main.c:10:5: error: use of undeclared identifier 'foo'\n    foo();\n    ^\nmain.c:15:12: warning: unused variable 'x' [-Wunused-variable]\n    int x = 42;\n        ^"
 
 [[tests.gcc]]
-name = "clean compilation"
+name = "clean compilation passes through as empty"
 input = """
 """
-expected = "gcc: ok"
+expected = ""
 
 [[tests.gcc]]
 name = "linker error kept"
@@ -44,6 +52,115 @@ collect2: error: ld returned 1 exit status
 expected = "/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'\ncollect2: error: ld returned 1 exit status"
 
 [[tests.gcc]]
-name = "empty input returns on_empty message"
+name = "empty input passes through (crash not masked as ok)"
 input = ""
-expected = "gcc: ok"
+expected = ""
+
+[[tests.gcc]]
+name = "overflow keeps trailing error line past max_lines"
+input = """
+main.c:1:5: warning: unused variable 'v1' [-Wunused-variable]
+main.c:2:5: warning: unused variable 'v2' [-Wunused-variable]
+main.c:3:5: warning: unused variable 'v3' [-Wunused-variable]
+main.c:4:5: warning: unused variable 'v4' [-Wunused-variable]
+main.c:5:5: warning: unused variable 'v5' [-Wunused-variable]
+main.c:6:5: warning: unused variable 'v6' [-Wunused-variable]
+main.c:7:5: warning: unused variable 'v7' [-Wunused-variable]
+main.c:8:5: warning: unused variable 'v8' [-Wunused-variable]
+main.c:9:5: warning: unused variable 'v9' [-Wunused-variable]
+main.c:10:5: warning: unused variable 'v10' [-Wunused-variable]
+main.c:11:5: warning: unused variable 'v11' [-Wunused-variable]
+main.c:12:5: warning: unused variable 'v12' [-Wunused-variable]
+main.c:13:5: warning: unused variable 'v13' [-Wunused-variable]
+main.c:14:5: warning: unused variable 'v14' [-Wunused-variable]
+main.c:15:5: warning: unused variable 'v15' [-Wunused-variable]
+main.c:16:5: warning: unused variable 'v16' [-Wunused-variable]
+main.c:17:5: warning: unused variable 'v17' [-Wunused-variable]
+main.c:18:5: warning: unused variable 'v18' [-Wunused-variable]
+main.c:19:5: warning: unused variable 'v19' [-Wunused-variable]
+main.c:20:5: warning: unused variable 'v20' [-Wunused-variable]
+main.c:21:5: warning: unused variable 'v21' [-Wunused-variable]
+main.c:22:5: warning: unused variable 'v22' [-Wunused-variable]
+main.c:23:5: warning: unused variable 'v23' [-Wunused-variable]
+main.c:24:5: warning: unused variable 'v24' [-Wunused-variable]
+main.c:25:5: warning: unused variable 'v25' [-Wunused-variable]
+main.c:26:5: warning: unused variable 'v26' [-Wunused-variable]
+main.c:27:5: warning: unused variable 'v27' [-Wunused-variable]
+main.c:28:5: warning: unused variable 'v28' [-Wunused-variable]
+main.c:29:5: warning: unused variable 'v29' [-Wunused-variable]
+main.c:30:5: warning: unused variable 'v30' [-Wunused-variable]
+main.c:31:5: warning: unused variable 'v31' [-Wunused-variable]
+main.c:32:5: warning: unused variable 'v32' [-Wunused-variable]
+main.c:33:5: warning: unused variable 'v33' [-Wunused-variable]
+main.c:34:5: warning: unused variable 'v34' [-Wunused-variable]
+main.c:35:5: warning: unused variable 'v35' [-Wunused-variable]
+main.c:36:5: warning: unused variable 'v36' [-Wunused-variable]
+main.c:37:5: warning: unused variable 'v37' [-Wunused-variable]
+main.c:38:5: warning: unused variable 'v38' [-Wunused-variable]
+main.c:39:5: warning: unused variable 'v39' [-Wunused-variable]
+main.c:40:5: warning: unused variable 'v40' [-Wunused-variable]
+main.c:41:5: warning: unused variable 'v41' [-Wunused-variable]
+main.c:42:5: warning: unused variable 'v42' [-Wunused-variable]
+main.c:43:5: warning: unused variable 'v43' [-Wunused-variable]
+main.c:44:5: warning: unused variable 'v44' [-Wunused-variable]
+main.c:45:5: warning: unused variable 'v45' [-Wunused-variable]
+main.c:46:5: warning: unused variable 'v46' [-Wunused-variable]
+main.c:47:5: warning: unused variable 'v47' [-Wunused-variable]
+main.c:48:5: warning: unused variable 'v48' [-Wunused-variable]
+main.c:49:5: warning: unused variable 'v49' [-Wunused-variable]
+main.c:50:5: warning: unused variable 'v50' [-Wunused-variable]
+main.c:51:5: warning: unused variable 'v51' [-Wunused-variable]
+main.c:99:1: error: expected ';' before '}' token
+"""
+expected = """
+... (3 lines omitted)
+main.c:4:5: warning: unused variable 'v4' [-Wunused-variable]
+main.c:5:5: warning: unused variable 'v5' [-Wunused-variable]
+main.c:6:5: warning: unused variable 'v6' [-Wunused-variable]
+main.c:7:5: warning: unused variable 'v7' [-Wunused-variable]
+main.c:8:5: warning: unused variable 'v8' [-Wunused-variable]
+main.c:9:5: warning: unused variable 'v9' [-Wunused-variable]
+main.c:10:5: warning: unused variable 'v10' [-Wunused-variable]
+main.c:11:5: warning: unused variable 'v11' [-Wunused-variable]
+main.c:12:5: warning: unused variable 'v12' [-Wunused-variable]
+main.c:13:5: warning: unused variable 'v13' [-Wunused-variable]
+main.c:14:5: warning: unused variable 'v14' [-Wunused-variable]
+main.c:15:5: warning: unused variable 'v15' [-Wunused-variable]
+main.c:16:5: warning: unused variable 'v16' [-Wunused-variable]
+main.c:17:5: warning: unused variable 'v17' [-Wunused-variable]
+main.c:18:5: warning: unused variable 'v18' [-Wunused-variable]
+main.c:19:5: warning: unused variable 'v19' [-Wunused-variable]
+main.c:20:5: warning: unused variable 'v20' [-Wunused-variable]
+main.c:21:5: warning: unused variable 'v21' [-Wunused-variable]
+main.c:22:5: warning: unused variable 'v22' [-Wunused-variable]
+main.c:23:5: warning: unused variable 'v23' [-Wunused-variable]
+main.c:24:5: warning: unused variable 'v24' [-Wunused-variable]
+main.c:25:5: warning: unused variable 'v25' [-Wunused-variable]
+main.c:26:5: warning: unused variable 'v26' [-Wunused-variable]
+main.c:27:5: warning: unused variable 'v27' [-Wunused-variable]
+main.c:28:5: warning: unused variable 'v28' [-Wunused-variable]
+main.c:29:5: warning: unused variable 'v29' [-Wunused-variable]
+main.c:30:5: warning: unused variable 'v30' [-Wunused-variable]
+main.c:31:5: warning: unused variable 'v31' [-Wunused-variable]
+main.c:32:5: warning: unused variable 'v32' [-Wunused-variable]
+main.c:33:5: warning: unused variable 'v33' [-Wunused-variable]
+main.c:34:5: warning: unused variable 'v34' [-Wunused-variable]
+main.c:35:5: warning: unused variable 'v35' [-Wunused-variable]
+main.c:36:5: warning: unused variable 'v36' [-Wunused-variable]
+main.c:37:5: warning: unused variable 'v37' [-Wunused-variable]
+main.c:38:5: warning: unused variable 'v38' [-Wunused-variable]
+main.c:39:5: warning: unused variable 'v39' [-Wunused-variable]
+main.c:40:5: warning: unused variable 'v40' [-Wunused-variable]
+main.c:41:5: warning: unused variable 'v41' [-Wunused-variable]
+main.c:42:5: warning: unused variable 'v42' [-Wunused-variable]
+main.c:43:5: warning: unused variable 'v43' [-Wunused-variable]
+main.c:44:5: warning: unused variable 'v44' [-Wunused-variable]
+main.c:45:5: warning: unused variable 'v45' [-Wunused-variable]
+main.c:46:5: warning: unused variable 'v46' [-Wunused-variable]
+main.c:47:5: warning: unused variable 'v47' [-Wunused-variable]
+main.c:48:5: warning: unused variable 'v48' [-Wunused-variable]
+main.c:49:5: warning: unused variable 'v49' [-Wunused-variable]
+main.c:50:5: warning: unused variable 'v50' [-Wunused-variable]
+main.c:51:5: warning: unused variable 'v51' [-Wunused-variable]
+main.c:99:1: error: expected ';' before '}' token
+"""

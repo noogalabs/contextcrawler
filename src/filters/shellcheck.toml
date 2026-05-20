@@ -5,6 +5,10 @@ strip_ansi = true
 strip_lines_matching = [
   "^\\s*$",
 ]
+# tail_lines runs before max_lines (stages 6 then 7). shellcheck has no summary
+# line, but reserving the tail keeps the last findings visible instead of
+# head-truncating to the first 50 on an overflowing run.
+tail_lines = 49
 max_lines = 50
 
 [[tests.shellcheck]]
@@ -25,3 +29,112 @@ expected = "In script.sh line 3:\nif [[ $1 == \"\" ]]\n     ^-- SC2236: Use -z i
 name = "empty input passes through"
 input = ""
 expected = ""
+
+[[tests.shellcheck]]
+name = "overflow keeps last findings past max_lines"
+input = """
+In script.sh line 1: SC2086: Double quote to prevent globbing.
+In script.sh line 2: SC2086: Double quote to prevent globbing.
+In script.sh line 3: SC2086: Double quote to prevent globbing.
+In script.sh line 4: SC2086: Double quote to prevent globbing.
+In script.sh line 5: SC2086: Double quote to prevent globbing.
+In script.sh line 6: SC2086: Double quote to prevent globbing.
+In script.sh line 7: SC2086: Double quote to prevent globbing.
+In script.sh line 8: SC2086: Double quote to prevent globbing.
+In script.sh line 9: SC2086: Double quote to prevent globbing.
+In script.sh line 10: SC2086: Double quote to prevent globbing.
+In script.sh line 11: SC2086: Double quote to prevent globbing.
+In script.sh line 12: SC2086: Double quote to prevent globbing.
+In script.sh line 13: SC2086: Double quote to prevent globbing.
+In script.sh line 14: SC2086: Double quote to prevent globbing.
+In script.sh line 15: SC2086: Double quote to prevent globbing.
+In script.sh line 16: SC2086: Double quote to prevent globbing.
+In script.sh line 17: SC2086: Double quote to prevent globbing.
+In script.sh line 18: SC2086: Double quote to prevent globbing.
+In script.sh line 19: SC2086: Double quote to prevent globbing.
+In script.sh line 20: SC2086: Double quote to prevent globbing.
+In script.sh line 21: SC2086: Double quote to prevent globbing.
+In script.sh line 22: SC2086: Double quote to prevent globbing.
+In script.sh line 23: SC2086: Double quote to prevent globbing.
+In script.sh line 24: SC2086: Double quote to prevent globbing.
+In script.sh line 25: SC2086: Double quote to prevent globbing.
+In script.sh line 26: SC2086: Double quote to prevent globbing.
+In script.sh line 27: SC2086: Double quote to prevent globbing.
+In script.sh line 28: SC2086: Double quote to prevent globbing.
+In script.sh line 29: SC2086: Double quote to prevent globbing.
+In script.sh line 30: SC2086: Double quote to prevent globbing.
+In script.sh line 31: SC2086: Double quote to prevent globbing.
+In script.sh line 32: SC2086: Double quote to prevent globbing.
+In script.sh line 33: SC2086: Double quote to prevent globbing.
+In script.sh line 34: SC2086: Double quote to prevent globbing.
+In script.sh line 35: SC2086: Double quote to prevent globbing.
+In script.sh line 36: SC2086: Double quote to prevent globbing.
+In script.sh line 37: SC2086: Double quote to prevent globbing.
+In script.sh line 38: SC2086: Double quote to prevent globbing.
+In script.sh line 39: SC2086: Double quote to prevent globbing.
+In script.sh line 40: SC2086: Double quote to prevent globbing.
+In script.sh line 41: SC2086: Double quote to prevent globbing.
+In script.sh line 42: SC2086: Double quote to prevent globbing.
+In script.sh line 43: SC2086: Double quote to prevent globbing.
+In script.sh line 44: SC2086: Double quote to prevent globbing.
+In script.sh line 45: SC2086: Double quote to prevent globbing.
+In script.sh line 46: SC2086: Double quote to prevent globbing.
+In script.sh line 47: SC2086: Double quote to prevent globbing.
+In script.sh line 48: SC2086: Double quote to prevent globbing.
+In script.sh line 49: SC2086: Double quote to prevent globbing.
+In script.sh line 50: SC2086: Double quote to prevent globbing.
+In script.sh line 51: SC2086: Double quote to prevent globbing.
+In script.sh line 52: SC2086: Double quote to prevent globbing.
+"""
+expected = """
+... (3 lines omitted)
+In script.sh line 4: SC2086: Double quote to prevent globbing.
+In script.sh line 5: SC2086: Double quote to prevent globbing.
+In script.sh line 6: SC2086: Double quote to prevent globbing.
+In script.sh line 7: SC2086: Double quote to prevent globbing.
+In script.sh line 8: SC2086: Double quote to prevent globbing.
+In script.sh line 9: SC2086: Double quote to prevent globbing.
+In script.sh line 10: SC2086: Double quote to prevent globbing.
+In script.sh line 11: SC2086: Double quote to prevent globbing.
+In script.sh line 12: SC2086: Double quote to prevent globbing.
+In script.sh line 13: SC2086: Double quote to prevent globbing.
+In script.sh line 14: SC2086: Double quote to prevent globbing.
+In script.sh line 15: SC2086: Double quote to prevent globbing.
+In script.sh line 16: SC2086: Double quote to prevent globbing.
+In script.sh line 17: SC2086: Double quote to prevent globbing.
+In script.sh line 18: SC2086: Double quote to prevent globbing.
+In script.sh line 19: SC2086: Double quote to prevent globbing.
+In script.sh line 20: SC2086: Double quote to prevent globbing.
+In script.sh line 21: SC2086: Double quote to prevent globbing.
+In script.sh line 22: SC2086: Double quote to prevent globbing.
+In script.sh line 23: SC2086: Double quote to prevent globbing.
+In script.sh line 24: SC2086: Double quote to prevent globbing.
+In script.sh line 25: SC2086: Double quote to prevent globbing.
+In script.sh line 26: SC2086: Double quote to prevent globbing.
+In script.sh line 27: SC2086: Double quote to prevent globbing.
+In script.sh line 28: SC2086: Double quote to prevent globbing.
+In script.sh line 29: SC2086: Double quote to prevent globbing.
+In script.sh line 30: SC2086: Double quote to prevent globbing.
+In script.sh line 31: SC2086: Double quote to prevent globbing.
+In script.sh line 32: SC2086: Double quote to prevent globbing.
+In script.sh line 33: SC2086: Double quote to prevent globbing.
+In script.sh line 34: SC2086: Double quote to prevent globbing.
+In script.sh line 35: SC2086: Double quote to prevent globbing.
+In script.sh line 36: SC2086: Double quote to prevent globbing.
+In script.sh line 37: SC2086: Double quote to prevent globbing.
+In script.sh line 38: SC2086: Double quote to prevent globbing.
+In script.sh line 39: SC2086: Double quote to prevent globbing.
+In script.sh line 40: SC2086: Double quote to prevent globbing.
+In script.sh line 41: SC2086: Double quote to prevent globbing.
+In script.sh line 42: SC2086: Double quote to prevent globbing.
+In script.sh line 43: SC2086: Double quote to prevent globbing.
+In script.sh line 44: SC2086: Double quote to prevent globbing.
+In script.sh line 45: SC2086: Double quote to prevent globbing.
+In script.sh line 46: SC2086: Double quote to prevent globbing.
+In script.sh line 47: SC2086: Double quote to prevent globbing.
+In script.sh line 48: SC2086: Double quote to prevent globbing.
+In script.sh line 49: SC2086: Double quote to prevent globbing.
+In script.sh line 50: SC2086: Double quote to prevent globbing.
+In script.sh line 51: SC2086: Double quote to prevent globbing.
+In script.sh line 52: SC2086: Double quote to prevent globbing.
+"""
