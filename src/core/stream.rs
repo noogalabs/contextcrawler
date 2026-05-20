@@ -220,6 +220,15 @@ pub struct StreamResult {
     pub raw_stdout: String,
     pub raw_stderr: String,
     pub filtered: String,
+    /// True if the in-memory `filtered` accumulator hit `FILTERED_CAP` and
+    /// subsequent filtered text was dropped. When set, `filtered` holds an
+    /// incomplete prefix and a visible `[contextcrawler: output truncated
+    /// at N bytes]` marker was emitted to the output sink (and appended to
+    /// `filtered` itself) so the agent/user knows the output is incomplete.
+    /// Part of the public `StreamResult` contract for callers parsing
+    /// `filtered`; consumed by tests today.
+    #[allow(dead_code)]
+    pub truncated_filtered: bool,
 }
 
 impl StreamResult {
@@ -246,10 +255,76 @@ pub fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
 // ISSUE #897: ChildGuard RAII prevents zombie processes that caused kernel panic
 pub const RAW_CAP: usize = 10_485_760; // 10 MiB
 
+/// Bound on the line-passing channel between the reader threads and the
+/// consumer loop. Without a bound, a child that floods stdout faster than the
+/// consumer can drain it grows the channel unboundedly (OOM). 4096 buffered
+/// lines is generous headroom while still capping memory.
+const STREAM_CHANNEL_CAP: usize = 4096;
+
+/// Cap on the in-memory `filtered` accumulator. The raw stdout/stderr buffers
+/// are already capped by `RAW_CAP`, but a pathological filter could expand its
+/// input; bound the filtered buffer independently so capture stays O(RAW_CAP).
+const FILTERED_CAP: usize = RAW_CAP;
+
+/// Bound on the sink channel feeding the dedicated writer thread. The writer
+/// thread drains filtered chunks to the real stdout/stderr. If the terminal
+/// wedges, the writer stalls and queued chunks accumulate here. An *unbounded*
+/// channel would grow without limit (OOM) while the child floods output — so
+/// the channel is bounded and the consumer uses `try_send`: a full channel
+/// means the chunk is dropped (and accounted), never blocked on. The child
+/// drain therefore never stalls on a wedged sink. 8192 buffered chunks is
+/// generous headroom for a transient terminal hiccup while capping memory.
+const SINK_CHANNEL_CAP: usize = 8192;
+
+/// Read a child stream line-by-line as raw bytes, yielding lossy-UTF-8 strings.
+///
+/// `BufRead::lines()` is strict UTF-8 and `.map_while(Result::ok)` silently
+/// stops at the first non-UTF-8 byte, truncating the rest of the child's
+/// output. Reading bytes and converting with `from_utf8_lossy` preserves every
+/// line (replacing invalid bytes with U+FFFD) instead of dropping output.
+fn for_each_line<R: Read>(reader: R, mut f: impl FnMut(String)) {
+    let mut buf = BufReader::new(reader);
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        bytes.clear();
+        match buf.read_until(b'\n', &mut bytes) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                // Trim a trailing \n (and \r) to match BufRead::lines() semantics.
+                if bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+                f(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 pub fn run_streaming(
     cmd: &mut Command,
     stdin_mode: StdinMode,
     stdout_mode: FilterMode<'_>,
+) -> Result<StreamResult> {
+    run_streaming_with_sink(cmd, stdin_mode, stdout_mode, None)
+}
+
+/// Optional override for the sink-writer thread's destinations: `(stdout-like,
+/// stderr-like)`. Production passes `None` (real stdout/stderr); tests inject a
+/// `Write` that can be wedged to exercise the bounded-sink drop-on-overflow
+/// path without hanging the test runner.
+type SinkOverride = Option<(Box<dyn Write + Send>, Box<dyn Write + Send>)>;
+
+/// Implementation of [`run_streaming`] with an injectable sink destination.
+/// See [`SinkOverride`]. All public callers go through `run_streaming`.
+fn run_streaming_with_sink(
+    cmd: &mut Command,
+    stdin_mode: StdinMode,
+    stdout_mode: FilterMode<'_>,
+    sink_override: SinkOverride,
 ) -> Result<StreamResult> {
     if matches!(stdout_mode, FilterMode::Passthrough) {
         match &stdin_mode {
@@ -269,6 +344,7 @@ pub fn run_streaming(
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         });
     }
 
@@ -328,6 +404,7 @@ pub fn run_streaming(
     let mut raw_stdout = String::new();
     let mut raw_stderr = String::new();
     let mut filtered = String::new();
+    let mut truncated_filtered = false;
     let mut capped_out = false;
     let mut capped_err = false;
     let mut saved_filter: Option<Box<dyn StreamFilter + '_>> = None;
@@ -339,30 +416,112 @@ pub fn run_streaming(
             Stderr(String),
         }
 
-        let (tx, rx) = mpsc::channel();
+        // Bounded channel: backpressure caps memory if the child outpaces us.
+        let (tx, rx) = mpsc::sync_channel(STREAM_CHANNEL_CAP);
         let tx_out = tx.clone();
         let stdout_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if tx_out.send(StreamLine::Stdout(line)).is_err() {
-                    break;
+            // Byte-line read + lossy UTF-8: never truncates on non-UTF-8 bytes.
+            let mut closed = false;
+            for_each_line(stdout, |line| {
+                if !closed && tx_out.send(StreamLine::Stdout(line)).is_err() {
+                    closed = true; // consumer gone — stop forwarding
                 }
-            }
+            });
         });
         let tx_err = tx;
         let stderr_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx_err.send(StreamLine::Stderr(line)).is_err() {
-                    break;
+            let mut closed = false;
+            for_each_line(stderr, |line| {
+                if !closed && tx_err.send(StreamLine::Stderr(line)).is_err() {
+                    closed = true;
                 }
-            }
+            });
         });
 
-        if let FilterMode::Streaming(mut filter) = stdout_mode {
-            let stdout_handle = io::stdout();
-            let mut out = stdout_handle.lock();
-            let stderr_handle = io::stderr();
-            let mut err_out = stderr_handle.lock();
+        // Sink message: a chunk of filtered text destined for stdout/stderr.
+        enum SinkMsg {
+            Out(String),
+            Err(String),
+        }
 
+        // Decouple draining from sink writes. The consumer loop below drains
+        // the bounded child channel (`rx`) AND must never block on a slow
+        // terminal — if it did, the reader threads would fill `rx` and the
+        // child's own writes would stall. Sink writes are handed to a
+        // dedicated writer thread over a *bounded* channel: the consumer
+        // always makes progress draining the child, and back-pressure from a
+        // wedged terminal is absorbed here — but only up to SINK_CHANNEL_CAP
+        // chunks. An unbounded channel would let a wedged sink grow memory
+        // without limit (OOM) while the child floods output. Past the cap the
+        // consumer DROPS the chunk (via `try_send`) and accounts the bytes;
+        // it never blocks. The terminal output is lost in that scenario, but
+        // it was un-writable anyway, and the child drain is never stalled.
+        let (sink_tx, sink_rx) = mpsc::sync_channel::<SinkMsg>(SINK_CHANNEL_CAP);
+        let sink_thread = std::thread::spawn(move || {
+            // Either the real stdout/stderr locks, or test-injected sinks.
+            let stdout_handle = io::stdout();
+            let stderr_handle = io::stderr();
+            let (mut out, mut err_out): (Box<dyn Write>, Box<dyn Write>) = match sink_override {
+                Some((o, e)) => (o, e),
+                None => (
+                    Box::new(stdout_handle.lock()),
+                    Box::new(stderr_handle.lock()),
+                ),
+            };
+            for msg in sink_rx {
+                let (text, dest): (String, &mut dyn Write) = match msg {
+                    SinkMsg::Out(t) => (t, &mut *out),
+                    SinkMsg::Err(t) => (t, &mut *err_out),
+                };
+                // Broken pipe / IO error on the sink: stop writing but keep
+                // draining the channel so senders never block. The child
+                // drain is unaffected.
+                let _ = write!(dest, "{}", text);
+            }
+            let _ = out.flush();
+            let _ = err_out.flush();
+        });
+
+        // Drop-on-overflow accounting for the bounded sink channel. When the
+        // sink writer wedges and the channel fills, chunks are dropped here
+        // instead of blocking the child drain. `dropped_bytes` totals what was
+        // lost so one summary marker can be emitted at the end.
+        let mut dropped_bytes: usize = 0;
+        let mut dropped = false;
+        let mut sink_gone = false;
+
+        // Hand a SinkMsg to the writer thread without EVER blocking the child
+        // drain: `try_send` only. `Full` → drop the chunk + account its bytes;
+        // `Disconnected` → writer is gone, stop trying. The child drain in the
+        // loop below proceeds regardless — this is the invariant that keeps
+        // the deadlock fix from re-introducing a stall (and the bounded
+        // channel keeps it from OOMing).
+        let sink_send = |tx: &mpsc::SyncSender<SinkMsg>,
+                         msg: SinkMsg,
+                         dropped_bytes: &mut usize,
+                         dropped: &mut bool,
+                         sink_gone: &mut bool| {
+            let len = |m: &SinkMsg| match m {
+                SinkMsg::Out(t) | SinkMsg::Err(t) => t.len(),
+            };
+            if *sink_gone {
+                *dropped_bytes += len(&msg);
+                *dropped = true;
+                return;
+            }
+            match tx.try_send(msg) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(m)) => {
+                    *dropped_bytes += len(&m);
+                    *dropped = true;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    *sink_gone = true;
+                }
+            }
+        };
+
+        if let FilterMode::Streaming(mut filter) = stdout_mode {
             for msg in rx {
                 let (line, is_stderr) = match msg {
                     StreamLine::Stderr(l) => (l, true),
@@ -388,30 +547,131 @@ pub fn run_streaming(
                     }
                 }
                 filter_fd_is_stderr = is_stderr;
-                if let Some(output) = filter.feed_line(&line) {
-                    filtered.push_str(&output);
-                    let dest: &mut dyn Write = if is_stderr { &mut err_out } else { &mut out };
-                    match write!(dest, "{}", output) {
-                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-                        Err(e) => return Err(e.into()),
-                        Ok(_) => {}
+                // Strip ANSI before feeding the filter: go/gradle filter
+                // predicates match plain text, so coloured failure markers
+                // (e.g. red "FAIL") would otherwise evade compaction. The raw
+                // line is still preserved verbatim in raw_stdout/raw_stderr.
+                let clean = crate::core::utils::strip_ansi(&line);
+                if let Some(output) = filter.feed_line(&clean) {
+                    if filtered.len() < FILTERED_CAP {
+                        filtered.push_str(&output);
+                    } else if !truncated_filtered {
+                        truncated_filtered = true;
+                        let marker = format!(
+                            "\n[contextcrawler: output truncated at {} bytes]\n",
+                            FILTERED_CAP
+                        );
+                        filtered.push_str(&marker);
+                        // Surface the marker on the same fd the filter is
+                        // writing to. Sink send cannot block the drain.
+                        let mm = if is_stderr {
+                            SinkMsg::Err(marker)
+                        } else {
+                            SinkMsg::Out(marker)
+                        };
+                        sink_send(
+                            &sink_tx,
+                            mm,
+                            &mut dropped_bytes,
+                            &mut dropped,
+                            &mut sink_gone,
+                        );
                     }
+                    let m = if is_stderr {
+                        SinkMsg::Err(output)
+                    } else {
+                        SinkMsg::Out(output)
+                    };
+                    // Bounded `try_send` to the writer thread: never blocks
+                    // the child drain even if the terminal is wedged. A full
+                    // channel drops the chunk (accounted in `dropped_bytes`)
+                    // rather than stalling — the drain keeps going.
+                    sink_send(
+                        &sink_tx,
+                        m,
+                        &mut dropped_bytes,
+                        &mut dropped,
+                        &mut sink_gone,
+                    );
                 }
             }
             let tail = filter.flush();
-            filtered.push_str(&tail);
-            let flush_dest: &mut dyn Write = if filter_fd_is_stderr {
-                &mut err_out
-            } else {
-                &mut out
-            };
-            match write!(flush_dest, "{}", tail) {
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-                Err(e) => return Err(e.into()),
-                Ok(_) => {}
+            if filtered.len() < FILTERED_CAP {
+                filtered.push_str(&tail);
+            } else if !truncated_filtered && !tail.is_empty() {
+                truncated_filtered = true;
+                let marker = format!(
+                    "\n[contextcrawler: output truncated at {} bytes]\n",
+                    FILTERED_CAP
+                );
+                filtered.push_str(&marker);
+                let mm = if filter_fd_is_stderr {
+                    SinkMsg::Err(marker)
+                } else {
+                    SinkMsg::Out(marker)
+                };
+                sink_send(
+                    &sink_tx,
+                    mm,
+                    &mut dropped_bytes,
+                    &mut dropped,
+                    &mut sink_gone,
+                );
             }
+            let tail_msg = if filter_fd_is_stderr {
+                SinkMsg::Err(tail)
+            } else {
+                SinkMsg::Out(tail)
+            };
+            sink_send(
+                &sink_tx,
+                tail_msg,
+                &mut dropped_bytes,
+                &mut dropped,
+                &mut sink_gone,
+            );
             saved_filter = Some(filter);
         }
+
+        // If the sink wedged and chunks were dropped, emit ONE summary marker
+        // — both into the `filtered` accumulator (so the captured output
+        // records the loss) and, best-effort, to the sink itself. This
+        // mirrors the `truncated_filtered` marker pattern above.
+        if dropped {
+            let marker = format!(
+                "\n[contextcrawler: {} bytes dropped — output sink stalled]\n",
+                dropped_bytes
+            );
+            // Append unconditionally — do NOT gate on FILTERED_CAP. The cap is
+            // a soft guard against unbounded accumulator growth; this is a
+            // fixed ~60-byte end-of-stream diagnostic. Gating it meant a user
+            // whose output BOTH filled the accumulator AND hit sink drops saw
+            // no notice of the loss at all. A tiny fixed trailing overrun is
+            // harmless; silently swallowing the drop notice is not. The
+            // `truncated_filtered` markers above already append unconditionally
+            // once over cap, so both end-of-stream markers stay visible even
+            // when truncation and drop fire together.
+            filtered.push_str(&marker);
+            let mm = if filter_fd_is_stderr {
+                SinkMsg::Err(marker)
+            } else {
+                SinkMsg::Out(marker)
+            };
+            // One final best-effort attempt; if the channel is still full or
+            // the writer is gone this is simply dropped too.
+            sink_send(
+                &sink_tx,
+                mm,
+                &mut dropped_bytes,
+                &mut dropped,
+                &mut sink_gone,
+            );
+        }
+
+        // Drop our sender so the writer thread sees the channel close and
+        // exits once it has flushed every queued chunk.
+        drop(sink_tx);
+        sink_thread.join().ok();
 
         stdout_thread.join().ok();
         stderr_thread.join().ok();
@@ -419,14 +679,15 @@ pub fn run_streaming(
         let stderr_thread = std::thread::spawn(move || -> String {
             let mut raw_err = String::new();
             let mut capped = false;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            // Byte-line read + lossy UTF-8: never truncates on non-UTF-8 bytes.
+            for_each_line(stderr, |line| {
                 if raw_err.len() + line.len() < RAW_CAP {
                     raw_err.push_str(&line);
                     raw_err.push('\n');
                 } else if !capped {
                     capped = true;
                 }
-            }
+            });
             raw_err
         });
 
@@ -438,7 +699,7 @@ pub fn run_streaming(
                 FilterMode::Passthrough => unreachable!("handled by early-return above"),
                 FilterMode::Streaming(_) => unreachable!("handled by is_streaming branch"),
                 FilterMode::Buffered(filter_fn) => {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for_each_line(stdout, |line| {
                         if raw_stdout.len() + line.len() < RAW_CAP {
                             raw_stdout.push_str(&line);
                             raw_stdout.push('\n');
@@ -448,7 +709,7 @@ pub fn run_streaming(
                                 "[contextcrawler] warning: output exceeds 10 MiB — filter input truncated"
                             );
                         }
-                    }
+                    });
                     filtered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         filter_fn(&raw_stdout)
                     }))
@@ -463,7 +724,7 @@ pub fn run_streaming(
                     }
                 }
                 FilterMode::CaptureOnly => {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for_each_line(stdout, |line| {
                         if raw_stdout.len() + line.len() < RAW_CAP {
                             raw_stdout.push_str(&line);
                             raw_stdout.push('\n');
@@ -473,7 +734,7 @@ pub fn run_streaming(
                                 "[contextcrawler] warning: output exceeds 10 MiB — filter input truncated"
                             );
                         }
-                    }
+                    });
                     filtered = raw_stdout.clone();
                 }
             }
@@ -495,6 +756,15 @@ pub fn run_streaming(
     if let Some(mut f) = saved_filter {
         if let Some(post) = f.on_exit(exit_code, &raw) {
             filtered.push_str(&post);
+            // `post` is written directly to stdout/stderr rather than routed
+            // through the sink channel. This is safe and race-free: the
+            // sink-writer thread was already joined above (`sink_thread.join`),
+            // so there is no concurrent writer to the same fd. Routing it
+            // through the channel would mean resurrecting the joined writer,
+            // which buys nothing here. A wedged terminal can still block this
+            // one trailing write, but the child has already exited by now —
+            // there is no drain left to stall, so the OOM/deadlock concern
+            // that motivated the bounded sink channel does not apply.
             let mut dest: Box<dyn Write> = if filter_fd_is_stderr {
                 Box::new(io::stderr().lock())
             } else {
@@ -514,6 +784,7 @@ pub fn run_streaming(
         raw_stdout,
         raw_stderr,
         filtered,
+        truncated_filtered,
     })
 }
 
@@ -790,6 +1061,7 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         };
         assert!(r.success());
     }
@@ -802,6 +1074,7 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         };
         assert!(!r.success());
     }
@@ -814,6 +1087,7 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         };
         assert!(!r.success());
     }
@@ -1584,5 +1858,396 @@ pub(crate) mod tests {
         let (buf3, truncated3) = drain_with_cap(Cursor::new(&input[..]), 99);
         assert_eq!(buf3, input);
         assert!(!truncated3, "cap above input size, not truncated");
+    }
+
+    #[test]
+    fn test_for_each_line_splits_lines() {
+        let input = b"alpha\nbeta\ngamma\n";
+        let mut got = Vec::new();
+        for_each_line(io::Cursor::new(&input[..]), |l| got.push(l));
+        assert_eq!(got, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_for_each_line_handles_no_trailing_newline() {
+        let input = b"only-line";
+        let mut got = Vec::new();
+        for_each_line(io::Cursor::new(&input[..]), |l| got.push(l));
+        assert_eq!(got, vec!["only-line"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Codex-review follow-up (G3 / #100): stream-path deadlock decoupling
+    // and FILTERED_CAP truncation marker.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_filtered_cap_sets_truncation_flag_and_marker() {
+        // Drive a streaming filter whose output exceeds FILTERED_CAP. The
+        // filter expands each input line; the child only needs to emit
+        // enough lines for the accumulator to trip the cap.
+        //
+        // Each input line is expanded to a ~64 KiB output chunk, so ~200
+        // lines clears the 10 MiB FILTERED_CAP without the child itself
+        // producing 10 MiB (keeps raw_stdout under RAW_CAP).
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 200); do echo x; done"]);
+        let chunk = "A".repeat(64 * 1024);
+        let filter = LineFilter::new(move |_l| Some(format!("{}\n", chunk)));
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+        assert!(
+            result.truncated_filtered,
+            "filtered accumulator exceeded FILTERED_CAP, flag must be set"
+        );
+        assert!(
+            result.filtered.contains("[contextcrawler: output truncated at"),
+            "filtered buffer must carry the visible truncation marker"
+        );
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn test_filtered_cap_flag_clear_for_small_output() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("hello\nworld\n");
+        let filter = LineFilter::new(|l| Some(format!("{}\n", l)));
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+        assert!(
+            !result.truncated_filtered,
+            "small output is well under FILTERED_CAP"
+        );
+        assert!(!result.filtered.contains("output truncated"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_slow_sink_does_not_deadlock_child_drain() {
+        // Regression for the sync_channel(4096) deadlock: the consumer loop
+        // drains the bounded child channel AND used to write to the sink
+        // inline. A slow/blocked terminal would stall the consumer, fill the
+        // child channel, and back-pressure the child itself.
+        //
+        // The structural guarantee under test: the child drain runs to
+        // completion and the call returns even when the child floods stdout
+        // far past STREAM_CHANNEL_CAP (4096 lines) faster than a real
+        // terminal could consume. The sink writer thread absorbs sink
+        // back-pressure off the drain path. A deadlock here would hang the
+        // test runner.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 50000); do echo line $i; done"]);
+        let filter = LineFilter::new(|l| Some(format!("{}\n", l)));
+        let start = std::time::Instant::now();
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        // 50k lines >> 4096 channel cap. If the drain were coupled to a
+        // stalled sink this would deadlock; instead it completes promptly.
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.raw_stdout.contains("line 50000"),
+            "child must fully drain — last line present"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "drain must not stall, took {:?}",
+            elapsed
+        );
+    }
+
+    /// A `Write` sink that BLOCKS on every write until a shared gate is
+    /// opened. This models a terminal whose reader has stalled (a paused
+    /// pager, or a pipe whose far end is not reading). It counts writes/bytes
+    /// it has accepted so a test can prove the bounded sink channel — not the
+    /// writer — absorbed the back-pressure while wedged.
+    struct WedgedSink {
+        bytes_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        writes_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for WedgedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // Block until the test opens the gate. While wedged, the
+            // sink-writer thread is parked here and cannot drain the channel.
+            let (lock, cvar) = &*self.gate;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cvar.wait(open).unwrap();
+            }
+            drop(open);
+            self.bytes_seen
+                .fetch_add(buf.len(), std::sync::atomic::Ordering::SeqCst);
+            self.writes_seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_wedged_sink_bounds_memory_and_drops_with_marker() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Fourth-pass regression (Codex re-review): the deadlock fix added a
+        // dedicated sink-writer thread fed by an UNBOUNDED channel. If the
+        // sink wedges while the child floods output, that channel grows
+        // without limit → OOM. The fix bounds the channel (SINK_CHANNEL_CAP)
+        // and the consumer uses `try_send`: a full channel DROPS the chunk
+        // (accounted) instead of blocking the child drain.
+        //
+        // This test ACTUALLY wedges the sink — `WedgedSink::write` blocks on
+        // a condvar gate that stays shut for the whole child run — and
+        // asserts:
+        //   (a) the child drain still completes — last line present, no hang;
+        //   (b) memory is bounded — while wedged the writer accepted at most
+        //       ONE chunk, so peak buffered output is the bounded channel
+        //       (≤ SINK_CHANNEL_CAP chunks) plus that one in-flight chunk,
+        //       NOT the whole 50k-chunk flood;
+        //   (c) dropped_bytes > 0 and the dropped-output marker is emitted.
+        //
+        // A pure high-volume test (above) does not prove (b)/(c): with a
+        // fast real sink nothing is ever dropped. The gate is opened by a
+        // watchdog thread AFTER the wedged window, so the sink-writer thread
+        // can finally drain its (bounded) backlog and `run_streaming` returns.
+        let bytes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        // Snapshot of `writes_seen` taken by the watchdog at the instant it
+        // opens the gate — i.e. the count accumulated DURING the wedged
+        // window, before the writer drains its backlog.
+        let writes_while_wedged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let out_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+        let err_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+
+        // Watchdog: keep the sink wedged for a window long enough for the
+        // child to flood and the bounded channel to overflow, then snapshot
+        // the wedged-window write count and open the gate so the run can
+        // finish. This proves the child drain never depended on the sink.
+        let wd_gate = gate.clone();
+        let wd_writes_seen = writes_seen.clone();
+        let wd_snapshot = writes_while_wedged.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            wd_snapshot.store(wd_writes_seen.load(SeqCst), SeqCst);
+            let (lock, cvar) = &*wd_gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+
+        // Child floods 20k lines, each expanded to a 200-byte chunk by the
+        // filter. 20k >> SINK_CHANNEL_CAP (8192), so once the wedged writer
+        // parks and the channel fills, every further chunk must be dropped.
+        // Total filtered output (~4 MiB) stays under FILTERED_CAP (10 MiB) so
+        // the dropped-output marker is not itself elided by FILTERED_CAP —
+        // this isolates the sink-overflow path from the accumulator-cap path.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 20000); do echo line $i; done"]);
+        let chunk = "Z".repeat(200);
+        let filter = LineFilter::new(move |l| Some(format!("{} {}\n", l, chunk)));
+
+        let start = std::time::Instant::now();
+        let result = run_streaming_with_sink(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+            Some((Box::new(out_sink), Box::new(err_sink))),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        watchdog.join().ok();
+
+        // (a) child drain completed despite the wedged sink.
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.raw_stdout.contains("line 20000"),
+            "child must fully drain even though the sink was wedged"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "wedged sink must not deadlock the child drain, took {:?}",
+            elapsed
+        );
+
+        // (b) memory bounded: while wedged the writer parked on its first
+        // write, so it pulled at most one chunk off the channel. Peak
+        // buffered output is therefore the bounded channel (≤
+        // SINK_CHANNEL_CAP) plus that single in-flight chunk — never the full
+        // flood. With an unbounded channel the consumer would have queued all
+        // ~50k chunks instead.
+        let writes_wedged = writes_while_wedged.load(SeqCst);
+        assert!(
+            writes_wedged <= 1,
+            "while wedged the writer must accept at most one chunk, saw {}",
+            writes_wedged
+        );
+
+        // (c) the overflow was detected: dropped chunks accounted, and ONE
+        // summary marker emitted into the filtered accumulator.
+        assert!(
+            result
+                .filtered
+                .contains("bytes dropped — output sink stalled"),
+            "dropped-output marker must be emitted when the sink wedges, filtered tail: {}",
+            &result.filtered[result.filtered.len().saturating_sub(200)..]
+        );
+        let marker_has_bytes = result
+            .filtered
+            .lines()
+            .any(|ln| ln.contains("bytes dropped") && !ln.contains("[contextcrawler: 0 bytes"));
+        assert!(
+            marker_has_bytes,
+            "dropped-output marker must report a non-zero byte count, got: {}",
+            result
+                .filtered
+                .lines()
+                .filter(|l| l.contains("dropped"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        // Exactly ONE marker — not one per dropped chunk.
+        assert_eq!(
+            result
+                .filtered
+                .matches("bytes dropped — output sink stalled")
+                .count(),
+            1,
+            "exactly one dropped-output summary marker expected"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_dropped_marker_survives_full_filtered_accumulator() {
+        // Fifth-pass regression (Codex re-review): the dropped-output summary
+        // marker used to be appended only `if filtered.len() + marker.len() <=
+        // FILTERED_CAP`. A user whose output BOTH filled the 10 MiB
+        // accumulator AND hit sink drops would therefore see no notice of the
+        // loss at all — the marker was silently elided.
+        //
+        // This test wedges the sink AND drives the filtered accumulator past
+        // FILTERED_CAP at the same time, then asserts the dropped-output
+        // marker IS present in the returned `filtered` and that the
+        // truncation marker is also visible — neither end-of-stream marker
+        // may be lost when both conditions fire together.
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let bytes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let out_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+        let err_sink = WedgedSink {
+            bytes_seen: bytes_seen.clone(),
+            writes_seen: writes_seen.clone(),
+            gate: gate.clone(),
+        };
+
+        // Watchdog opens the gate after the wedged window so the run finishes.
+        let wd_gate = gate.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let (lock, cvar) = &*wd_gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+
+        // Child emits 14000 lines; the filter expands each to a ~1 KiB chunk.
+        // Two caps must both trip:
+        //   - the filtered accumulator fills after ~10 MiB ≈ 10500 chunks, so
+        //     `truncated_filtered` fires and the truncation marker is emitted;
+        //   - the sink is wedged for the whole run, so once the bounded sink
+        //     channel (SINK_CHANNEL_CAP = 8192) fills, every further chunk is
+        //     dropped → `dropped` is set and the dropped-output marker fires.
+        // 14000 > both thresholds, so both end-of-stream markers must reach
+        // the returned `filtered` even though it is at FILTERED_CAP.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 14000); do echo x; done"]);
+        let chunk = "A".repeat(1024);
+        let filter = LineFilter::new(move |_l| Some(format!("{}\n", chunk)));
+
+        let result = run_streaming_with_sink(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+            Some((Box::new(out_sink), Box::new(err_sink))),
+        )
+        .unwrap();
+        watchdog.join().ok();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.truncated_filtered,
+            "filtered accumulator must have hit FILTERED_CAP"
+        );
+        // The accumulator is full — within a marker's length of the cap — yet
+        // the dropped-output marker must STILL be present.
+        assert!(
+            result.filtered.len() >= FILTERED_CAP,
+            "filtered accumulator must be at the cap, len = {}",
+            result.filtered.len()
+        );
+        assert!(
+            result
+                .filtered
+                .contains("bytes dropped — output sink stalled"),
+            "dropped-output marker must survive a full accumulator, filtered tail: {}",
+            &result.filtered[result.filtered.len().saturating_sub(300)..]
+        );
+        assert!(
+            result.filtered.contains("[contextcrawler: output truncated at"),
+            "truncation marker must also be visible when both conditions fire"
+        );
+    }
+
+    #[test]
+    fn test_for_each_line_preserves_non_utf8_lines() {
+        // G3 finding 5: BufRead::lines() + map_while(Result::ok) silently
+        // truncates child output at the first non-UTF-8 byte. for_each_line
+        // does a lossy conversion, so every line survives (invalid byte 0xFF
+        // becomes U+FFFD) and lines *after* it are not dropped.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"before\n");
+        input.extend_from_slice(&[0xFF, b'\n']); // invalid UTF-8 line
+        input.extend_from_slice(b"after\n");
+        let mut got = Vec::new();
+        for_each_line(io::Cursor::new(input), |l| got.push(l));
+        assert_eq!(got.len(), 3, "no lines dropped at the non-UTF-8 byte");
+        assert_eq!(got[0], "before");
+        assert_eq!(got[2], "after", "line after invalid byte must survive");
+        assert!(got[1].contains('\u{FFFD}'), "invalid byte became U+FFFD");
     }
 }

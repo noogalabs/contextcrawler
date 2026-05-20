@@ -17,7 +17,19 @@ const PING_INTERVAL_SECS: u64 = 23 * 3600; // 23 hours
 
 /// Send a telemetry ping if enabled and not already sent today.
 /// Fire-and-forget: errors are silently ignored.
+///
+/// NETWORK TELEMETRY DISABLED BY PROJECT DECISION.
+/// This function returns immediately and never opens a network socket. The
+/// rest of the module (consent checks, `send_ping`, erasure paths) is kept
+/// intentionally dead so this change is small and trivially reversible — to
+/// re-enable, delete the early return below. Local SQLite tracking
+/// (`history.db`) is unaffected and remains fully functional.
+#[allow(unreachable_code, unused_variables)]
 pub fn maybe_ping() {
+    // Hard kill-switch: no network phone-home, regardless of build-time URL,
+    // config, or consent state.
+    return;
+
     // No URL compiled in → telemetry disabled
     if TELEMETRY_URL.is_none() {
         return;
@@ -446,6 +458,24 @@ fn touch_marker(path: &PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_maybe_ping_is_a_noop_no_network() {
+        // G3 / user decision: network telemetry is disabled. `maybe_ping()`
+        // must return before it touches the marker file or spawns the send
+        // thread — the marker is written immediately before `send_ping` runs,
+        // so an unchanged marker proves no network code path was reached.
+        let marker = telemetry_marker_path();
+        let before = std::fs::metadata(&marker).and_then(|m| m.modified()).ok();
+
+        maybe_ping();
+
+        let after = std::fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        assert_eq!(
+            before, after,
+            "maybe_ping() must not touch the telemetry marker — it is a no-op"
+        );
+    }
 
     #[test]
     fn test_device_hash_is_stable() {

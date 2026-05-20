@@ -364,6 +364,13 @@ fn compile_filter(name: String, def: TomlFilterDef) -> Result<CompiledFilter, St
         return Err("strip_lines_matching and keep_lines_matching are mutually exclusive".into());
     }
 
+    // Reject max_lines = 0 at parse time. A zero cap is meaningless (it would
+    // discard all output) and downstream arithmetic such as `max_lines - 1`
+    // would underflow.
+    if def.max_lines == Some(0) {
+        return Err("max_lines must be greater than 0".into());
+    }
+
     let match_regex = Regex::new(&def.match_command)
         .map_err(|e| format!("invalid match_command regex: {}", e))?;
 
@@ -489,6 +496,12 @@ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
             .collect();
     }
 
+    // Snapshot the pre-replace output. `match_output`/`unless` guards must
+    // evaluate against the RAW (post-ansi-strip) text — a `replace` rule that
+    // scrubs error markers would otherwise let an `unless` guard see clean
+    // text and short-circuit a genuine failure to "ok".
+    let pre_replace_blob = lines.join("\n");
+
     // 2. replace — line-by-line, rules chained sequentially
     if !filter.replace.is_empty() {
         lines = lines
@@ -507,12 +520,14 @@ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
 
     // 3. match_output — short-circuit on full blob match (first rule wins)
     //    If `unless` is set and also matches the blob, the rule is skipped.
+    //    Evaluated against the pre-replace snapshot so `replace` rules cannot
+    //    mask error markers that the `unless` guard depends on.
     if !filter.match_output.is_empty() {
-        let blob = lines.join("\n");
+        let blob = &pre_replace_blob;
         for rule in &filter.match_output {
-            if rule.pattern.is_match(&blob) {
+            if rule.pattern.is_match(blob) {
                 if let Some(ref unless_re) = rule.unless {
-                    if unless_re.is_match(&blob) {
+                    if unless_re.is_match(blob) {
                         continue; // errors/warnings present — skip this rule
                     }
                 }
@@ -539,7 +554,8 @@ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
     // 6. head + tail
     let total = lines.len();
     if let (Some(head), Some(tail)) = (filter.head_lines, filter.tail_lines) {
-        if total > head + tail {
+        // saturating_add: head/tail are config-reachable and could overflow.
+        if total > head.saturating_add(tail) {
             let mut result = lines[..head].to_vec();
             result.push(format!("... ({} lines omitted)", total - head - tail));
             result.extend_from_slice(&lines[total - tail..]);
@@ -1361,6 +1377,53 @@ match_output = [
         let input = "file.txt\ntotal size is 98765  speedup is 77.31\n";
         let out = apply_filter(&f, input);
         assert_eq!(out.trim(), "ok (synced)");
+    }
+
+    #[test]
+    fn test_match_output_unless_evaluated_before_replace_scrub() {
+        // G3 finding 1: a `replace` rule that scrubs error markers must NOT
+        // let an `unless` guard see clean text. match_output/unless evaluates
+        // against the pre-replace snapshot, so a genuine failure is preserved.
+        let f = first_filter(
+            r#"
+schema_version = 1
+[filters.f]
+match_command = "^cmd"
+replace = [
+  { pattern = "error", replacement = "" },
+]
+match_output = [
+  { pattern = "total size is", message = "ok (synced)", unless = "error|failed" },
+]
+"#,
+        );
+        let input = "rsync: error in transfer\ntotal size is 1000\n";
+        let out = apply_filter(&f, input);
+        // Pre-fix, `replace` strips "error" before match_output runs, the
+        // `unless` guard sees clean text and short-circuits to "ok (synced)".
+        assert_ne!(
+            out.trim(),
+            "ok (synced)",
+            "replace must not be able to mask error markers from the unless guard"
+        );
+    }
+
+    #[test]
+    fn test_max_lines_zero_rejected_at_parse() {
+        // G3 finding 2: max_lines = 0 is meaningless and underflows downstream
+        // arithmetic — it must be rejected when the filter config is compiled.
+        let result = make_filters(
+            r#"
+schema_version = 1
+[filters.f]
+match_command = "^cmd"
+max_lines = 0
+"#,
+        );
+        assert!(
+            result.is_empty(),
+            "max_lines = 0 must be rejected at config parse time"
+        );
     }
 
     #[test]

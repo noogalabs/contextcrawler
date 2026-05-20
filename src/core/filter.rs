@@ -330,6 +330,10 @@ pub fn smart_truncate(content: &str, max_lines: usize, _lang: &Language) -> Stri
         return content.to_string();
     }
 
+    // Clamp to a minimum of 1: max_lines is config/CLI-reachable and a value
+    // of 0 would underflow `max_lines - 1` below.
+    let max_lines = max_lines.max(1);
+
     let mut result = Vec::with_capacity(max_lines + 1);
     let mut kept_lines = 0;
 

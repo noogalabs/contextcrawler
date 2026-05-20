@@ -201,16 +201,10 @@ impl PeriodStats for WeekStats {
     }
 
     fn period(&self) -> String {
-        let start = if self.week_start.len() > 5 {
-            &self.week_start[5..]
-        } else {
-            &self.week_start
-        };
-        let end = if self.week_end.len() > 5 {
-            &self.week_end[5..]
-        } else {
-            &self.week_end
-        };
+        // .get(5..) is char-boundary-safe: a plain `[5..]` slice panics if the
+        // date string is malformed (short, or a non-char-boundary at byte 5).
+        let start = self.week_start.get(5..).unwrap_or(self.week_start.as_str());
+        let end = self.week_end.get(5..).unwrap_or(self.week_end.as_str());
         format!("{} → {}", start, end)
     }
 
@@ -344,6 +338,25 @@ mod tests {
         assert_eq!(week.avg_time_ms(), 100);
         assert_eq!(WeekStats::icon(), "W");
         assert_eq!(WeekStats::label(), "Weekly");
+    }
+
+    #[test]
+    fn test_week_stats_period_malformed_dates_no_panic() {
+        // G3 finding 8: a plain `[5..]` slice panics on a short date string or
+        // a non-char-boundary at byte 5. `.get(5..)` must fall back gracefully.
+        let week = WeekStats {
+            week_start: "ab".to_string(), // shorter than 5 bytes
+            week_end: "日本".to_string(),  // byte 5 is mid-character
+            commands: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            saved_tokens: 0,
+            savings_pct: 0.0,
+            total_time_ms: 0,
+            avg_time_ms: 0,
+        };
+        // Must not panic; falls back to the whole string when slice is invalid.
+        assert_eq!(week.period(), "ab → 日本");
     }
 
     #[test]
