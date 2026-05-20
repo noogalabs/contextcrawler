@@ -2,8 +2,10 @@
 description = "Compact OpenTofu validate output"
 match_command = "^tofu\\s+validate(\\s|$)"
 strip_ansi = true
+# `unless` keeps real failures from being swallowed — OpenTofu emits "Error:"
+# and "Warning:" diagnostic blocks that must never collapse to "ok (valid)".
 match_output = [
-  { pattern = "Success! The configuration is valid", message = "ok (valid)" },
+  { pattern = "Success! The configuration is valid", message = "ok (valid)", unless = "(?i)\\berror[: ]|\\bwarning[: ]|\\bfailed\\b|\\bfatal\\b" },
 ]
 
 [[tests.tofu-validate]]
@@ -15,3 +17,8 @@ expected = "ok (valid)"
 name = "error passes through unchanged"
 input = "Error: Invalid resource type\n  on main.tf line 3: resource \"aws_instancee\" \"web\""
 expected = "Error: Invalid resource type\n  on main.tf line 3: resource \"aws_instancee\" \"web\""
+
+[[tests.tofu-validate]]
+name = "warning not swallowed despite success line"
+input = "Warning: Deprecated attribute\n  on main.tf line 5\nSuccess! The configuration is valid, but there were some validation warnings."
+expected = "Warning: Deprecated attribute\n  on main.tf line 5\nSuccess! The configuration is valid, but there were some validation warnings."

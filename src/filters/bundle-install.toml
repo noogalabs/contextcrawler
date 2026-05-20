@@ -8,9 +8,11 @@ strip_lines_matching = [
   "^Fetching gem metadata",
   "^Resolving dependencies",
 ]
+# `unless` keeps real failures from being swallowed (e.g. a post-install
+# warning, an install error, or a "Bundler could not ..." resolution failure).
 match_output = [
-  { pattern = "Bundle complete!", message = "ok bundle: complete" },
-  { pattern = "Bundle updated!", message = "ok bundle: updated" },
+  { pattern = "Bundle complete!", message = "ok bundle: complete", unless = "(?i)\\berror\\b|\\bwarning\\b|\\bfailed\\b|\\bfatal\\b|could not find|conflict" },
+  { pattern = "Bundle updated!", message = "ok bundle: updated", unless = "(?i)\\berror\\b|\\bwarning\\b|\\bfailed\\b|\\bfatal\\b|could not find|conflict" },
 ]
 max_lines = 30
 
@@ -54,6 +56,18 @@ Installing rspec 3.14.0 (was 3.13.0)
 Bundle updated!
 """
 expected = "ok bundle: updated"
+
+[[tests.bundle-install]]
+name = "post-install error not swallowed despite Bundle complete"
+input = """
+Using rake 13.1.0
+Installing nokogiri 1.16.0 with native extensions
+An error occurred while installing nokogiri (1.16.0), and Bundler cannot continue.
+Bundle complete! 85 Gemfile dependencies, 200 gems now installed.
+"""
+expected = """Installing nokogiri 1.16.0 with native extensions
+An error occurred while installing nokogiri (1.16.0), and Bundler cannot continue.
+Bundle complete! 85 Gemfile dependencies, 200 gems now installed."""
 
 [[tests.bundle-install]]
 name = "empty output"

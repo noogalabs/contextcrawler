@@ -17,6 +17,10 @@ strip_lines_matching = [
 ]
 truncate_lines_at = 150
 max_lines = 50
+# NOTE (#100/G8): on_empty also fires when gradle crashes with no stdout
+# (e.g. JVM failure). The TOML filter schema has no exit-code field — the
+# engine only sees output text — so this cannot be gated on exit status
+# without an engine change (out of scope here). Accepted limitation.
 on_empty = "gradle: ok"
 
 [[tests.gradle]]

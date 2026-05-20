@@ -49,12 +49,13 @@ fn run_cc(env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
     // production-DB writes even in release builds (cfg!(test) is false in
     // a release-compiled child binary).
     cmd.env("CONTEXTCRAWLER_TEST_MODE", "1");
-    // Clear DB path so tracking doesn't touch user state.
-    let tmp_db = std::env::temp_dir().join(format!(
-        "cc-hardening-{}.sqlite",
-        std::process::id()
-    ));
-    cmd.env("RTK_DB_PATH", tmp_db);
+    // Per-invocation isolated DB. A shared `cc-hardening-<pid>.sqlite` made
+    // every test in this binary race on one file (order-dependence risk);
+    // a fresh tempdir per call removes the shared state entirely. The
+    // TempDir handle is held until after `cmd.output()` returns, then
+    // dropped — the spawned child only touches the DB during its run.
+    let db_dir = tempfile::tempdir().expect("create per-test DB tempdir");
+    cmd.env("RTK_DB_PATH", db_dir.path().join("tracking.sqlite"));
     for (k, v) in env {
         cmd.env(k, v);
     }

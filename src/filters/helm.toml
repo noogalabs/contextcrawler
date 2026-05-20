@@ -4,7 +4,10 @@ match_command = "^helm\\b"
 strip_ansi = true
 strip_lines_matching = [
   "^\\s*$",
-  "^W\\d{4}",
+  # Strip only fully-formed glog warning lines (W + MMDD + space + HH:MM:SS),
+  # i.e. client-go log noise. Narrowed from "^W\\d{4}" so it cannot eat a
+  # genuine warning/summary line that merely starts with W followed by digits.
+  "^W\\d{4} \\d{2}:\\d{2}:\\d{2}",
 ]
 truncate_lines_at = 120
 max_lines = 40

@@ -8,8 +8,10 @@ strip_lines_matching = [
   "^\\s+Using cached ",
   "^\\s+Preparing ",
 ]
+# `unless` keeps real failures from being swallowed — uv prints "error:" and
+# "warning:" diagnostics that can co-occur with an "Audited N packages" line.
 match_output = [
-  { pattern = "Audited \\d+ package", message = "ok (up to date)" },
+  { pattern = "Audited \\d+ package", message = "ok (up to date)", unless = "(?i)\\berror[: ]|\\bwarning[: ]|\\bfailed\\b|\\bfatal\\b|no solution found" },
 ]
 max_lines = 20
 
@@ -35,3 +37,12 @@ Installed 5 packages in 23ms
  + urllib3==2.1.0
 """
 expected = "Installed 5 packages in 23ms\n + certifi==2023.11.17\n + charset-normalizer==3.3.2\n + idna==3.6\n + requests==2.31.0\n + urllib3==2.1.0"
+
+[[tests.uv-sync]]
+name = "error not swallowed despite audited line"
+input = """
+Resolved 42 packages in 123ms
+Audited 42 packages in 0.05ms
+error: Failed to install requests==2.31.0
+"""
+expected = "Resolved 42 packages in 123ms\nAudited 42 packages in 0.05ms\nerror: Failed to install requests==2.31.0"

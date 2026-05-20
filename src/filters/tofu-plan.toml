@@ -10,6 +10,10 @@ strip_lines_matching = [
   "^Releasing state lock",
 ]
 max_lines = 80
+# NOTE (#100/G8): on_empty also fires when tofu crashes with no stdout. The
+# TOML filter schema has no exit-code field — the engine only sees output
+# text — so this cannot be gated on exit status without an engine change
+# (out of scope here). Accepted limitation.
 on_empty = "tofu plan: no changes detected"
 
 [[tests.tofu-plan]]

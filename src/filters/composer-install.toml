@@ -9,8 +9,10 @@ strip_lines_matching = [
   "^Loading composer",
   "^Updating dependencies",
 ]
+# `unless` keeps real failures from being swallowed — composer reports
+# dependency resolution problems and deprecation warnings around this line.
 match_output = [
-  { pattern = "Nothing to install, update or remove", message = "ok (up to date)" },
+  { pattern = "Nothing to install, update or remove", message = "ok (up to date)", unless = "(?i)\\berror\\b|\\bwarning\\b|\\bfailed\\b|\\bfatal\\b|your requirements could not be resolved|deprecated" },
 ]
 max_lines = 30
 
@@ -38,3 +40,16 @@ Writing lock file
 Generating autoload files
 """
 expected = "Writing lock file\nGenerating autoload files"
+
+[[tests.composer-install]]
+name = "resolution error not swallowed despite nothing-to-do line"
+input = """
+Loading composer repositories with package information
+Updating dependencies
+Nothing to install, update or remove
+Your requirements could not be resolved to an installable set of packages.
+Problem 1: package vendor/pkg requires php >=8.2
+"""
+expected = """Nothing to install, update or remove
+Your requirements could not be resolved to an installable set of packages.
+Problem 1: package vendor/pkg requires php >=8.2"""
