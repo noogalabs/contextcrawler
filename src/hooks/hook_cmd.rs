@@ -318,6 +318,18 @@ enum PayloadAction {
         /// recoverable command).
         cmd: String,
     },
+    /// Emit a real Claude Code `ask` permission decision so the user gets an
+    /// approve/deny prompt. Used when a defence-in-depth gate returns an
+    /// `Ask` verdict for a command that has no contextcrawler rewrite — the
+    /// old behaviour hard-denied these, an "ask" the user could never answer
+    /// (#111). A supply-chain hard `Block` still routes through `Deny`.
+    Ask {
+        reason: String,
+        /// Audit-log tag describing why the ask fired.
+        audit_tag: &'static str,
+        /// Command being asked about.
+        cmd: String,
+    },
     Ignore,
 }
 
@@ -379,13 +391,13 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
 }
 
 /// Stderr line emitted when a gate flags a command `Ask` but it has no
-/// contextcrawler rewrite, so the only fail-closed option is a hard Deny.
-/// Factored out so the exact wording is testable without firing a live gate.
-/// Codex-review follow-up for #100.
-fn gate_no_rewrite_deny_log(cmd: &str) -> String {
+/// contextcrawler rewrite. The command is routed to a real Claude Code `ask`
+/// permission decision so the user can approve or deny it (#111). Factored
+/// out so the exact wording is testable without firing a live gate.
+fn gate_no_rewrite_ask_log(cmd: &str) -> String {
     format!(
         "[contextcrawler] gate flagged '{cmd}' (ask) but it has no rewrite; \
-         denying (protocol limitation)"
+         prompting the user for review"
     )
 }
 
@@ -397,6 +409,35 @@ fn gate_no_rewrite_deny_log(cmd: &str) -> String {
 fn process_claude_payload_with(
     v: &Value,
     check: impl Fn(&str) -> PermissionVerdict,
+) -> PayloadAction {
+    // Production: compute the gate decision from the live Tirith +
+    // supply-chain checks. Tests inject a deterministic `GateDecision` via
+    // `process_claude_payload_with_gate` so the no-rewrite Ask path (#111)
+    // can be exercised without spawning the gate binaries.
+    process_claude_payload_with_gate(v, check, |cmd| {
+        let tirith_verdict = tirith_gate::check(cmd);
+        let sc_verdict = supply_chain_gate::check(cmd);
+        supply_chain_gate::log_event(cmd, &sc_verdict);
+        let decision = gate_decision(&tirith_verdict, &sc_verdict);
+        // Emit the Tirith downgrade audit line when (and only when) the
+        // classification is an Ask driven by Tirith — the pure `gate_decision`
+        // does no I/O, so the logging stays here on the production path.
+        if matches!(decision, GateDecision::Ask) {
+            if let Some((reason, tirith_json)) = tirith_gate::should_downgrade(&tirith_verdict) {
+                tirith_gate::log_downgrade(cmd, reason, tirith_json);
+            }
+        }
+        decision
+    })
+}
+
+/// `process_claude_payload_with` with the gate decision injectable. The
+/// `gate` closure maps a command to a `GateDecision`; production passes the
+/// live Tirith + supply-chain wiring, tests pass a fixed verdict.
+fn process_claude_payload_with_gate(
+    v: &Value,
+    check: impl Fn(&str) -> PermissionVerdict,
+    gate: impl Fn(&str) -> GateDecision,
 ) -> PayloadAction {
     // Set by the defence-in-depth gates below: when a gate returns Ask, the
     // permission `Allow` must be suppressed so Claude Code prompts the user.
@@ -444,20 +485,12 @@ fn process_claude_payload_with(
     // are no-ops when disabled (Tirith → `Unavailable` + not required;
     // supply-chain → `Skip` when `supply_chain.enabled` is false), so the
     // default behaviour is byte-for-byte unchanged.
-    let tirith_verdict = tirith_gate::check(cmd);
-    let sc_verdict = supply_chain_gate::check(cmd);
-    supply_chain_gate::log_event(cmd, &sc_verdict);
-
-    match gate_decision(&tirith_verdict, &sc_verdict) {
+    match gate(cmd) {
         GateDecision::Proceed => {}
         GateDecision::Ask => {
-            // A gate wants the user prompted. Log the Tirith downgrade (if it
-            // was Tirith that fired) and force the rewrite path to Ask by
-            // overriding the permission verdict — a gate Ask must win over a
-            // permissions `Allow` so Claude Code prompts.
-            if let Some((reason, tirith_json)) = tirith_gate::should_downgrade(&tirith_verdict) {
-                tirith_gate::log_downgrade(cmd, reason, tirith_json);
-            }
+            // A gate wants the user prompted. Force the rewrite path to Ask
+            // by overriding the permission verdict — a gate Ask must win over
+            // a permissions `Allow` so Claude Code prompts.
             gate_ask = true;
         }
         GateDecision::Deny { reason } => {
@@ -476,20 +509,21 @@ fn process_claude_payload_with(
         Some(r) => r,
         None => {
             // No contextcrawler equivalent. If a gate flagged the command,
-            // the Claude PreToolUse protocol gives us nowhere to express
-            // "ask" — a bare `Skip` would pass the command through unchecked
-            // (fail open). Fail CLOSED with a deny so the user must confirm.
+            // emit a real Claude Code `ask` permission decision so the user
+            // gets an approve/deny prompt (#111). The old behaviour hard-
+            // denied here, which turned a gate "ask" verdict into a block the
+            // user could never approve — e.g. credential-bearing `curl` loops
+            // in a REST-verification workflow.
             if gate_ask {
-                // The Deny is correct (fail closed), but a bare un-rewritable
-                // command — e.g. a gate false-positive on `ls` — would
-                // otherwise be blocked with no operator-visible reason. Emit
-                // a clear stderr line so the WHY is observable.
-                let _ = writeln!(io::stderr(), "{}", gate_no_rewrite_deny_log(cmd));
-                return PayloadAction::Deny {
-                    reason: "contextcrawler: defence-in-depth gate flagged this command \
-                             and it has no contextcrawler rewrite; denying for review"
+                // Emit a clear stderr line so the WHY is operator-visible —
+                // a gate false-positive on a bare un-rewritable command (e.g.
+                // `ls`) is then a visible prompt, not a silent block.
+                let _ = writeln!(io::stderr(), "{}", gate_no_rewrite_ask_log(cmd));
+                return PayloadAction::Ask {
+                    reason: "contextcrawler: a defence-in-depth gate flagged this command \
+                             — review before allowing"
                         .to_string(),
-                    audit_tag: "deny:gate_no_rewrite",
+                    audit_tag: "ask:gate_no_rewrite",
                     cmd: cmd.to_string(),
                 };
             }
@@ -552,6 +586,25 @@ fn emit_claude_deny(reason: &str) {
     let _ = writeln!(io::stdout(), "{output}");
 }
 
+/// Emit a Claude Code PreToolUse `ask` verdict.
+///
+/// Unlike `deny`, `ask` makes the harness prompt the user with an
+/// approve/deny choice rather than hard-blocking the command. Used when a
+/// defence-in-depth gate returns an `Ask` verdict for a command with no
+/// contextcrawler rewrite — a gate "ask" must reach the user, not become a
+/// silent block (#111). The JSON schema mirrors `emit_claude_deny`; only the
+/// `permissionDecision` value differs.
+fn emit_claude_ask(reason: &str) {
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE_KEY,
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
+        }
+    });
+    let _ = writeln!(io::stdout(), "{output}");
+}
+
 /// Run the Claude Code PreToolUse hook natively.
 pub fn run_claude() -> Result<()> {
     let input = match read_stdin_limited() {
@@ -601,6 +654,14 @@ pub fn run_claude() -> Result<()> {
             audit_log(audit_tag, &cmd, "");
             emit_claude_deny(&reason);
         }
+        PayloadAction::Ask {
+            reason,
+            audit_tag,
+            cmd,
+        } => {
+            audit_log(audit_tag, &cmd, "");
+            emit_claude_ask(&reason);
+        }
         PayloadAction::Ignore => {}
     }
 
@@ -619,6 +680,16 @@ fn run_claude_inner(input: &str) -> Option<String> {
                 "hookSpecificOutput": {
                     "hookEventName": PRE_TOOL_USE_KEY,
                     "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+            .to_string(),
+        ),
+        PayloadAction::Ask { reason, .. } => Some(
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE_KEY,
+                    "permissionDecision": "ask",
                     "permissionDecisionReason": reason,
                 }
             })
@@ -776,18 +847,18 @@ mod tests {
         json!({ "toolName": "bash", "toolArgs": args })
     }
 
-    /// The no-rewrite-Deny path emits a clear, operator-visible log line so a
-    /// gate false-positive on a bare un-rewritable command isn't blocked
-    /// silently. Codex-review follow-up for #100.
+    /// The no-rewrite-Ask path emits a clear, operator-visible log line so a
+    /// gate false-positive on a bare un-rewritable command surfaces as a
+    /// visible prompt rather than a silent block (#111).
     #[test]
-    fn gate_no_rewrite_deny_log_explains_why() {
-        let line = gate_no_rewrite_deny_log("ls");
+    fn gate_no_rewrite_ask_log_explains_why() {
+        let line = gate_no_rewrite_ask_log("ls");
         assert!(line.starts_with("[contextcrawler] "));
         assert!(line.contains("'ls'"));
         assert!(line.contains("(ask)"));
         assert!(line.contains("no rewrite"));
-        assert!(line.contains("denying"));
-        assert!(line.contains("protocol limitation"));
+        assert!(line.contains("prompting the user"));
+        assert!(!line.contains("denying"));
     }
 
     #[test]
@@ -1252,6 +1323,116 @@ mod tests {
             &ScVerdict::Block(vec![]),
         );
         assert!(matches!(d, GateDecision::Deny { .. }));
+    }
+
+    // --- #111: gate `Ask` verdict → real Claude `ask` prompt, not a deny ---
+
+    /// A gate `Ask` verdict on a command with NO contextcrawler rewrite must
+    /// now yield `PayloadAction::Ask` — the user gets an approve/deny prompt,
+    /// not a hard deny they can never answer. This is the core #111 fix: a
+    /// command flagged by Tirith but with no rewrite must reach the user.
+    /// `htop` is the canonical un-rewritable fixture used across this module.
+    #[test]
+    fn test_gate_ask_no_rewrite_is_ask_action() {
+        let v = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "htop" }
+        });
+        let action = process_claude_payload_with_gate(
+            &v,
+            |_| PermissionVerdict::Default,
+            |_| GateDecision::Ask,
+        );
+        match action {
+            PayloadAction::Ask { audit_tag, cmd, reason } => {
+                assert_eq!(audit_tag, "ask:gate_no_rewrite");
+                assert_eq!(cmd, "htop");
+                assert!(reason.contains("defence-in-depth gate"));
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    /// The `Ask` action, emitted through the `run_claude` driver, must carry
+    /// the Claude PreToolUse `permissionDecision: ask` contract — the value
+    /// that makes the harness prompt the user (confirmed against the
+    /// `handle_vscode` path, which already emits `ask`).
+    #[test]
+    fn test_gate_ask_emits_ask_json() {
+        let v = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "htop" }
+        });
+        let action = process_claude_payload_with_gate(
+            &v,
+            |_| PermissionVerdict::Default,
+            |_| GateDecision::Ask,
+        );
+        let emitted = match action {
+            PayloadAction::Ask { reason, .. } => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE_KEY,
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason,
+                }
+            })
+            .to_string(),
+            other => panic!("expected Ask, got {other:?}"),
+        };
+        let parsed: Value = serde_json::from_str(&emitted).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "ask",
+            "a gate ask verdict must emit an ask verdict, not a deny"
+        );
+    }
+
+    /// A gate `Ask` verdict on a command that DOES have a rewrite still
+    /// rewrites (with the auto-allow suppressed so the host prompts) — the
+    /// #111 change only affects the no-rewrite branch.
+    #[test]
+    fn test_gate_ask_with_rewrite_still_rewrites() {
+        let v = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status" }
+        });
+        let action = process_claude_payload_with_gate(
+            &v,
+            |_| PermissionVerdict::Allow,
+            |_| GateDecision::Ask,
+        );
+        match action {
+            PayloadAction::Rewrite { output, .. } => {
+                // gate Ask suppresses the auto-allow.
+                assert!(output
+                    .pointer("/hookSpecificOutput/permissionDecision")
+                    .is_none());
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
+
+    /// A supply-chain hard `Block` (`GateDecision::Deny`) still produces a
+    /// `PayloadAction::Deny` — a real hard-block must stay a deny. The #111
+    /// change must NOT relax this path.
+    #[test]
+    fn test_gate_deny_still_denies() {
+        let v = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "cargo install evil-crate" }
+        });
+        let action = process_claude_payload_with_gate(
+            &v,
+            |_| PermissionVerdict::Default,
+            |_| GateDecision::Deny {
+                reason: "supply-chain block".into(),
+            },
+        );
+        match action {
+            PayloadAction::Deny { audit_tag, .. } => {
+                assert_eq!(audit_tag, "deny:supply_chain_block");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
     }
 
     /// No-regression: with both gates disabled (the default — supply-chain
