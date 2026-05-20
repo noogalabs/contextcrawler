@@ -393,6 +393,116 @@ fn benign_git_status_still_succeeds() {
     );
 }
 
+// ---- #111 G4 follow-up: value-taking option operands are not flags ---------
+//
+// `check_forbidden_git_args` rejected any token textually shaped like a
+// forbidden transport flag, even when the token was the VALUE of a
+// value-taking option (`-m`, `-F`, ...). A commit whose message happened to
+// be `--upload-pack=x` was blocked before `run_commit` ran. The scanner now
+// skips the operand after a recognised value-taking option.
+
+#[test]
+fn git_commit_message_shaped_like_forbidden_flag_is_not_rejected() {
+    // `-m --upload-pack=x` — the second token is the commit MESSAGE.
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("f.txt"), "x").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "f.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "-m", "--upload-pack=x"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "`git commit -m --upload-pack=x` — the token is the message, not a \
+         flag — must not trip the denylist. stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(
+        out.status.success(),
+        "the commit itself must succeed. stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
+#[test]
+fn git_commit_message_exactly_exec_path_is_not_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("g.txt"), "y").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "g.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "-m", "--exec-path"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "`git commit -m --exec-path` must not trip the denylist. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
+#[test]
+fn git_commit_attached_message_shaped_like_forbidden_flag_is_not_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("h.txt"), "z").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "h.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "--message=--receive-pack"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "`git commit --message=--receive-pack` must not trip the denylist. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
+#[test]
+fn git_commit_normal_message_still_works() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("i.txt"), "w").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "i.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "-m", "normal message"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    assert!(
+        out.status.success(),
+        "`git commit -m \"normal message\"` must still succeed. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ---- G4/#100: git exit-code propagation ------------------------------------
 //
 // run_status (compact), run_stash (list/show) and run_worktree (list) applied

@@ -638,9 +638,40 @@ const FORBIDDEN_GIT_CONFIG_KEY_PREFIXES: &[&str] = &[
 ///
 /// See issue #35 for the empirical PoCs that motivate each shape.
 pub fn check_forbidden_git_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    // Value-taking git options in their *separate-value* form: the token
+    // that follows is a VALUE, not a flag, so it must not be scanned for
+    // forbidden transport flags. `git commit -m --upload-pack=x` — the
+    // `--upload-pack=x` is the commit message, not a flag. Only the
+    // separate form consumes the next token; the attached form
+    // (`--message=X`) carries its own value. `-c` is handled separately
+    // below (it also inspects its value against the config denylist).
+    // See finding #111 G4 follow-up; mirrors the curl/wget VALUE_FLAGS
+    // pattern from #100 G4.
+    const GIT_VALUE_FLAGS: &[&str] = &[
+        "-m",
+        "--message",
+        "-F",
+        "--file",
+        "-C",
+        "--reuse-message",
+        "--author",
+        "--date",
+    ];
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_ref();
+
+        // A recognised value-taking option in its separate-value form
+        // consumes the next token as a VALUE — skip the forbidden-flag
+        // scan for that token so a commit message that happens to look
+        // like `--upload-pack=x` is not wrongly rejected. The attached
+        // form (`--message=X`) carries its own value and is handled by
+        // the normal scan below (it never matches a forbidden prefix).
+        if GIT_VALUE_FLAGS.contains(&a) {
+            i += 2;
+            continue;
+        }
 
         // Exact-match deny for the long-form transport overrides. We
         // reject on the flag alone so the value (whether in the next
@@ -880,6 +911,53 @@ mod secure_git_tests {
         // over-block.
         assert!(check_forbidden_git_args(&["-c", "user.email=foo@bar.com", "commit"]).is_ok());
         assert!(check_forbidden_git_args(&["-c", "color.ui=always", "log"]).is_ok());
+    }
+
+    #[test]
+    fn value_taking_options_skip_forbidden_looking_operand() {
+        // A commit message that textually equals (or carries) a forbidden
+        // transport flag is a VALUE, not a flag — it must not be rejected.
+        // #111 G4 follow-up: the scanner now skips the token after a
+        // recognised value-taking option in its separate-value form.
+        assert!(
+            check_forbidden_git_args(&["commit", "-m", "--upload-pack=x"]).is_ok(),
+            "`-m` operand `--upload-pack=x` is a message, not a flag"
+        );
+        assert!(
+            check_forbidden_git_args(&["commit", "-m", "--exec-path"]).is_ok(),
+            "`-m` operand `--exec-path` is a message, not a flag"
+        );
+        assert!(
+            check_forbidden_git_args(&["commit", "-F", "--receive-pack=x"]).is_ok(),
+            "`-F` operand is a file path, not a flag"
+        );
+        // Attached form carries its own value and so does NOT skip the
+        // next token — but the attached value never matches a forbidden
+        // *prefix* (`--message=` is not a forbidden prefix), so it passes.
+        assert!(
+            check_forbidden_git_args(&["commit", "--message=--receive-pack"]).is_ok(),
+            "`--message=...` attached form is a benign commit"
+        );
+    }
+
+    #[test]
+    fn forbidden_flag_in_genuine_flag_position_still_rejected() {
+        // The value-skip must NOT weaken rejection of a forbidden flag
+        // that is genuinely in flag position (not the operand of a
+        // value-taking option).
+        assert!(check_forbidden_git_args(&["fetch", "--upload-pack=/tmp/evil"]).is_err());
+        assert!(check_forbidden_git_args(&["push", "--receive-pack=x"]).is_err());
+        assert!(check_forbidden_git_args(&["clone", "--upload-pack=x", "url"]).is_err());
+        // `-m` followed by a real forbidden flag as a SEPARATE later arg
+        // still rejects — only the single token right after `-m` is skipped.
+        assert!(
+            check_forbidden_git_args(&["commit", "-m", "msg", "--upload-pack=x"]).is_err()
+        );
+        // `-c` value-skip still works alongside the new option set.
+        assert!(check_forbidden_git_args(&["-c", "protocol.ext.allow=always", "clone"]).is_err());
+        assert!(
+            check_forbidden_git_args(&["-c", "color.ui=always", "log", "-m"]).is_ok()
+        );
     }
 
     #[test]
