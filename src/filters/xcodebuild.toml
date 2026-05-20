@@ -36,6 +36,10 @@ strip_lines_matching = [
   "^note: Using new build system",
 ]
 max_lines = 60
+# NOTE (#100/G8): on_empty also fires when xcodebuild crashes with no stdout.
+# The TOML filter schema has no exit-code field — the engine only sees output
+# text — so this cannot be gated on exit status without an engine change
+# (out of scope here). Accepted limitation.
 on_empty = "xcodebuild: ok"
 
 [[tests.xcodebuild]]

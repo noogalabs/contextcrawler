@@ -9,8 +9,10 @@ strip_lines_matching = [
   "^Creating virtualenv",
   "^Using virtualenv",
 ]
+# `unless` keeps real failures from being swallowed — poetry reports solver
+# failures and warnings ("SolverProblemError", "Warning: ...") around this line.
 match_output = [
-  { pattern = "No dependencies to install or update|No changes\\.", message = "ok (up to date)" },
+  { pattern = "No dependencies to install or update|No changes\\.", message = "ok (up to date)", unless = "(?i)\\berror\\b|\\bwarning\\b|\\bfailed\\b|\\bfatal\\b|could not|version solving failed" },
 ]
 max_lines = 30
 
@@ -48,3 +50,12 @@ Installing dependencies from lock file
 Writing lock file
 """
 expected = "Installing dependencies from lock file\nWriting lock file"
+
+[[tests.poetry-install]]
+name = "solver failure not swallowed despite no-changes line"
+input = """
+Installing dependencies from lock file
+No changes.
+SolverProblemError: version solving failed for package foo
+"""
+expected = "Installing dependencies from lock file\nNo changes.\nSolverProblemError: version solving failed for package foo"

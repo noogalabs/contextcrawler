@@ -8,8 +8,10 @@ strip_lines_matching = [
   "^Copyright \\(C\\)",
   "^  Determining projects",
 ]
+# `unless` keeps real failures from being swallowed — a "0 Error(s)" summary
+# can still co-occur with an error-level diagnostic or a "Build FAILED." banner.
 match_output = [
-  { pattern = "0 Warning\\(s\\)\\n\\s+0 Error\\(s\\)", message = "ok (build succeeded)" },
+  { pattern = "0 Warning\\(s\\)\\n\\s+0 Error\\(s\\)", message = "ok (build succeeded)", unless = "(?i)\\bwarning [A-Z]+\\d|\\berror [A-Z]+\\d|build failed|\\bfatal\\b" },
 ]
 max_lines = 40
 
@@ -62,3 +64,17 @@ Build FAILED.
     1 Error(s)
 """
 expected = "src/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]\nBuild FAILED.\n    0 Warning(s)\n    1 Error(s)"
+
+[[tests.dotnet-build]]
+name = "error diagnostic not swallowed despite zero-count summary"
+input = """
+Microsoft (R) Build Engine version 17.8.3+195e7f5a3
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+src/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]
+
+Build FAILED.
+    0 Warning(s)
+    0 Error(s)
+"""
+expected = "src/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]\nBuild FAILED.\n    0 Warning(s)\n    0 Error(s)"

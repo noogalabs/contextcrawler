@@ -5,13 +5,16 @@ strip_ansi = true
 strip_lines_matching = [
   "^\\s*$",
   "^Finished in \\d+",
-  "^Found \\d+ warning",
+  # Only strip the all-clear summary ("Found 0 warnings and 0 errors").
+  # A non-zero warning/error summary must survive so a warnings-only run is
+  # not mistaken for a clean run.
+  "^Found 0 warnings? and 0 errors?",
 ]
 max_lines = 50
 on_empty = "oxlint: ok"
 
 [[tests.oxlint]]
-name = "strips noise, keeps diagnostics"
+name = "strips noise, keeps diagnostics and warning summary"
 input = """
   × eslint(no-console): Unexpected console statement.
    ╭─[src/app.ts:5:3]
@@ -28,7 +31,15 @@ input = """
 Found 2 warnings on 2 files.
 Finished in 12ms on 100 files.
 """
-expected = "  × eslint(no-console): Unexpected console statement.\n   ╭─[src/app.ts:5:3]\n 5 │   console.log(\"debug\");\n   │   ^^^^^^^^^^^\n   ╰────\n  × eslint(no-unused-vars): 'x' is defined but never used.\n   ╭─[src/utils.ts:2:7]\n 2 │   let x = 42;\n   │       ^\n   ╰────"
+expected = "  × eslint(no-console): Unexpected console statement.\n   ╭─[src/app.ts:5:3]\n 5 │   console.log(\"debug\");\n   │   ^^^^^^^^^^^\n   ╰────\n  × eslint(no-unused-vars): 'x' is defined but never used.\n   ╭─[src/utils.ts:2:7]\n 2 │   let x = 42;\n   │       ^\n   ╰────\nFound 2 warnings on 2 files."
+
+[[tests.oxlint]]
+name = "all-clear summary stripped to on_empty"
+input = """
+Found 0 warnings and 0 errors.
+Finished in 5ms on 100 files.
+"""
+expected = "oxlint: ok"
 
 [[tests.oxlint]]
 name = "clean output"

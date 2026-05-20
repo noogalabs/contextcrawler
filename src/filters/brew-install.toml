@@ -10,8 +10,11 @@ strip_lines_matching = [
   "^###",
   "^==> Fetching",
 ]
+# `unless` keeps real failures from being swallowed. Note: brew prints a benign
+# "Warning: <pkg> is already installed" on the success path, so `warning` is
+# deliberately excluded — brew signals real failures with "Error:"/"failed".
 match_output = [
-  { pattern = "already installed", message = "ok (already installed)" },
+  { pattern = "already installed", message = "ok (already installed)", unless = "(?i)\\berror[: ]|\\bfailed\\b|\\bfatal\\b|cannot install" },
 ]
 max_lines = 20
 
@@ -35,3 +38,14 @@ input = """
 /opt/homebrew/Cellar/jq/1.7.1: 18 files, 1.2MB
 """
 expected = "==> Summary\n/opt/homebrew/Cellar/jq/1.7.1: 18 files, 1.2MB"
+
+[[tests.brew-install]]
+name = "failure not swallowed even when already-installed text present"
+input = """
+Warning: jq 1.7.1 is already installed and up-to-date.
+Error: Could not symlink bin/jq
+Target /opt/homebrew/bin/jq is a symlink belonging to fd.
+"""
+expected = """Warning: jq 1.7.1 is already installed and up-to-date.
+Error: Could not symlink bin/jq
+Target /opt/homebrew/bin/jq is a symlink belonging to fd."""

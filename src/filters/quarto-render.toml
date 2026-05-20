@@ -12,8 +12,10 @@ strip_lines_matching = [
   "^  Validating",
   "^  Resolving",
 ]
+# `unless` keeps real failures from being swallowed — quarto prints "ERROR:"
+# (and pandoc/knitr "WARNING:") which can co-occur with an "Output created:" line.
 match_output = [
-  { pattern = "Output created:", message = "ok (output created)" },
+  { pattern = "Output created:", message = "ok (output created)", unless = "(?i)\\berror\\b|\\bwarning\\b|\\bfailed\\b|\\bfatal\\b|caused by:" },
 ]
 max_lines = 20
 
@@ -39,3 +41,12 @@ caused by:
   syntax error at line 10
 """
 expected = "ERROR: Render failed\ncaused by:\n  syntax error at line 10"
+
+[[tests.quarto-render]]
+name = "error not swallowed despite output-created line"
+input = """
+processing file: index.qmd
+ERROR: chunk 'setup' failed to execute
+Output created: _site/index.html
+"""
+expected = "ERROR: chunk 'setup' failed to execute\nOutput created: _site/index.html"

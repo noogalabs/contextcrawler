@@ -14,6 +14,10 @@ strip_lines_matching = [
   "^Checking size",
 ]
 max_lines = 30
+# NOTE (#100/G8): on_empty also fires when pio crashes with no stdout. The
+# TOML filter schema has no exit-code field — the engine only sees output
+# text — so this cannot be gated on exit status without an engine change
+# (out of scope here). Accepted limitation.
 on_empty = "pio run: ok"
 
 [[tests.pio-run]]
