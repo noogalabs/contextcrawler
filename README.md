@@ -88,6 +88,12 @@ linked AGPL code.
 | `CONTEXTCRAWLER_TIRITH_REQUIRED=1` | fail-closed: refuse auto-allow without a working Tirith verdict |
 | `CONTEXTCRAWLER_TIRITH_DISABLED=1` | bypass the gate entirely (debug only) |
 
+When the gate blocks a legitimate command (the most common case is a
+`curl ... | python3` REST workflow matching the `curl | bash` shape),
+see [`docs/security/working-with-the-gate.md`](docs/security/working-with-the-gate.md)
+for diagnosis, the gate-safe network-fetch pattern, and `tirith trust`
+allowlisting.
+
 ### 3. Supply-chain pipeline control
 
 Optional. Opt-in via `~/.config/contextcrawler/supply-chain.toml`.
