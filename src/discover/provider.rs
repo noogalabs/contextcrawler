@@ -136,6 +136,19 @@ impl ClaudeProvider {
                     continue;
                 }
 
+                // G7/#100 (Codex follow-up): reject symlinked session files.
+                // The directory-level guard above blocks symlinked project
+                // dirs, but an attacker who can drop a symlink inside an
+                // otherwise-legitimate project dir could still redirect the
+                // scanner at a file outside the tree. `symlink_metadata`
+                // inspects the link itself (unlike `metadata`, which follows
+                // it), so check the link type explicitly before accepting.
+                match fs::symlink_metadata(file_path) {
+                    Ok(meta) if meta.file_type().is_symlink() => continue,
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+
                 // Apply mtime filter
                 if let Some(cutoff_time) = cutoff {
                     if let Ok(meta) = fs::metadata(file_path) {
@@ -574,6 +587,40 @@ mod tests {
         .unwrap();
 
         // Only the real project's file is found; the symlinked dir is skipped.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].file_name().and_then(|n| n.to_str()),
+            Some("real.jsonl")
+        );
+    }
+
+    // G7/#100 (Codex follow-up): a symlinked `.jsonl` placed inside an
+    // accepted project dir must be skipped so scanning cannot be redirected
+    // outside the tree, while a regular `.jsonl` is still collected.
+    #[test]
+    #[cfg(unix)]
+    fn test_discover_sessions_rejects_symlinked_session_file() {
+        let projects_dir = tempfile::tempdir().unwrap();
+        let project = projects_dir.path().join("-Users-test-real");
+        std::fs::create_dir_all(&project).unwrap();
+        // A regular session file inside the project — should be collected.
+        std::fs::write(project.join("real.jsonl"), "").unwrap();
+
+        // An out-of-tree file reached via a symlink inside the project dir.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.jsonl");
+        std::fs::write(&secret, "").unwrap();
+        let link = project.join("evil.jsonl");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let sessions = ClaudeProvider::discover_sessions_in_projects_dir(
+            projects_dir.path(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Only the regular file is found; the symlinked file is skipped.
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].file_name().and_then(|n| n.to_str()),
