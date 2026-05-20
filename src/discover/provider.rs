@@ -85,10 +85,36 @@ impl ClaudeProvider {
         let entries = fs::read_dir(projects_dir)
             .with_context(|| format!("failed to read {}", projects_dir.display()))?;
 
+        // Resolve the projects dir once so we can prefix-check each entry's
+        // canonical path against it (G7/#100).
+        let projects_root = projects_dir.canonicalize().ok();
+
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
+
+            // G7/#100: reject symlinked entries — a symlinked project dir
+            // under ~/.claude/projects/ would redirect scanning outside the
+            // tree. `path.is_dir()` follows symlinks, so check the link type
+            // explicitly first.
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    if !meta.is_dir() {
+                        continue;
+                    }
+                }
+                Err(_) => continue,
+            }
+
+            // Defence in depth: even a non-symlink entry's resolved path must
+            // stay inside the projects root.
+            if let Some(root) = &projects_root {
+                match path.canonicalize() {
+                    Ok(resolved) if resolved.starts_with(root) => {}
+                    _ => continue,
+                }
             }
 
             // Apply project filter: substring match on directory name
@@ -108,6 +134,19 @@ impl ClaudeProvider {
                 let file_path = walk_entry.path();
                 if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
+                }
+
+                // G7/#100 (Codex follow-up): reject symlinked session files.
+                // The directory-level guard above blocks symlinked project
+                // dirs, but an attacker who can drop a symlink inside an
+                // otherwise-legitimate project dir could still redirect the
+                // scanner at a file outside the tree. `symlink_metadata`
+                // inspects the link itself (unlike `metadata`, which follows
+                // it), so check the link type explicitly before accepting.
+                match fs::symlink_metadata(file_path) {
+                    Ok(meta) if meta.file_type().is_symlink() => continue,
+                    Ok(_) => {}
+                    Err(_) => continue,
                 }
 
                 // Apply mtime filter
@@ -521,6 +560,72 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("failed to read"));
+    }
+
+    // G7/#100: a symlinked project dir must be rejected so scanning cannot be
+    // redirected outside the ~/.claude/projects/ tree.
+    #[test]
+    #[cfg(unix)]
+    fn test_discover_sessions_rejects_symlinked_project_dir() {
+        let projects_dir = tempfile::tempdir().unwrap();
+        // A real project dir inside the tree — should be scanned.
+        let real_project = projects_dir.path().join("-Users-test-real");
+        std::fs::create_dir_all(&real_project).unwrap();
+        std::fs::write(real_project.join("real.jsonl"), "").unwrap();
+
+        // An out-of-tree dir reached via a symlink placed inside the tree.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.jsonl"), "").unwrap();
+        let link = projects_dir.path().join("-Users-test-evil");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let sessions = ClaudeProvider::discover_sessions_in_projects_dir(
+            projects_dir.path(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Only the real project's file is found; the symlinked dir is skipped.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].file_name().and_then(|n| n.to_str()),
+            Some("real.jsonl")
+        );
+    }
+
+    // G7/#100 (Codex follow-up): a symlinked `.jsonl` placed inside an
+    // accepted project dir must be skipped so scanning cannot be redirected
+    // outside the tree, while a regular `.jsonl` is still collected.
+    #[test]
+    #[cfg(unix)]
+    fn test_discover_sessions_rejects_symlinked_session_file() {
+        let projects_dir = tempfile::tempdir().unwrap();
+        let project = projects_dir.path().join("-Users-test-real");
+        std::fs::create_dir_all(&project).unwrap();
+        // A regular session file inside the project — should be collected.
+        std::fs::write(project.join("real.jsonl"), "").unwrap();
+
+        // An out-of-tree file reached via a symlink inside the project dir.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.jsonl");
+        std::fs::write(&secret, "").unwrap();
+        let link = project.join("evil.jsonl");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let sessions = ClaudeProvider::discover_sessions_in_projects_dir(
+            projects_dir.path(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Only the regular file is found; the symlinked file is skipped.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].file_name().and_then(|n| n.to_str()),
+            Some("real.jsonl")
+        );
     }
 
     #[test]

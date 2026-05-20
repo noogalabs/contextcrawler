@@ -433,7 +433,7 @@ fn display_summary(tracker: &Tracker, verbose: u8) -> Result<()> {
     let periods = merge_monthly(cc_monthly, rtk_monthly);
 
     if periods.is_empty() {
-        println!("No data available. Run some rtk commands to start tracking.");
+        println!("No data available. Run some contextcrawler commands to start tracking.");
         return Ok(());
     }
 

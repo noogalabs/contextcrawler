@@ -374,14 +374,16 @@ fn split_token_spans(cmd: &str) -> Vec<(&str, usize, usize)> {
 }
 
 /// Normalize absolute binary paths: `/usr/bin/grep -rn foo` → `grep -rn foo` (#485)
-/// Only strips if the first word contains a `/` (Unix path).
+/// Only strips a TRUE absolute path (first word starts with `/`). Relative
+/// invocations like `./git` or `repo/bin/git` are NOT the system binary and
+/// must not be normalised to `git` and rewritten (G7/#100).
 fn strip_absolute_path(cmd: &str) -> String {
     let first_space = cmd.find(' ');
     let first_word = match first_space {
         Some(pos) => &cmd[..pos],
         None => cmd,
     };
-    if first_word.contains('/') {
+    if first_word.starts_with('/') {
         // Extract basename
         let basename = first_word.rsplit('/').next().unwrap_or(first_word);
         if basename.is_empty() {
@@ -396,8 +398,46 @@ fn strip_absolute_path(cmd: &str) -> String {
     }
 }
 
+/// True only when the env-prefix contains an assignment whose key is EXACTLY
+/// `RTK_DISABLED`. A naive `prefix.contains("RTK_DISABLED=")` is unsafe: a
+/// crafted prefix like `FOO=RTK_DISABLED=1 git status` parses as a single
+/// assignment `FOO` = `RTK_DISABLED=1`, so the substring is present even
+/// though `RTK_DISABLED` was never genuinely set. Parse into individual
+/// `KEY=VALUE` tokens and match the key name precisely.
 pub fn prefix_contains_rtk_disabled(prefix_part: &str) -> bool {
-    prefix_part.contains("RTK_DISABLED=")
+    env_prefix_assignments(prefix_part)
+        .iter()
+        .any(|(key, _)| *key == "RTK_DISABLED")
+}
+
+/// Split an env-prefix chunk into individual `(KEY, VALUE)` assignments.
+///
+/// The prefix is the portion matched by `ENV_PREFIX` — a run of `sudo `,
+/// `env ` words and `KEY=VALUE` assignments. Whitespace-tokenises the chunk,
+/// drops bare `sudo`/`env` words, and splits each remaining token at the
+/// FIRST `=` only (so `FOO=RTK_DISABLED=1` yields key `FOO`, not `RTK_DISABLED`).
+/// Quoted values are kept verbatim — the key is all that matters here.
+fn env_prefix_assignments(prefix_part: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    for tok in prefix_part.split_whitespace() {
+        if tok == "sudo" || tok == "env" {
+            continue;
+        }
+        if let Some(eq) = tok.find('=') {
+            let key = &tok[..eq];
+            // A valid shell env key: [A-Za-z_][A-Za-z0-9_]* — the ENV_PREFIX
+            // regex already enforces uppercase, but be defensive.
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !key.chars().next().unwrap().is_ascii_digit()
+            {
+                out.push((key, &tok[eq + 1..]));
+            }
+        }
+    }
+    out
 }
 
 /// Check if a command has RTK_DISABLED= prefix in its env prefix portion.
@@ -735,7 +775,9 @@ fn rewrite_segment_inner(
     if !env_prefix.is_empty() {
         // #345: RTK_DISABLED=1 in env prefix → skip rewrite entirely
         // #508: warn on stderr so agents learn to stop overusing it
-        if env_prefix.contains("RTK_DISABLED=") {
+        // G7/#100: match the EXACT key, not a substring — a crafted prefix
+        // like `FOO=RTK_DISABLED=1 cmd` must NOT disable rewriting.
+        if prefix_contains_rtk_disabled(env_prefix) {
             eprintln!(
                 "[contextcrawler] RTK_DISABLED=1 detected — skipping filter for this command. \
                  Remove RTK_DISABLED=1 to restore token savings."
@@ -3544,6 +3586,67 @@ mod tests {
         assert!(!cmd_has_rtk_disabled_prefix("git status"));
         assert!(!cmd_has_rtk_disabled_prefix("contextcrawler git status"));
         assert!(!cmd_has_rtk_disabled_prefix("SOME_VAR=1 git status"));
+    }
+
+    // --- G7/#100: RTK_DISABLED key must be matched exactly, not as a substring ---
+
+    #[test]
+    fn test_rtk_disabled_substring_does_not_bypass() {
+        // A crafted prefix where RTK_DISABLED= appears inside another var's
+        // VALUE must NOT count as setting RTK_DISABLED.
+        assert!(!cmd_has_rtk_disabled_prefix("FOO=RTK_DISABLED=1 git status"));
+        assert!(!cmd_has_rtk_disabled_prefix(
+            "X=a RTK_DISABLED_NOT=1 git status"
+        ));
+        assert!(!cmd_has_rtk_disabled_prefix("MY_RTK_DISABLED=1 git status"));
+        // ...and rewriting must still happen for the crafted prefix.
+        assert_eq!(
+            rewrite_command_no_prefixes("FOO=RTK_DISABLED=1 git status", &[]),
+            Some("FOO=RTK_DISABLED=1 contextcrawler git status".into())
+        );
+    }
+
+    #[test]
+    fn test_real_rtk_disabled_still_bypasses() {
+        // A genuine RTK_DISABLED=1 assignment must still disable rewriting.
+        assert!(cmd_has_rtk_disabled_prefix("RTK_DISABLED=1 git status"));
+        assert_eq!(
+            rewrite_command_no_prefixes("RTK_DISABLED=1 git status", &[]),
+            None
+        );
+        // ...even when preceded by other (innocuous) assignments.
+        assert!(cmd_has_rtk_disabled_prefix("FOO=bar RTK_DISABLED=1 git status"));
+        assert_eq!(
+            rewrite_command_no_prefixes("FOO=bar RTK_DISABLED=1 git status", &[]),
+            None
+        );
+    }
+
+    // --- G7/#100: only TRUE absolute paths are normalised to a bare binary ---
+
+    #[test]
+    fn test_relative_path_not_normalised() {
+        // `./git` and `repo/bin/git` are not the system binary — they must
+        // NOT be normalised to `git` and rewritten.
+        assert_eq!(strip_absolute_path("./git status"), "./git status");
+        assert_eq!(
+            strip_absolute_path("repo/bin/git status"),
+            "repo/bin/git status"
+        );
+        assert_eq!(rewrite_command_no_prefixes("./git status", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("repo/bin/git status", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_absolute_path_still_normalised() {
+        // Regression guard: a real absolute path still strips to the binary.
+        assert_eq!(
+            strip_absolute_path("/usr/bin/git status"),
+            "git status"
+        );
     }
 
     #[test]

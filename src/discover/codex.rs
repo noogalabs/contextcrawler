@@ -106,7 +106,22 @@ pub fn scan_log(path: &Path, raw_counts: &mut HashMap<String, usize>, compliance
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
-    for line in reader.lines().map_while(|l| l.ok()) {
+    // G7/#100: handle each line's error explicitly. `map_while(|l| l.ok())`
+    // silently stops at the first I/O or non-UTF-8 line, dropping the rest of
+    // the log and undercounting commands. Skip the bad line, keep iterating.
+    for (lineno, line_result) in reader.lines().enumerate() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!(
+                    "[contextcrawler] skipping unreadable line {} in {}: {}",
+                    lineno + 1,
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
         if let Some(cmd) = extract_command(&line) {
             compliance.total_commands += 1;
             if is_wrapped(&cmd) {

@@ -110,7 +110,9 @@ pub fn run(_verbose: u8) -> Result<()> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
-        let short_id = if id.len() > 8 { &id[..8] } else { id };
+        // G7/#100: char-safe truncation — byte slicing panics if the
+        // filename stem contains a multibyte char split at the boundary.
+        let short_id: String = id.chars().take(8).collect();
 
         // Extract date from mtime
         let date = fs::metadata(path)
@@ -183,7 +185,7 @@ pub fn run(_verbose: u8) -> Result<()> {
         0.0
     };
     println!("Average adoption: {:.0}%", avg_adoption);
-    println!("Tip: Run `rtk discover` to find missed RTK opportunities");
+    println!("Tip: Run `contextcrawler discover` to find missed contextcrawler opportunities");
 
     Ok(())
 }
