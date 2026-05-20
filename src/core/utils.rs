@@ -3509,9 +3509,23 @@ pub fn secure_curl_command() -> Command {
     cmd
 }
 
+/// Normalise an option token to its flag *key* for deny-list comparison.
+///
+/// curl and wget both accept an attached-value form (`-K=file`,
+/// `--config=file`). A deny-list that only compares the bare token (`-K`,
+/// `--config`) is bypassed by the attached form. This strips the leading
+/// dashes and everything from the first `=` onward, yielding just the flag
+/// key so a single equality check covers `--config`, `--config=file` and
+/// `-K=file` alike. Returns `None` for a non-option token (no leading `-`).
+fn option_key(arg: &str) -> Option<&str> {
+    let stripped = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    Some(stripped.split('=').next().unwrap_or(stripped))
+}
+
 /// curl args that re-introduce the env-var threat shape:
-/// - `-K <file>` / `--config <file>` / `--config=<file>`: same as `CURL_HOME`,
-///   the file can carry arbitrary curl flags including credential uploads.
+/// - `-K <file>` / `--config <file>` / `--config=<file>` / `-K=<file>`: same
+///   as `CURL_HOME`, the file can carry arbitrary curl flags including
+///   credential uploads.
 /// - `--output <path>` / `-o <path>` writing into dotfile rc paths
 ///   (`~/.bashrc`, `~/.zshrc`, `~/.profile`, etc.): heuristic — any output
 ///   target whose basename starts with `.` and ends with `rc`, or matches a
@@ -3521,12 +3535,13 @@ pub fn check_forbidden_curl_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
     while i < args.len() {
         let a = args[i].as_ref();
 
-        // --config / -K (space-separated form)
-        if a == "--config" || a == "-K" {
-            return Err(cloud_deny_message("curl", a));
-        }
-        if a.starts_with("--config=") {
-            return Err(cloud_deny_message("curl", a));
+        // --config / -K — match the bare token AND the attached-value form
+        // (`--config=file`, `-K=file`). curl accepts both; comparing the
+        // normalised key closes the `-K=file` injection hole.
+        if let Some(key) = option_key(a) {
+            if key == "config" || key == "K" {
+                return Err(cloud_deny_message("curl", a));
+            }
         }
 
         // --output <path> / -o <path>
@@ -3605,26 +3620,42 @@ pub fn secure_wget_command() -> Command {
     cmd
 }
 
-/// wget flags that re-introduce the `WGETRC` threat shape, or directly
-/// execute attacker commands:
+/// wget flags that re-introduce the `WGETRC` threat shape, directly execute
+/// attacker commands, or read/write arbitrary local files:
 /// - `--config <file>` / `--config=<file>`: equivalent to WGETRC.
 /// - `--execute=<cmd>` / `-e <cmd>`: runs an arbitrary wgetrc directive
 ///   inline, including credential-loading or output-rewriting directives.
 /// - `--use-askpass=<file>`: runs the named program; direct RCE.
+/// - `--output-document` / `-O`: writes the response to an arbitrary path —
+///   clobber any file the process can write (`~/.bashrc`, authorized_keys).
+/// - `--input-file` / `-i`: reads a URL list from an arbitrary local file —
+///   an exfil primitive (the file's contents become request targets).
+/// - `--load-cookies`: loads a cookie jar from an arbitrary path, a
+///   cookie-theft pivot if pointed at another tool's session store.
+///
+/// All matches use `option_key` so the attached-value form (`-O=x`,
+/// `--output-document=x`) is caught alongside the bare and space-separated
+/// forms — see finding G4/#100.
 pub fn check_forbidden_wget_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_ref();
-        if a == "--config" || a.starts_with("--config=") {
-            return Err(cloud_deny_message("wget", a));
+    // Long-form keys (compared against the normalised `--key` of each arg).
+    const FORBIDDEN_LONG: &[&str] = &[
+        "config",
+        "execute",
+        "use-askpass",
+        "output-document",
+        "input-file",
+        "load-cookies",
+    ];
+    // Single-letter short keys.
+    const FORBIDDEN_SHORT: &[&str] = &["e", "O", "i"];
+
+    for arg in args {
+        let a = arg.as_ref();
+        if let Some(key) = option_key(a) {
+            if FORBIDDEN_LONG.contains(&key) || FORBIDDEN_SHORT.contains(&key) {
+                return Err(cloud_deny_message("wget", a));
+            }
         }
-        if a == "--execute" || a == "-e" || a.starts_with("--execute=") {
-            return Err(cloud_deny_message("wget", a));
-        }
-        if a == "--use-askpass" || a.starts_with("--use-askpass=") {
-            return Err(cloud_deny_message("wget", a));
-        }
-        i += 1;
     }
     Ok(())
 }
@@ -3863,6 +3894,15 @@ mod secure_cloud_tests {
         assert!(check_forbidden_curl_args(&["--config=/tmp/x"]).is_err());
     }
 
+    // G4/#100: the attached-value form (`-K=file`, `--config=file`) is valid
+    // curl syntax and must not bypass the deny-list.
+    #[test]
+    fn rejects_curl_config_attached_value_forms() {
+        assert!(check_forbidden_curl_args(&["-K=/tmp/evil"]).is_err());
+        assert!(check_forbidden_curl_args(&["--config=/tmp/evil"]).is_err());
+        assert!(check_forbidden_curl_args(&["-K=/tmp/x", "https://x"]).is_err());
+    }
+
     #[test]
     fn rejects_curl_output_to_rc_files() {
         assert!(check_forbidden_curl_args(&["https://x", "--output", "/home/u/.bashrc"]).is_err());
@@ -3903,11 +3943,36 @@ mod secure_cloud_tests {
         assert!(check_forbidden_wget_args(&["--use-askpass=/tmp/evil.sh"]).is_err());
     }
 
+    // G4/#100: --output-document / -O (file overwrite), --input-file / -i
+    // (file read), --load-cookies (cookie-theft pivot) — every shape.
+    #[test]
+    fn rejects_wget_output_document_all_forms() {
+        assert!(check_forbidden_wget_args(&["-O", "/home/u/.bashrc"]).is_err());
+        assert!(check_forbidden_wget_args(&["-O=/home/u/.bashrc"]).is_err());
+        assert!(check_forbidden_wget_args(&["--output-document", "/tmp/x"]).is_err());
+        assert!(check_forbidden_wget_args(&["--output-document=/tmp/x"]).is_err());
+    }
+
+    #[test]
+    fn rejects_wget_input_file_all_forms() {
+        assert!(check_forbidden_wget_args(&["-i", "/etc/passwd"]).is_err());
+        assert!(check_forbidden_wget_args(&["-i=/etc/passwd"]).is_err());
+        assert!(check_forbidden_wget_args(&["--input-file", "/etc/passwd"]).is_err());
+        assert!(check_forbidden_wget_args(&["--input-file=/etc/passwd"]).is_err());
+    }
+
+    #[test]
+    fn rejects_wget_load_cookies_all_forms() {
+        assert!(check_forbidden_wget_args(&["--load-cookies", "/tmp/jar"]).is_err());
+        assert!(check_forbidden_wget_args(&["--load-cookies=/tmp/jar"]).is_err());
+    }
+
     #[test]
     fn allows_safe_wget_args() {
         assert!(check_forbidden_wget_args(&["https://example.com"]).is_ok());
-        assert!(check_forbidden_wget_args(&["-O", "out.html", "https://x"]).is_ok());
         assert!(check_forbidden_wget_args(&["--tries=3", "https://x"]).is_ok());
+        assert!(check_forbidden_wget_args(&["-q", "https://x"]).is_ok());
+        assert!(check_forbidden_wget_args(&["--no-check-certificate", "https://x"]).is_ok());
     }
 
     #[test]

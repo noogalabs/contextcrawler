@@ -590,11 +590,6 @@ lazy_static! {
         "Rules file should reference the rewrite tool (RTK or ContextCrawler brand)",
         // src/core/telemetry_cmd.rs — telemetry interactive prompt.
         "RTK collects anonymous usage metrics",
-        // src/cmds/git/git.rs — diff-truncation recovery hint (user-visible).
-        "[full diff: rtk git diff --no-compact]",
-        // src/cmds/cloud/container.rs — Usage hints.
-        "Usage: rtk docker logs",
-        "Usage: rtk kubectl logs",
         // src/main.rs — Usage / error hints.
         "Usage: rtk proxy",
         "Use: rtk init --agent kilocode",

@@ -201,7 +201,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
 fn docker_logs(args: &[String], _verbose: u8) -> Result<i32> {
     let container = args.first().map(|s| s.as_str()).unwrap_or("");
     if container.is_empty() {
-        println!("Usage: rtk docker logs <container>");
+        println!("Usage: contextcrawler docker logs <container>");
         return Ok(0);
     }
 
@@ -371,7 +371,7 @@ fn format_kubectl_services(json: &Value) -> String {
 fn kubectl_logs(args: &[String], _verbose: u8) -> Result<i32> {
     let pod = args.first().map(|s| s.as_str()).unwrap_or("");
     if pod.is_empty() {
-        println!("Usage: rtk kubectl logs <pod>");
+        println!("Usage: contextcrawler kubectl logs <pod>");
         return Ok(0);
     }
 

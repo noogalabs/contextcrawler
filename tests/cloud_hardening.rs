@@ -278,6 +278,45 @@ fn curl_rejects_config_flag() {
     );
 }
 
+// G4/#100: the deny-list must catch the attached-value form (`-K=file`,
+// `--config=file`) — curl accepts these and they are equivalent to the
+// space-separated form a naive token compare missed.
+#[test]
+fn curl_rejects_short_config_attached_value() {
+    let out = run_cc(&[], &["curl", "-K=/tmp/evil.curlrc", "https://example.com"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "curl -K=file should be rejected (attached-value flag injection); stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn curl_rejects_long_config_attached_value() {
+    let out = run_cc(
+        &[],
+        &["curl", "--config=/tmp/evil.curlrc", "https://example.com"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "curl --config=file should be rejected; stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn curl_rejects_short_config_space_form() {
+    let out = run_cc(&[], &["curl", "-K", "/tmp/evil.curlrc"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "curl -K file should be rejected; stderr: {}",
+        stderr
+    );
+}
+
 #[test]
 fn curl_rejects_output_to_bashrc() {
     let out = run_cc(
@@ -319,5 +358,69 @@ fn wget_rejects_use_askpass() {
         stderr.contains("refusing to forward") && stderr.contains("--use-askpass"),
         "wget --use-askpass should be rejected; stderr: {}",
         stderr
+    );
+}
+
+// G4/#100: --output-document / -O (arbitrary file overwrite), --input-file /
+// -i (arbitrary file read), and --load-cookies (cookie-theft pivot) must be
+// rejected in every shape: short, long, space-separated and attached-value.
+fn wget_must_reject(args: &[&str], label: &str) {
+    let out = run_cc(&[], args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward"),
+        "wget {label} should be rejected; args={args:?}; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn wget_rejects_output_document_all_forms() {
+    wget_must_reject(
+        &["wget", "https://example.com", "-O", "/home/user/.bashrc"],
+        "-O (space form)",
+    );
+    wget_must_reject(
+        &["wget", "https://example.com", "-O=/home/user/.bashrc"],
+        "-O=x (attached form)",
+    );
+    wget_must_reject(
+        &["wget", "https://example.com", "--output-document", "/tmp/x"],
+        "--output-document (space form)",
+    );
+    wget_must_reject(
+        &["wget", "https://example.com", "--output-document=/tmp/x"],
+        "--output-document=x (attached form)",
+    );
+}
+
+#[test]
+fn wget_rejects_input_file_all_forms() {
+    wget_must_reject(
+        &["wget", "-i", "/etc/passwd"],
+        "-i (space form)",
+    );
+    wget_must_reject(
+        &["wget", "-i=/etc/passwd"],
+        "-i=x (attached form)",
+    );
+    wget_must_reject(
+        &["wget", "--input-file", "/etc/passwd"],
+        "--input-file (space form)",
+    );
+    wget_must_reject(
+        &["wget", "--input-file=/etc/passwd"],
+        "--input-file=x (attached form)",
+    );
+}
+
+#[test]
+fn wget_rejects_load_cookies_all_forms() {
+    wget_must_reject(
+        &["wget", "https://example.com", "--load-cookies", "/tmp/jar"],
+        "--load-cookies (space form)",
+    );
+    wget_must_reject(
+        &["wget", "https://example.com", "--load-cookies=/tmp/jar"],
+        "--load-cookies=x (attached form)",
     );
 }

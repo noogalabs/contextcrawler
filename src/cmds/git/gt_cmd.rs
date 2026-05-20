@@ -8,7 +8,7 @@ use crate::core::utils::{
 use anyhow::{Context, Result};
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 lazy_static! {
     static ref EMAIL_RE: Regex =
@@ -136,14 +136,29 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<i32> {
         anyhow::bail!("gt: no subcommand specified");
     }
 
+    // The subcommand name is matched lossily — git/gt subcommand names are
+    // ASCII, so a lossy compare is safe HERE. The argument tail is NOT
+    // stringified up front: the unknown-subcommand passthrough below keeps
+    // the original `OsStr` args so non-UTF-8 branch/path names survive
+    // intact. (#100 G4)
     let subcommand = args[0].to_string_lossy();
+
+    // gt passes unknown subcommands to git, so "gt status" = "git status".
+    // Route known git commands to RTK's git filters for token savings.
+    // The crate::git::run filters are typed on `&[String]` (clap-derived),
+    // so the known-command branches must lossily stringify the tail — an
+    // accepted limitation scoped to recognised subcommands only.
+    let known = matches!(
+        subcommand.as_ref(),
+        "status" | "diff" | "show" | "add" | "push" | "pull" | "fetch" | "stash" | "worktree"
+    );
+    if !known {
+        return passthrough_gt_os(&args[0], &args[1..], verbose);
+    }
     let rest: Vec<String> = args[1..]
         .iter()
         .map(|a| a.to_string_lossy().into())
         .collect();
-
-    // gt passes unknown subcommands to git, so "gt status" = "git status".
-    // Route known git commands to RTK's git filters for token savings.
     match subcommand.as_ref() {
         "status" => crate::git::run(crate::git::GitCommand::Status, &rest, None, verbose, &[]),
         "diff" => crate::git::run(crate::git::GitCommand::Diff, &rest, None, verbose, &[]),
@@ -166,16 +181,24 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<i32> {
             )
         }
         "worktree" => crate::git::run(crate::git::GitCommand::Worktree, &rest, None, verbose, &[]),
-        _ => passthrough_gt(&subcommand, &rest, verbose),
+        // Unreachable: the `known` guard above routes every other subcommand
+        // through `passthrough_gt_os` before this match. Kept exhaustive.
+        _ => passthrough_gt_os(&args[0], &args[1..], verbose),
     }
 }
 
-fn passthrough_gt(subcommand: &str, args: &[String], verbose: u8) -> Result<i32> {
+/// Forward an unknown `gt` subcommand to git without lossy conversion.
+///
+/// gt delegates unrecognised subcommands to git, so a non-UTF-8 branch or
+/// path name in the argument tail must reach git byte-for-byte. Keeping
+/// `OsStr` through the dispatch avoids the `to_string_lossy()` mangling that
+/// would corrupt such names. (#100 G4)
+fn passthrough_gt_os(subcommand: &OsStr, args: &[OsString], verbose: u8) -> Result<i32> {
     // SECURITY (issue #50 pre-PR review P0): gt passthrough must use
     // `secure_gt_command()` to apply UNIVERSAL_ENV_STRIP + GT_STRIP_ENV +
     // the inherited git env deny set.
-    let mut os_args: Vec<OsString> = vec![OsString::from(subcommand)];
-    os_args.extend(args.iter().map(OsString::from));
+    let mut os_args: Vec<OsString> = vec![subcommand.to_os_string()];
+    os_args.extend_from_slice(args);
     crate::core::runner::run_passthrough_cmd(secure_gt_command(), "gt", &os_args, verbose)
 }
 

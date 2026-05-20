@@ -132,11 +132,16 @@ fn normalize_diff_args_impl<F>(args: &[String], path_exists: F) -> Vec<String>
 where
     F: Fn(&str) -> bool,
 {
-    // Already has `--` — nothing to do
+    // Already has `--` anywhere — the user (or clap) placed the separator
+    // explicitly. Re-inserting a second one, or second-guessing the first,
+    // can only mis-place it; leave the args untouched. (#100 G4)
     if args.iter().any(|a| a == "--") {
         return args.to_vec();
     }
-    let path_start = args.iter().position(|arg| {
+
+    // Classify each positional once so we can both locate the path-start AND
+    // validate the ordering before committing to an injection.
+    let is_path = |arg: &str| -> bool {
         if arg.starts_with('-') {
             return false;
         }
@@ -149,20 +154,35 @@ where
         if arg.contains('/') || arg.contains('\\') {
             return path_exists(arg);
         }
-        // Bare word (no separator, no special prefix) — never inject `--`
-        // This avoids misidentifying a ref/branch as a path even if a same-named
+        // Bare word (no separator, no special prefix) — never a path.
+        // Avoids misidentifying a ref/branch as a path even if a same-named
         // file happens to exist on disk.
         false
-    });
-    match path_start {
-        Some(idx) => {
-            let mut out = args[..idx].to_vec();
-            out.push("--".to_string());
-            out.extend_from_slice(&args[idx..]);
-            out
-        }
-        None => args.to_vec(),
+    };
+
+    let path_start = args.iter().position(|arg| is_path(arg));
+    let Some(idx) = path_start else {
+        return args.to_vec();
+    };
+
+    // Defensive ordering check: `--` promotes EVERY following arg to a
+    // pathspec. If anything after the path-start looks like a revision
+    // (a non-flag, non-path positional — e.g. `HEAD`, `main`, `a..b`),
+    // the user's `<rev> -- <path>` intent is ambiguous and an injected
+    // `--` here would demote that revision to a path. In that case do
+    // nothing and let git resolve the args itself rather than risk a
+    // silently-wrong diff.
+    let ambiguous_tail = args[idx + 1..]
+        .iter()
+        .any(|arg| !arg.starts_with('-') && !is_path(arg));
+    if ambiguous_tail {
+        return args.to_vec();
     }
+
+    let mut out = args[..idx].to_vec();
+    out.push("--".to_string());
+    out.extend_from_slice(&args[idx..]);
+    out
 }
 
 fn run_diff(
@@ -520,7 +540,7 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
     }
 
     if was_truncated {
-        result.push("[full diff: rtk git diff --no-compact]".to_string());
+        result.push("[full diff: contextcrawler git diff --no-compact]".to_string());
     }
 
     result.join("\n")
@@ -974,6 +994,27 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             format!("contextcrawler git status {}", args.join(" "))
         };
         timer.track(&original_cmd, &rtk_cmd, &raw_output, &message);
+        return Ok(result.exit_code);
+    }
+
+    // Any other non-zero git exit (corrupt index, broken HEAD, etc.) must be
+    // surfaced raw with the real exit code — applying the porcelain filter to
+    // a failed run would absorb the error and report apparent success. (#100 G4)
+    if !result.success() {
+        if !result.stderr.trim().is_empty() {
+            eprint!("{}", result.stderr);
+        }
+        let original_cmd = if args.is_empty() {
+            "git status".to_string()
+        } else {
+            format!("git status {}", args.join(" "))
+        };
+        let rtk_cmd = if args.is_empty() {
+            "contextcrawler git status".to_string()
+        } else {
+            format!("contextcrawler git status {}", args.join(" "))
+        };
+        timer.track(&original_cmd, &rtk_cmd, &raw_output, &result.stdout);
         return Ok(result.exit_code);
     }
 
@@ -1669,6 +1710,22 @@ fn run_stash(
             cmd.args(["stash", "list"]);
             let result = exec_capture(&mut cmd).context("Failed to run git stash list")?;
 
+            // Surface a failed git run raw — filtering a non-zero exit would
+            // absorb the error and report apparent success. (#100 G4)
+            if !result.success() {
+                eprintln!("FAILED: git stash list");
+                if !result.stderr.trim().is_empty() {
+                    eprintln!("{}", result.stderr);
+                }
+                timer.track(
+                    "git stash list",
+                    "contextcrawler git stash list",
+                    &result.combined(),
+                    &result.combined(),
+                );
+                return Ok(result.exit_code);
+            }
+
             if result.stdout.trim().is_empty() {
                 let msg = "No stashes";
                 println!("{}", msg);
@@ -1692,6 +1749,22 @@ fn run_stash(
                 cmd.arg(arg);
             }
             let result = exec_capture(&mut cmd).context("Failed to run git stash show")?;
+
+            // A non-zero exit (bad stash ref, etc.) must propagate raw rather
+            // than be swallowed by the diff compactor. (#100 G4)
+            if !result.success() {
+                eprintln!("FAILED: git stash show");
+                if !result.stderr.trim().is_empty() {
+                    eprintln!("{}", result.stderr);
+                }
+                timer.track(
+                    "git stash show",
+                    "contextcrawler git stash show",
+                    &result.combined(),
+                    &result.combined(),
+                );
+                return Ok(result.exit_code);
+            }
 
             let filtered = if result.stdout.trim().is_empty() {
                 let msg = "Empty stash";
@@ -1858,6 +1931,22 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
     let mut cmd = git_cmd(global_args);
     cmd.args(["worktree", "list"]);
     let result = exec_capture(&mut cmd).context("Failed to run git worktree list")?;
+
+    // Propagate a failed git run instead of filtering it into apparent
+    // success (e.g. run outside a repo, or a corrupt worktree set). (#100 G4)
+    if !result.success() {
+        eprintln!("FAILED: git worktree list");
+        if !result.stderr.trim().is_empty() {
+            eprintln!("{}", result.stderr);
+        }
+        timer.track(
+            "git worktree list",
+            "contextcrawler git worktree",
+            &result.combined(),
+            &result.combined(),
+        );
+        return Ok(result.exit_code);
+    }
 
     let filtered = filter_worktree_list(&result.stdout);
     println!("{}", filtered);
@@ -3139,7 +3228,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
         }
         let result = compact_diff(&diff, 500);
         assert!(
-            result.contains("[full diff: rtk git diff --no-compact]"),
+            result.contains("[full diff: contextcrawler git diff --no-compact]"),
             "Expected recovery hint when hunk is truncated, got:\n{}",
             result
         );
