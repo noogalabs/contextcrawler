@@ -65,15 +65,17 @@ fn check_baseline_trust(path: &Path) -> BaselineTrust {
                 mode & 0o777
             ));
         }
-        // Reject ownership by anyone other than the running user. We use
-        // the real uid (geteuid would be subtler under setuid, but the
-        // CLI is never setuid).
+        // Trust a baseline owned by the running user, or by root: a
+        // root-owned baseline is the system-wide install pattern (a
+        // non-root user legitimately can't own it, and root ownership is
+        // strictly harder for an unprivileged attacker to forge). Reject
+        // any other uid. We use the effective uid (the CLI is never setuid).
         let our_uid = unsafe { libc::geteuid() };
-        if meta.uid() != our_uid {
+        let owner = meta.uid();
+        if owner != our_uid && owner != 0 {
             return BaselineTrust::Unsafe(format!(
-                "baseline is owned by uid {} (expected {})",
-                meta.uid(),
-                our_uid
+                "baseline is owned by uid {} (expected {} or root)",
+                owner, our_uid
             ));
         }
     }
