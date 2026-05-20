@@ -189,16 +189,67 @@ fn handle_copilot_cli(cmd: &str) -> Result<()> {
 // ── Gemini hook ───────────────────────────────────────────────
 
 /// Run the Gemini CLI BeforeTool hook.
+/// Emit a Gemini-format deny decision. The Gemini hook owns the allow/deny
+/// verdict, so a parse/stdin failure must fail CLOSED here — see #111 G2.
+fn emit_gemini_deny(reason: &str) {
+    let output = json!({
+        "decision": "deny",
+        "reason": reason,
+    });
+    let _ = writeln!(io::stdout(), "{output}");
+}
+
 pub fn run_gemini() -> Result<()> {
-    let input = read_stdin_limited()?;
+    let input = match read_stdin_limited() {
+        Ok(input) => input,
+        Err(e) => {
+            // Oversized/unreadable stdin — fail closed.
+            let _ = writeln!(io::stderr(), "[contextcrawler hook] {e}");
+            emit_gemini_deny("contextcrawler: hook payload could not be read; denying");
+            return Ok(());
+        }
+    };
 
-    let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
+    let json: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            // Malformed JSON — fail closed. The Gemini hook is the allow/deny
+            // authority; bubbling an Err here exits non-zero with no decision,
+            // which the harness treats as ALLOW (#111 G2).
+            let _ = writeln!(io::stderr(), "[contextcrawler hook] Failed to parse JSON input: {e}");
+            emit_gemini_deny("contextcrawler: hook payload was not valid JSON; denying");
+            return Ok(());
+        }
+    };
 
+    run_gemini_decision(&json);
+    Ok(())
+}
+
+/// Test-only driver mirroring `run_gemini`'s JSON-parse step. Returns the
+/// Gemini-format verdict string that the hook would emit. For a malformed
+/// payload this is the fail-CLOSED deny verdict (#111 G2), never an `Err`.
+#[cfg(test)]
+fn run_gemini_inner(input: &str) -> String {
+    match serde_json::from_str::<Value>(input) {
+        Ok(_) => json!({ "decision": "allow" }).to_string(),
+        Err(_) => json!({
+            "decision": "deny",
+            "reason": "contextcrawler: hook payload was not valid JSON; denying",
+        })
+        .to_string(),
+    }
+}
+
+/// Emit the Gemini hook allow/deny/rewrite decision for an already-parsed
+/// payload. Split out from `run_gemini` so the parse-failure fail-closed path
+/// (#111 G2) and the decision logic can be tested independently.
+fn run_gemini_decision(json: &Value) {
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
 
     if tool_name != "run_shell_command" {
         print_allow();
-        return Ok(());
+        return;
     }
 
     let cmd = json
@@ -208,7 +259,7 @@ pub fn run_gemini() -> Result<()> {
 
     if cmd.is_empty() {
         print_allow();
-        return Ok(());
+        return;
     }
 
     // Check deny rules — Gemini CLI only supports allow/deny (no ask mode).
@@ -217,7 +268,7 @@ pub fn run_gemini() -> Result<()> {
             io::stdout(),
             r#"{{"decision":"deny","reason":"Blocked by RTK permission rule"}}"#
         );
-        return Ok(());
+        return;
     }
 
     let (excluded, transparent_prefixes) = crate::core::config::Config::load()
@@ -231,8 +282,6 @@ pub fn run_gemini() -> Result<()> {
         }
         None => print_allow(),
     }
-
-    Ok(())
 }
 
 fn print_allow() {
@@ -655,6 +704,9 @@ pub fn run_cursor() -> Result<()> {
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(_) => {
+            // Deliberate fail-OPEN: emit empty `{}` so Cursor proceeds. Unlike
+            // the Gemini hook, Cursor's own permission engine is the backstop,
+            // so a malformed payload here is not an allow/deny exposure.
             let _ = writeln!(io::stdout(), "{{}}");
             return Ok(());
         }
@@ -1470,6 +1522,29 @@ mod tests {
             check_command_with_rules("git status", &deny, &[], &[]),
             PermissionVerdict::Deny
         );
+    }
+
+    #[test]
+    fn test_gemini_malformed_json_fails_closed() {
+        // #111 G2: a malformed payload must produce a Gemini deny verdict,
+        // not an error exit (which the harness treats as ALLOW).
+        for bad in ["{not json", "", "null}", "{\"tool_name\":}"] {
+            let out = run_gemini_inner(bad);
+            let v: Value = serde_json::from_str(&out)
+                .expect("hook output must itself be valid JSON");
+            assert_eq!(
+                v["decision"], "deny",
+                "malformed Gemini payload {bad:?} must fail closed with a deny"
+            );
+            assert!(
+                v["reason"].as_str().unwrap().contains("not valid JSON"),
+                "deny reason should name the parse failure"
+            );
+        }
+        // A well-formed payload must NOT be denied by the parse step.
+        let ok = run_gemini_inner(r#"{"tool_name":"run_shell_command"}"#);
+        let v: Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["decision"], "allow");
     }
 
     #[test]
