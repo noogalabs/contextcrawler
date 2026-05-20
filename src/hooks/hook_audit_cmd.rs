@@ -2,18 +2,58 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+/// Hard cap on how much of the audit log we will read (#100 G2 IMPORTANT 8).
+/// The log is append-only and small in normal use; a multi-GB file (whether
+/// accidental or a crafted symlink target) must not be slurped whole.
+const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+/// Cap on number of lines parsed, independent of byte size.
+const MAX_LOG_LINES: usize = 200_000;
+
+/// The directory the audit log is expected to live under.
+fn audit_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("RTK_AUDIT_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".local/share/rtk")
+    }
+}
 
 /// Default log file location (aligned with hook's $HOME/.local/share/rtk/).
 fn default_log_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("RTK_AUDIT_DIR") {
-        PathBuf::from(dir).join("hook-audit.log")
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home)
-            .join(".local/share/rtk")
-            .join("hook-audit.log")
+    audit_dir().join("hook-audit.log")
+}
+
+/// Validate that `log_path` resolves to a regular file inside `expected_dir`
+/// after canonicalisation (#100 G2 IMPORTANT 8).
+///
+/// This rejects a symlink whose target escapes the audit directory — a
+/// crafted `hook-audit.log` symlink pointing at `/etc/shadow` (or any
+/// arbitrary file) must not be read back and rendered.
+fn validate_log_path(log_path: &Path, expected_dir: &Path) -> Result<()> {
+    let canon_log = std::fs::canonicalize(log_path)
+        .with_context(|| format!("Failed to resolve {}", log_path.display()))?;
+    // The directory may legitimately be a symlink itself; canonicalise it
+    // too so the containment check compares like-for-like.
+    let canon_dir = std::fs::canonicalize(expected_dir)
+        .unwrap_or_else(|_| expected_dir.to_path_buf());
+    if !canon_log.starts_with(&canon_dir) {
+        anyhow::bail!(
+            "audit log {} resolves outside the audit directory {} — \
+             refusing to read (possible symlink escape)",
+            log_path.display(),
+            canon_dir.display()
+        );
     }
+    let meta = std::fs::symlink_metadata(&canon_log)
+        .with_context(|| format!("Failed to stat {}", canon_log.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("audit log {} is not a regular file", canon_log.display());
+    }
+    Ok(())
 }
 
 /// A single parsed audit log entry.
@@ -77,10 +117,46 @@ pub fn run(since_days: u64, verbose: u8) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&log_path)
-        .context(format!("Failed to read {}", log_path.display()))?;
+    // SECURITY (#100 G2 IMPORTANT 8): canonicalise + confirm the log lives
+    // inside the audit directory (rejects symlink escapes) before reading.
+    validate_log_path(&log_path, &audit_dir())?;
 
-    let entries: Vec<AuditEntry> = content.lines().filter_map(parse_line).collect();
+    let file = std::fs::File::open(&log_path)
+        .with_context(|| format!("Failed to open {}", log_path.display()))?;
+
+    // Stream the file with a byte cap and line cap rather than slurping an
+    // arbitrarily large file into memory with `read_to_string`.
+    let mut reader = BufReader::new(file);
+    let mut entries: Vec<AuditEntry> = Vec::new();
+    let mut bytes_read: u64 = 0;
+    let mut line = String::new();
+    loop {
+        if entries.len() >= MAX_LOG_LINES {
+            eprintln!(
+                "[contextcrawler] audit log line cap ({}) reached — output truncated",
+                MAX_LOG_LINES
+            );
+            break;
+        }
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .with_context(|| format!("Failed to read {}", log_path.display()))?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > MAX_LOG_BYTES {
+            eprintln!(
+                "[contextcrawler] audit log byte cap ({} MiB) reached — output truncated",
+                MAX_LOG_BYTES / (1024 * 1024)
+            );
+            break;
+        }
+        if let Some(entry) = parse_line(line.trim_end_matches(['\n', '\r'])) {
+            entries.push(entry);
+        }
+    }
 
     if entries.is_empty() {
         println!("Audit log is empty.");

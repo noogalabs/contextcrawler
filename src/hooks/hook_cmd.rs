@@ -50,7 +50,10 @@ pub fn run_copilot() -> Result<()> {
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            let _ = writeln!(
+                io::stderr(),
+                "[contextcrawler hook] Failed to parse JSON input: {e}"
+            );
             return Ok(());
         }
     };
@@ -145,7 +148,7 @@ fn handle_vscode(cmd: &str) -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": PRE_TOOL_USE_KEY,
             "permissionDecision": decision,
-            "permissionDecisionReason": "RTK auto-rewrite",
+            "permissionDecisionReason": "contextcrawler auto-rewrite",
             "updatedInput": { "command": rewritten }
         }
     });
@@ -169,7 +172,7 @@ fn handle_copilot_cli(cmd: &str) -> Result<()> {
     let output = json!({
         "permissionDecision": "deny",
         "permissionDecisionReason": format!(
-            "Token savings: use `{}` instead (rtk saves 60-90% tokens)",
+            "Token savings: use `{}` instead (contextcrawler saves 60-90% tokens)",
             rewritten
         )
     });
@@ -294,16 +297,29 @@ enum PayloadAction {
         reason: &'static str,
         cmd: String,
     },
+    /// Genuine shape error in the payload — fail CLOSED with a deny verdict.
+    Deny {
+        reason: &'static str,
+    },
     Ignore,
 }
 
 fn process_claude_payload(v: &Value) -> PayloadAction {
-    let cmd = match v
-        .pointer("/tool_input/command")
-        .and_then(|c| c.as_str())
-        .filter(|c| !c.is_empty())
-    {
-        Some(c) => c,
+    // Distinguish "legitimately no command to rewrite" (Ignore — correct)
+    // from "malformed payload shape" (Deny — fail closed, #100 G2).
+    let cmd = match v.pointer("/tool_input/command") {
+        // A present `command` that is not a non-empty string is a shape
+        // error — the harness sent something we can't reason about.
+        Some(c) => match c.as_str() {
+            Some(s) if !s.is_empty() => s,
+            Some(_) => return PayloadAction::Ignore, // empty string: nothing to do
+            None => {
+                return PayloadAction::Deny {
+                    reason: "contextcrawler: hook payload `command` was not a string; denying",
+                }
+            }
+        },
+        // No `command` field at all — non-Bash tool or no command to gate.
         None => return PayloadAction::Ignore,
     };
 
@@ -335,15 +351,17 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
 
     let mut hook_output = json!({
         "hookEventName": PRE_TOOL_USE_KEY,
-        "permissionDecisionReason": "RTK auto-rewrite",
+        "permissionDecisionReason": "contextcrawler auto-rewrite",
         "updatedInput": updated_input
     });
 
     if verdict == PermissionVerdict::Allow {
-        hook_output
-            .as_object_mut()
-            .unwrap()
-            .insert("permissionDecision".into(), json!("allow"));
+        // `hook_output` is a `json!` object literal, so `as_object_mut`
+        // is always `Some` — but use a checked branch rather than
+        // `.unwrap()` so the hook can never panic on the payload path.
+        if let Some(obj) = hook_output.as_object_mut() {
+            obj.insert("permissionDecision".into(), json!("allow"));
+        }
     }
 
     PayloadAction::Rewrite {
@@ -353,19 +371,48 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     }
 }
 
+/// Emit a Claude Code PreToolUse `deny` verdict.
+///
+/// SECURITY: every payload-error path on the Claude hook must fail CLOSED.
+/// A malformed/oversized/unparseable payload means the hook can't reason
+/// about the command — emitting `deny` makes the harness block it instead
+/// of silently letting the unchecked command run (fail-open hole, #100 G2).
+fn emit_claude_deny(reason: &str) {
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE_KEY,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    });
+    let _ = writeln!(io::stdout(), "{output}");
+}
+
 /// Run the Claude Code PreToolUse hook natively.
 pub fn run_claude() -> Result<()> {
-    let input = read_stdin_limited()?;
+    let input = match read_stdin_limited() {
+        Ok(input) => input,
+        Err(e) => {
+            // Oversized/unreadable stdin — fail closed.
+            let _ = writeln!(io::stderr(), "[contextcrawler hook] {e}");
+            emit_claude_deny("contextcrawler: hook payload could not be read; denying");
+            return Ok(());
+        }
+    };
 
     let input = input.trim();
     if input.is_empty() {
+        // No payload at all — nothing to gate. The harness invoked the hook
+        // with empty stdin; treat as a no-op rather than denying.
         return Ok(());
     }
 
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            // Malformed JSON — fail closed.
+            let _ = writeln!(io::stderr(), "[contextcrawler hook] Failed to parse JSON input: {e}");
+            emit_claude_deny("contextcrawler: hook payload was not valid JSON; denying");
             return Ok(());
         }
     };
@@ -382,17 +429,33 @@ pub fn run_claude() -> Result<()> {
         PayloadAction::Skip { reason, cmd } => {
             audit_log(reason, &cmd, "");
         }
+        PayloadAction::Deny { reason } => {
+            audit_log("deny:malformed_payload", "", "");
+            emit_claude_deny(reason);
+        }
         PayloadAction::Ignore => {}
     }
 
     Ok(())
 }
 
+/// Test-only driver mirroring `run_claude`. Returns the emitted JSON verdict
+/// (rewrite or deny), or `None` for a silent pass-through (`Ignore`/`Skip`).
 #[cfg(test)]
 fn run_claude_inner(input: &str) -> Option<String> {
     let v: Value = serde_json::from_str(input).ok()?;
     match process_claude_payload(&v) {
         PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
+        PayloadAction::Deny { reason } => Some(
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE_KEY,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+            .to_string(),
+        ),
         _ => None,
     }
 }
@@ -769,7 +832,7 @@ mod tests {
         assert_eq!(hook["hookEventName"], PRE_TOOL_USE_KEY);
         // permissionDecision is only set when an explicit allow rule matches;
         // with default-to-ask semantics (no rules configured), it is absent.
-        assert_eq!(hook["permissionDecisionReason"], "RTK auto-rewrite");
+        assert_eq!(hook["permissionDecisionReason"], "contextcrawler auto-rewrite");
         assert!(hook["updatedInput"].is_object());
         assert!(hook["updatedInput"]["command"].is_string());
     }
@@ -778,6 +841,63 @@ mod tests {
     fn test_claude_no_tool_input_passthrough() {
         let input = json!({ "tool_name": "Bash" }).to_string();
         assert!(run_claude_inner(&input).is_none());
+    }
+
+    // --- Fail-closed payload handling (#100 G2 CRITICAL 1) ---
+
+    /// A `command` field present but not a string is a malformed shape —
+    /// the hook must emit a `deny` verdict, not silently Ignore.
+    #[test]
+    fn test_claude_non_string_command_denies() {
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": 12345 }
+        })
+        .to_string();
+        let result = run_claude_inner(&input).expect("malformed shape must emit a verdict");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    /// `process_claude_payload` classifies a non-string command as Deny.
+    #[test]
+    fn test_process_payload_non_string_command_is_deny() {
+        let v = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": ["array", "not", "string"] }
+        });
+        assert!(matches!(
+            process_claude_payload(&v),
+            PayloadAction::Deny { .. }
+        ));
+    }
+
+    /// A valid payload with no `command` field stays Ignore (correct — not
+    /// a parse error, just nothing to rewrite).
+    #[test]
+    fn test_process_payload_missing_command_is_ignore() {
+        let v = json!({ "tool_name": "Bash", "tool_input": {} });
+        assert!(matches!(process_claude_payload(&v), PayloadAction::Ignore));
+    }
+
+    /// The deny verdict emitted for a malformed payload carries the
+    /// Claude PreToolUse `permissionDecision: deny` contract.
+    #[test]
+    fn test_claude_deny_verdict_contract() {
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": false }
+        })
+        .to_string();
+        let result = run_claude_inner(&input).expect("malformed shape must emit a verdict");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        let hook = &v["hookSpecificOutput"];
+        assert_eq!(hook["hookEventName"], PRE_TOOL_USE_KEY);
+        assert_eq!(hook["permissionDecision"], "deny");
+        assert!(hook["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("contextcrawler"));
     }
 
     // --- Cursor handler ---

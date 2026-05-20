@@ -150,6 +150,14 @@ pub fn run(
                 );
                 eprintln!();
             }
+            hook_check::HookStatus::Broken => {
+                eprintln!(
+                    "{}",
+                    "[warn] Hook registered but its binary is missing — run `contextcrawler init -g` to repair (you are NOT protected)"
+                        .yellow()
+                );
+                eprintln!();
+            }
             hook_check::HookStatus::Ok => {}
         }
 

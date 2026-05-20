@@ -645,6 +645,16 @@ enum Commands {
 
     /// Execute command without filtering but track usage
     Proxy {
+        /// Interpret a single quoted argument as a shell command line.
+        ///
+        /// SECURITY: by default `args` is passed verbatim as argv —
+        /// `args[0]` is the binary, `args[1..]` its arguments — so a binary
+        /// path containing whitespace can never be split into the wrong
+        /// program. `--shell` is the explicit opt-in for callers that
+        /// genuinely need shell word-splitting / quoting of a single arg.
+        #[arg(long)]
+        shell: bool,
+
         /// Command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
@@ -1429,6 +1439,16 @@ enum GtCommands {
 /// e.g. `git log --format="%H %s"` → ["git", "log", "--format=%H %s"]
 fn shell_split(input: &str) -> Vec<String> {
     discover::lexer::shell_split(input)
+}
+
+/// Final path component of a binary token, used to normalise an
+/// absolute/relative path (`/usr/bin/npm`) down to its name (`npm`) for
+/// membership checks against `META_PASSTHROUGH_BINS` (#100 G2 IMPORTANT 3).
+fn bin_basename(bin: &str) -> &str {
+    std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(bin)
 }
 
 /// `true` when the proxy nudge should be printed to stderr. Three independent
@@ -2557,8 +2577,16 @@ fn run_cli() -> Result<i32> {
         // falls through clap → run_fallback → raw exec, writing a
         // parse_failure row per call. Issue #90.
         if let Some(bin) = raw_args.first().map(|s| s.as_str()) {
-            if META_PASSTHROUGH_BINS.contains(&bin) && cmd_has_meta_flag(&raw_args[1..]) {
-                return run_simple_passthrough(bin, &raw_args[1..]);
+            // SECURITY (#100 G2 IMPORTANT 3): basename-normalise the bin
+            // token before the membership check. `contextcrawler
+            // /usr/bin/npm --version` must still hit the hardened
+            // `run_simple_passthrough` path — matching on the raw token
+            // would miss it and fall through to `run_fallback` without the
+            // per-tool env hardening. Same basename logic the fallback
+            // hardening path uses (`cloud_fallback_hardening`).
+            let bin_base = bin_basename(bin);
+            if META_PASSTHROUGH_BINS.contains(&bin_base) && cmd_has_meta_flag(&raw_args[1..]) {
+                return run_simple_passthrough(bin_base, &raw_args[1..]);
             }
         }
     }
@@ -3463,43 +3491,65 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Proxy { args } => {
+        Commands::Proxy { shell, args } => {
+            use std::ffi::OsString;
             use std::io::{Read, Write};
+            use std::process::Command as ProcCommand;
             use std::process::Stdio;
             use std::sync::atomic::{AtomicU32, Ordering};
             use std::thread;
 
             if args.is_empty() {
                 anyhow::bail!(
-                    "proxy requires a command to execute\nUsage: rtk proxy <command> [args...]"
+                    "proxy requires a command to execute\n\
+                     Usage: contextcrawler proxy <command> [args...]"
                 );
             }
 
             let timer = core::tracking::TimedExecution::start();
 
-            // If a single quoted arg contains spaces, split it respecting quotes (#388).
-            // e.g. rtk proxy 'head -50 file.php' → cmd=head, args=["-50", "file.php"]
-            // e.g. rtk proxy 'git log --format="%H %s"' → cmd=git, args=["log", "--format=%H %s"]
-            let (cmd_name, cmd_args): (String, Vec<String>) = if args.len() == 1 {
+            // SECURITY (#100 G2 CRITICAL 2): keep argv as OsString end-to-end.
+            // The default path passes argv verbatim — argv[0] is the binary,
+            // argv[1..] its arguments — so a binary path containing
+            // whitespace can never be word-split into the wrong program.
+            //
+            // `--shell` is the explicit opt-in for callers that genuinely
+            // need shell word-splitting of a single quoted argument
+            // (formerly #388). It is gated, never a heuristic on a
+            // positional arg.
+            let (cmd_name, cmd_args): (OsString, Vec<OsString>) = if shell {
+                if args.len() != 1 {
+                    anyhow::bail!(
+                        "proxy --shell expects exactly one quoted command-line argument"
+                    );
+                }
                 let full = args[0].to_string_lossy();
                 let parts = shell_split(&full);
-                if parts.len() > 1 {
-                    (parts[0].clone(), parts[1..].to_vec())
-                } else {
-                    (full.into_owned(), vec![])
+                match parts.split_first() {
+                    Some((first, rest)) => (
+                        OsString::from(first),
+                        rest.iter().map(OsString::from).collect(),
+                    ),
+                    None => anyhow::bail!("proxy --shell: empty command line"),
                 }
             } else {
-                (
-                    args[0].to_string_lossy().into_owned(),
-                    args[1..]
-                        .iter()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .collect(),
-                )
+                (args[0].clone(), args[1..].to_vec())
             };
 
+            // Lossy String forms — used ONLY for display, the nudge and
+            // usage tracking, never for spawning the process.
+            let cmd_name_display = cmd_name.to_string_lossy().into_owned();
+            let cmd_args_display: Vec<String> = cmd_args
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+
             if cli.verbose > 0 {
-                eprintln!("Proxy mode: {} {}", cmd_name, cmd_args.join(" "));
+                eprintln!(
+                    "Proxy mode: {} {}",
+                    cmd_name_display,
+                    cmd_args_display.join(" ")
+                );
             }
 
             // Nudge: if the proxied tool has a wrapped equivalent, point the
@@ -3514,10 +3564,10 @@ fn run_cli() -> Result<i32> {
             //      CircleCI, Travis all set this) so pipeline stderr stays clean
             //   3. stderr not a tty — script/pipe consumer can't act on the nudge
             if should_emit_proxy_nudge() {
-                let basename = std::path::Path::new(&cmd_name)
+                let basename = std::path::Path::new(&cmd_name_display)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or(&cmd_name);
+                    .unwrap_or(&cmd_name_display);
                 if let Some(suggestion) = proxy_wrapped_equivalent(basename) {
                     eprintln!(
                         "[contextcrawler] note: `proxy {basename}` bypasses the wrapped filter. \
@@ -3569,13 +3619,30 @@ fn run_cli() -> Result<i32> {
                 }
             }
 
+            // SECURITY: spawn argv[0] as an OsStr. If it contains a path
+            // separator the user gave an explicit path — exec it directly,
+            // no PATH lookup. Otherwise resolve the bare name via PATH.
+            // Either way argv[0] and argv[1..] stay OsString — never
+            // word-split, never shell-interpreted.
+            let mut proc_cmd = {
+                let has_sep = std::path::Path::new(&cmd_name)
+                    .components()
+                    .nth(1)
+                    .is_some()
+                    || cmd_name.to_string_lossy().contains(std::path::MAIN_SEPARATOR);
+                if has_sep {
+                    ProcCommand::new(&cmd_name)
+                } else {
+                    core::utils::resolved_command(&cmd_name_display)
+                }
+            };
             let mut child = ChildGuard(Some(
-                core::utils::resolved_command(cmd_name.as_ref())
+                proc_cmd
                     .args(&cmd_args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
-                    .context(format!("Failed to execute command: {}", cmd_name))?,
+                    .context(format!("Failed to execute command: {}", cmd_name_display))?,
             ));
 
             // Store child PID for signal handler before anything can fail
@@ -3644,7 +3711,7 @@ fn run_cli() -> Result<i32> {
                 .take()
                 .context("Child process missing")?
                 .wait()
-                .context(format!("Failed waiting for command: {}", cmd_name))?;
+                .context(format!("Failed waiting for command: {}", cmd_name_display))?;
 
             let stdout_bytes = stdout_handle
                 .join()
@@ -3659,13 +3726,17 @@ fn run_cli() -> Result<i32> {
 
             // Track usage (input = output since no filtering)
             timer.track(
-                &format!("{} {}", cmd_name, cmd_args.join(" ")),
-                &format!("contextcrawler proxy {} {}", cmd_name, cmd_args.join(" ")),
+                &format!("{} {}", cmd_name_display, cmd_args_display.join(" ")),
+                &format!(
+                    "contextcrawler proxy {} {}",
+                    cmd_name_display,
+                    cmd_args_display.join(" ")
+                ),
                 &full_output,
                 &full_output,
             );
 
-            core::utils::exit_code_from_status(&status, &cmd_name)
+            core::utils::exit_code_from_status(&status, &cmd_name_display)
         }
 
         Commands::Trust { list, global } => {
@@ -4241,6 +4312,58 @@ mod tests {
     fn test_shell_split_empty() {
         let result: Vec<String> = shell_split("");
         assert!(result.is_empty());
+    }
+
+    // --- #100 G2 IMPORTANT 3: absolute-path bin basename normalisation ---
+
+    #[test]
+    fn test_bin_basename_absolute_path() {
+        assert_eq!(bin_basename("/usr/bin/npm"), "npm");
+        assert_eq!(bin_basename("/usr/local/bin/cargo"), "cargo");
+        assert_eq!(bin_basename("./node_modules/.bin/pnpm"), "pnpm");
+    }
+
+    #[test]
+    fn test_bin_basename_bare_name() {
+        assert_eq!(bin_basename("npm"), "npm");
+        assert_eq!(bin_basename("cargo"), "cargo");
+    }
+
+    /// `contextcrawler /usr/bin/npm --version` must resolve to a bin that
+    /// is in `META_PASSTHROUGH_BINS` so it hits the hardened
+    /// `run_simple_passthrough` path, not `run_fallback`.
+    #[test]
+    fn test_absolute_path_bin_matches_meta_passthrough() {
+        let raw = "/usr/bin/npm";
+        assert!(
+            !META_PASSTHROUGH_BINS.contains(&raw),
+            "raw absolute path must NOT match — that was the bug"
+        );
+        assert!(
+            META_PASSTHROUGH_BINS.contains(&bin_basename(raw)),
+            "basename-normalised bin must match META_PASSTHROUGH_BINS"
+        );
+    }
+
+    // --- #100 G2 CRITICAL 2: proxy keeps whitespace-containing argv intact ---
+
+    /// Without `--shell`, a binary path containing whitespace is a single
+    /// argv[0] token — it must never be word-split. This is the OsString
+    /// passthrough path: `args[0]` is the binary verbatim.
+    #[test]
+    fn test_proxy_default_does_not_split_whitespace_path() {
+        use std::ffi::OsString;
+        // Simulates `contextcrawler proxy "/opt/my tool/bin" arg1`.
+        let args: Vec<OsString> = vec![
+            OsString::from("/opt/my tool/bin"),
+            OsString::from("arg1"),
+        ];
+        // Default (non-shell) path: argv[0] verbatim, argv[1..] verbatim.
+        let (cmd_name, cmd_args) = (args[0].clone(), args[1..].to_vec());
+        assert_eq!(cmd_name, OsString::from("/opt/my tool/bin"));
+        assert_eq!(cmd_args, vec![OsString::from("arg1")]);
+        // The path is a single token — shell_split WOULD have wrongly split it.
+        assert!(shell_split(&cmd_name.to_string_lossy()).len() > 1);
     }
 
     #[test]
