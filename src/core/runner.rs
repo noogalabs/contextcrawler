@@ -14,6 +14,32 @@ pub fn print_with_hint(filtered: &str, raw: &str, tee_label: &str, exit_code: i3
     }
 }
 
+/// No-bloat guard: a filter must never cost more than it saves.
+///
+/// Given the `baseline` a filter is tracked against and the `filtered`
+/// output the filter produced, return whichever is smaller (by byte length).
+/// When the filtered form is the same size or larger than the baseline,
+/// the wrapper has added framing/summary without saving anything — in that
+/// case the raw baseline is returned so the caller emits *and* tracks it.
+///
+/// Callers MUST emit exactly the returned string and pass that same value
+/// to `timer.track(..)` as the output, so what the user sees and what the
+/// tracking DB records always agree. See issue #95.
+///
+/// Note `baseline` is whatever the caller chose to track against — usually
+/// raw command output, but for filters that deliberately measure against a
+/// synthetic baseline (e.g. `git add` tracks against `git diff --cached
+/// --stat`, issue #89) it is that synthetic string. The guard compares the
+/// filtered output against that same baseline, so an intentional compact
+/// summary that is smaller than its synthetic baseline survives untouched.
+pub fn no_bloat<'a>(baseline: &'a str, filtered: &'a str) -> &'a str {
+    if filtered.len() >= baseline.len() {
+        baseline
+    } else {
+        filtered
+    }
+}
+
 #[derive(Default)]
 pub struct RunOptions<'a> {
     pub tee_label: Option<&'a str>,
@@ -96,24 +122,31 @@ pub fn run(
             };
             let filtered = filter_fn(text_to_filter);
 
-            if let Some(label) = opts.tee_label {
-                print_with_hint(&filtered, raw, label, exit_code);
-            } else if opts.no_trailing_newline {
-                print!("{}", filtered);
-            } else {
-                println!("{}", filtered);
-            }
-
             let raw_for_tracking = if opts.filter_stdout_only {
                 raw_stdout
             } else {
                 raw
             };
+
+            // No-bloat guard (issue #95): if the filtered output is the same
+            // size or larger than the raw it was tracked against, the filter
+            // is costing more than it saves — emit the raw output instead so
+            // print and track agree and savings never go negative.
+            let emitted = no_bloat(raw_for_tracking, &filtered);
+
+            if let Some(label) = opts.tee_label {
+                print_with_hint(emitted, raw, label, exit_code);
+            } else if opts.no_trailing_newline {
+                print!("{}", emitted);
+            } else {
+                println!("{}", emitted);
+            }
+
             timer.track(
                 &cmd_label,
                 &format!("contextcrawler {}", cmd_label),
                 raw_for_tracking,
-                &filtered,
+                emitted,
             );
             Ok(exit_code)
         }
@@ -222,4 +255,56 @@ pub fn run_streamed(
         RunMode::Streamed(filter),
         opts,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- no-bloat guard (issue #95) ---
+
+    #[test]
+    fn no_bloat_emits_raw_when_filter_inflates() {
+        // A no-match grep: raw is empty, the "0 matches" convenience message
+        // is pure overhead. The guard must pick the raw (empty) output.
+        let raw = "";
+        let filtered = "0 matches for 'needle'";
+        assert_eq!(no_bloat(raw, filtered), raw);
+    }
+
+    #[test]
+    fn no_bloat_emits_raw_when_equal_size() {
+        // Equal byte length is still "no saving" — guard prefers raw so the
+        // filter never costs anything and tracking shows 0%, not negative.
+        let raw = "abcdef";
+        let filtered = "uvwxyz";
+        assert_eq!(no_bloat(raw, filtered), raw);
+    }
+
+    #[test]
+    fn no_bloat_keeps_filtered_when_it_saves() {
+        // A normal large-output filter (filtered << raw) is unaffected:
+        // the compact form is returned untouched.
+        let raw = "line one\nline two\nline three\nline four\nline five\n";
+        let filtered = "5 lines";
+        assert_eq!(no_bloat(raw, filtered), filtered);
+        assert!(no_bloat(raw, filtered).len() < raw.len());
+    }
+
+    #[test]
+    fn no_bloat_keeps_intentional_summary_against_synthetic_baseline() {
+        // `git add` tracks the compact shortstat against a synthetic
+        // `git diff --cached --stat` baseline (issue #89), NOT raw git-add
+        // output (which is silent). The compact summary is shorter than that
+        // multi-line baseline, so the guard leaves it intact — the
+        // informational filter is not regressed.
+        let synthetic_baseline = "\
+ src/core/runner.rs   | 42 ++++++++++
+ src/cmds/git/git.rs  | 17 +++++--
+ src/cmds/system/grep_cmd.rs | 13 ++++-
+ 3 files changed, 64 insertions(+), 8 deletions(-)";
+        let compact = "ok 3 files changed, 64 insertions(+), 8 deletions(-)";
+        assert!(compact.len() < synthetic_baseline.len());
+        assert_eq!(no_bloat(synthetic_baseline, compact), compact);
+    }
 }

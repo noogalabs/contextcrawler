@@ -3,6 +3,7 @@
 use crate::core::stream::{
     self, exec_capture, CaptureResult, FilterMode, LineHandler, LineStreamFilter, StdinMode,
 };
+use crate::core::runner;
 use crate::core::tracking;
 use crate::core::utils::{exit_code_from_output, exit_code_from_status, secure_git_command};
 use anyhow::{Context, Result};
@@ -1045,20 +1046,38 @@ fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> 
             }
         };
 
-        println!("{}", compact);
-
         // Tracking baseline: the full `git diff --cached --stat` output
         // (multi-line, per-file) — what the agent would have asked for
         // next. Compact side is the shortstat we just printed. This gives
         // positive savings on real adds and ~0 on trivial ones; the prior
         // baseline (raw stdout of `git add`, which is silent) caused
         // -1300% records. See #89.
+        //
+        // No-bloat guard (issue #95) runs against THIS synthetic baseline,
+        // not raw `git add` output. The compact shortstat is virtually
+        // always shorter than the multi-line per-file stat, so the
+        // intentional informational summary survives; the guard only kicks
+        // in for the degenerate case where the stat baseline is itself
+        // tiny, where emitting it raw costs nothing.
         let baseline = stat_result.stdout.clone();
+        // When `git add` stages nothing (a no-op add), the synthetic
+        // `git diff --cached --stat` baseline is empty. An empty string is
+        // shorter than any compact message, so `no_bloat` would pick it and
+        // silence the legitimate `ok (nothing to add)` summary. An empty
+        // baseline is not meaningful "raw output to fall back to" — it just
+        // means the stat command produced nothing — so skip the guard and
+        // emit the compact message as-is. See issue #95.
+        let emitted = if baseline.trim().is_empty() {
+            compact.as_str()
+        } else {
+            runner::no_bloat(&baseline, &compact)
+        };
+        println!("{}", emitted);
         timer.track(
             &format!("git add {}", args.join(" ")),
             &format!("contextcrawler git add {}", args.join(" ")),
             &baseline,
-            &compact,
+            emitted,
         );
     } else {
         eprintln!("FAILED: git add");
@@ -1295,13 +1314,16 @@ fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
             }
         };
 
-        println!("{}", compact);
+        // No-bloat guard (issue #95): emit the smaller of compact summary
+        // vs raw git-pull output so the filter never costs more than it saves.
+        let emitted = runner::no_bloat(&raw_output, &compact);
+        println!("{}", emitted);
 
         timer.track(
             &format!("git pull {}", args.join(" ")),
             &format!("contextcrawler git pull {}", args.join(" ")),
             &raw_output,
-            &compact,
+            emitted,
         );
     } else {
         eprintln!("FAILED: git pull");
@@ -2648,6 +2670,35 @@ A  added.rs
             savings,
             baseline_tokens,
             compact_tokens
+        );
+    }
+
+    #[test]
+    fn test_git_add_noop_keeps_message_against_empty_baseline() {
+        // #95 regression: a no-op `git add` (nothing staged) produces an
+        // EMPTY `git diff --cached --stat` baseline. `no_bloat` would pick
+        // the empty string over the compact message (empty is shorter),
+        // silencing the legitimate `ok (nothing to add)` summary. `run_add`
+        // must short-circuit the guard on an empty baseline.
+        let baseline = "";
+        let compact = "ok (nothing to add)".to_string();
+
+        // Naively applying the guard silences the message — the bug.
+        assert_eq!(
+            runner::no_bloat(baseline, &compact),
+            "",
+            "precondition: no_bloat alone would suppress the message"
+        );
+
+        // The short-circuit run_add uses: empty baseline => emit compact.
+        let emitted = if baseline.trim().is_empty() {
+            compact.as_str()
+        } else {
+            runner::no_bloat(baseline, &compact)
+        };
+        assert_eq!(
+            emitted, "ok (nothing to add)",
+            "no-op git add must still emit its message"
         );
     }
 
