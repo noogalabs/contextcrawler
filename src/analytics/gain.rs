@@ -2,7 +2,7 @@
 
 use crate::core::display_helpers::{format_duration, print_period_table};
 use crate::core::tracking::{DayStats, MonthStats, Tracker, WeekStats};
-use crate::core::utils::format_tokens;
+use crate::core::utils::{format_tokens, truncate};
 use crate::hooks::hook_check;
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -259,11 +259,9 @@ pub fn run(
                 for rec in recent {
                     let time = rec.timestamp.with_timezone(&Local).format("%m-%d %H:%M");
                     let display = display_cmd(&rec.rtk_cmd);
-                    let cmd_short = if display.len() > 25 {
-                        format!("{}...", &display[..22])
-                    } else {
-                        display.to_string()
-                    };
+                    // G7/#100: char-safe truncation — byte slicing panics
+                    // when a multibyte char straddles the boundary.
+                    let cmd_short = truncate(display, 25);
                     // added: tier indicators by savings level
                     let sign = if rec.savings_pct >= 70.0 {
                         "▲"
@@ -721,11 +719,8 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
         println!("{}", "─".repeat(60));
         for (cmd, count) in &summary.top_commands {
             let display = display_cmd(cmd);
-            let cmd_display = if display.len() > 50 {
-                format!("{}...", &display[..47])
-            } else {
-                display.to_string()
-            };
+            // G7/#100: char-safe truncation (see note above).
+            let cmd_display = truncate(display, 50);
             println!("  {:>4}x  {}", count, cmd_display);
         }
         println!();
@@ -741,11 +736,8 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
                 &rec.timestamp
             };
             let status = if rec.fallback_succeeded { "ok" } else { "FAIL" };
-            let cmd_display = if rec.raw_command.len() > 40 {
-                format!("{}...", &rec.raw_command[..37])
-            } else {
-                rec.raw_command.clone()
-            };
+            // G7/#100: char-safe truncation (see note above).
+            let cmd_display = truncate(&rec.raw_command, 40);
             println!("  {} [{}] {}", ts_short, status, cmd_display);
         }
         println!();
@@ -775,4 +767,34 @@ fn confirm_reset() -> Result<bool> {
         .context("Failed to read confirmation")?;
 
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // G7/#100: `gain` truncates user-controlled command strings for display.
+    // Byte slicing (`&s[..n]`) panics when a multibyte char straddles the
+    // boundary; the char-safe `truncate` helper used at each display site
+    // must never panic regardless of where the cut falls.
+    #[test]
+    fn test_gain_truncation_multibyte_no_panic() {
+        // Each `é` is 2 bytes; emoji are 4. The 25/40/50-char limits used by
+        // `gain` would land mid-codepoint under naive byte slicing.
+        let multibyte = "git commit -m \"café 日本語 🚀🚀🚀 résumé déjà vu\"";
+        for limit in [25usize, 40, 50] {
+            let out = truncate(multibyte, limit);
+            // Sanity: result is valid UTF-8 (String guarantees it) and is no
+            // longer than the limit in chars.
+            assert!(out.chars().count() <= limit);
+        }
+        // A string whose Nth byte is mid-codepoint at every tested boundary.
+        let all_multibyte = "日".repeat(60);
+        for limit in [25usize, 40, 50] {
+            let _ = truncate(&all_multibyte, limit);
+        }
+        // display_cmd + truncate together, as the Recent Commands path does.
+        let prefixed = format!("contextcrawler git log {}", "日".repeat(40));
+        let _ = truncate(display_cmd(&prefixed), 25);
+    }
 }
