@@ -246,6 +246,45 @@ pub fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
 // ISSUE #897: ChildGuard RAII prevents zombie processes that caused kernel panic
 pub const RAW_CAP: usize = 10_485_760; // 10 MiB
 
+/// Bound on the line-passing channel between the reader threads and the
+/// consumer loop. Without a bound, a child that floods stdout faster than the
+/// consumer can drain it grows the channel unboundedly (OOM). 4096 buffered
+/// lines is generous headroom while still capping memory.
+const STREAM_CHANNEL_CAP: usize = 4096;
+
+/// Cap on the in-memory `filtered` accumulator. The raw stdout/stderr buffers
+/// are already capped by `RAW_CAP`, but a pathological filter could expand its
+/// input; bound the filtered buffer independently so capture stays O(RAW_CAP).
+const FILTERED_CAP: usize = RAW_CAP;
+
+/// Read a child stream line-by-line as raw bytes, yielding lossy-UTF-8 strings.
+///
+/// `BufRead::lines()` is strict UTF-8 and `.map_while(Result::ok)` silently
+/// stops at the first non-UTF-8 byte, truncating the rest of the child's
+/// output. Reading bytes and converting with `from_utf8_lossy` preserves every
+/// line (replacing invalid bytes with U+FFFD) instead of dropping output.
+fn for_each_line<R: Read>(reader: R, mut f: impl FnMut(String)) {
+    let mut buf = BufReader::new(reader);
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        bytes.clear();
+        match buf.read_until(b'\n', &mut bytes) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                // Trim a trailing \n (and \r) to match BufRead::lines() semantics.
+                if bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+                f(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 pub fn run_streaming(
     cmd: &mut Command,
     stdin_mode: StdinMode,
@@ -339,22 +378,26 @@ pub fn run_streaming(
             Stderr(String),
         }
 
-        let (tx, rx) = mpsc::channel();
+        // Bounded channel: backpressure caps memory if the child outpaces us.
+        let (tx, rx) = mpsc::sync_channel(STREAM_CHANNEL_CAP);
         let tx_out = tx.clone();
         let stdout_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if tx_out.send(StreamLine::Stdout(line)).is_err() {
-                    break;
+            // Byte-line read + lossy UTF-8: never truncates on non-UTF-8 bytes.
+            let mut closed = false;
+            for_each_line(stdout, |line| {
+                if !closed && tx_out.send(StreamLine::Stdout(line)).is_err() {
+                    closed = true; // consumer gone — stop forwarding
                 }
-            }
+            });
         });
         let tx_err = tx;
         let stderr_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx_err.send(StreamLine::Stderr(line)).is_err() {
-                    break;
+            let mut closed = false;
+            for_each_line(stderr, |line| {
+                if !closed && tx_err.send(StreamLine::Stderr(line)).is_err() {
+                    closed = true;
                 }
-            }
+            });
         });
 
         if let FilterMode::Streaming(mut filter) = stdout_mode {
@@ -388,8 +431,15 @@ pub fn run_streaming(
                     }
                 }
                 filter_fd_is_stderr = is_stderr;
-                if let Some(output) = filter.feed_line(&line) {
-                    filtered.push_str(&output);
+                // Strip ANSI before feeding the filter: go/gradle filter
+                // predicates match plain text, so coloured failure markers
+                // (e.g. red "FAIL") would otherwise evade compaction. The raw
+                // line is still preserved verbatim in raw_stdout/raw_stderr.
+                let clean = crate::core::utils::strip_ansi(&line);
+                if let Some(output) = filter.feed_line(&clean) {
+                    if filtered.len() < FILTERED_CAP {
+                        filtered.push_str(&output);
+                    }
                     let dest: &mut dyn Write = if is_stderr { &mut err_out } else { &mut out };
                     match write!(dest, "{}", output) {
                         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
@@ -399,7 +449,9 @@ pub fn run_streaming(
                 }
             }
             let tail = filter.flush();
-            filtered.push_str(&tail);
+            if filtered.len() < FILTERED_CAP {
+                filtered.push_str(&tail);
+            }
             let flush_dest: &mut dyn Write = if filter_fd_is_stderr {
                 &mut err_out
             } else {
@@ -419,14 +471,15 @@ pub fn run_streaming(
         let stderr_thread = std::thread::spawn(move || -> String {
             let mut raw_err = String::new();
             let mut capped = false;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            // Byte-line read + lossy UTF-8: never truncates on non-UTF-8 bytes.
+            for_each_line(stderr, |line| {
                 if raw_err.len() + line.len() < RAW_CAP {
                     raw_err.push_str(&line);
                     raw_err.push('\n');
                 } else if !capped {
                     capped = true;
                 }
-            }
+            });
             raw_err
         });
 
@@ -438,7 +491,7 @@ pub fn run_streaming(
                 FilterMode::Passthrough => unreachable!("handled by early-return above"),
                 FilterMode::Streaming(_) => unreachable!("handled by is_streaming branch"),
                 FilterMode::Buffered(filter_fn) => {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for_each_line(stdout, |line| {
                         if raw_stdout.len() + line.len() < RAW_CAP {
                             raw_stdout.push_str(&line);
                             raw_stdout.push('\n');
@@ -448,7 +501,7 @@ pub fn run_streaming(
                                 "[contextcrawler] warning: output exceeds 10 MiB — filter input truncated"
                             );
                         }
-                    }
+                    });
                     filtered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         filter_fn(&raw_stdout)
                     }))
@@ -463,7 +516,7 @@ pub fn run_streaming(
                     }
                 }
                 FilterMode::CaptureOnly => {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for_each_line(stdout, |line| {
                         if raw_stdout.len() + line.len() < RAW_CAP {
                             raw_stdout.push_str(&line);
                             raw_stdout.push('\n');
@@ -473,7 +526,7 @@ pub fn run_streaming(
                                 "[contextcrawler] warning: output exceeds 10 MiB — filter input truncated"
                             );
                         }
-                    }
+                    });
                     filtered = raw_stdout.clone();
                 }
             }
@@ -1584,5 +1637,39 @@ pub(crate) mod tests {
         let (buf3, truncated3) = drain_with_cap(Cursor::new(&input[..]), 99);
         assert_eq!(buf3, input);
         assert!(!truncated3, "cap above input size, not truncated");
+    }
+
+    #[test]
+    fn test_for_each_line_splits_lines() {
+        let input = b"alpha\nbeta\ngamma\n";
+        let mut got = Vec::new();
+        for_each_line(io::Cursor::new(&input[..]), |l| got.push(l));
+        assert_eq!(got, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_for_each_line_handles_no_trailing_newline() {
+        let input = b"only-line";
+        let mut got = Vec::new();
+        for_each_line(io::Cursor::new(&input[..]), |l| got.push(l));
+        assert_eq!(got, vec!["only-line"]);
+    }
+
+    #[test]
+    fn test_for_each_line_preserves_non_utf8_lines() {
+        // G3 finding 5: BufRead::lines() + map_while(Result::ok) silently
+        // truncates child output at the first non-UTF-8 byte. for_each_line
+        // does a lossy conversion, so every line survives (invalid byte 0xFF
+        // becomes U+FFFD) and lines *after* it are not dropped.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"before\n");
+        input.extend_from_slice(&[0xFF, b'\n']); // invalid UTF-8 line
+        input.extend_from_slice(b"after\n");
+        let mut got = Vec::new();
+        for_each_line(io::Cursor::new(input), |l| got.push(l));
+        assert_eq!(got.len(), 3, "no lines dropped at the non-UTF-8 byte");
+        assert_eq!(got[0], "before");
+        assert_eq!(got[2], "after", "line after invalid byte must survive");
+        assert!(got[1].contains('\u{FFFD}'), "invalid byte became U+FFFD");
     }
 }

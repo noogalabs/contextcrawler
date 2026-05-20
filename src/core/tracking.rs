@@ -379,6 +379,26 @@ impl Tracker {
         }
 
         let conn = Connection::open(&db_path)?;
+        // Restrict the DB (and its WAL/SHM sidecars) to owner-only. The DB can
+        // hold command history that should not be world/group readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["", "-wal", "-shm"] {
+                let p = if suffix.is_empty() {
+                    db_path.clone()
+                } else {
+                    let mut s = db_path.clone().into_os_string();
+                    s.push(suffix);
+                    PathBuf::from(s)
+                };
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&p, perms);
+                }
+            }
+        }
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
         let _ = conn.execute_batch(
@@ -573,10 +593,15 @@ impl Tracker {
             "DELETE FROM commands WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
-        self.conn.execute(
+        let removed = self.conn.execute(
             "DELETE FROM parse_failures WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
+        // Reclaim space from pruned rows so the DB file does not grow
+        // unbounded. Non-fatal: VACUUM can fail mid-transaction / on WAL.
+        if removed > 0 {
+            let _ = self.conn.execute_batch("VACUUM;");
+        }
         Ok(())
     }
 
@@ -1368,16 +1393,61 @@ fn get_db_path() -> Result<PathBuf> {
         return Ok(tmp);
     }
 
-    // Priority 2: Configuration file
+    // Priority 2: Configuration file. Confine to $HOME — a config-supplied
+    // path is attacker-influenceable (shared/checked-in config), so reject
+    // anything that resolves outside the user's home directory.
     if let Ok(config) = crate::core::config::Config::load() {
         if let Some(db_path) = config.tracking.database_path {
-            return Ok(db_path);
+            return confine_db_path_to_home(db_path);
         }
     }
 
     // Priority 3: Default platform-specific location
     let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     Ok(data_dir.join(RTK_DATA_DIR).join(HISTORY_DB))
+}
+
+/// Confine a config-supplied DB path to the user's home directory.
+///
+/// The DB file itself may not exist yet, so we canonicalise the deepest
+/// existing ancestor and append the remainder. If the resolved path escapes
+/// `$HOME` the path is rejected.
+fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
+    let home = match dirs::home_dir().and_then(|h| h.canonicalize().ok()) {
+        Some(h) => h,
+        // No resolvable home — fall back to the default location rather than
+        // trusting an unconfined config path.
+        None => {
+            let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+            return Ok(data_dir.join(RTK_DATA_DIR).join(HISTORY_DB));
+        }
+    };
+
+    // Canonicalise the deepest existing ancestor, re-attaching the tail.
+    let mut existing = db_path.as_path();
+    let mut tail = PathBuf::new();
+    let resolved = loop {
+        if let Ok(c) = existing.canonicalize() {
+            break c.join(&tail);
+        }
+        match existing.parent() {
+            Some(p) => {
+                if let Some(name) = existing.file_name() {
+                    tail = PathBuf::from(name).join(&tail);
+                }
+                existing = p;
+            }
+            None => break db_path.clone(),
+        }
+    };
+
+    if !resolved.starts_with(&home) {
+        anyhow::bail!(
+            "configured tracking.database_path '{}' resolves outside $HOME — refusing to open",
+            db_path.display()
+        );
+    }
+    Ok(resolved)
 }
 
 /// Individual parse failure record.

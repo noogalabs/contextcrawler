@@ -34,16 +34,56 @@ fn sanitize_slug(slug: &str) -> String {
     }
 }
 
+/// Confine a tee directory to the user's home directory.
+///
+/// The directory may not exist yet, so we canonicalise the deepest existing
+/// ancestor and re-attach the tail. Paths that escape `$HOME` are rejected
+/// (returns None) so a hostile config/env value cannot redirect raw command
+/// output — which may contain secrets — to an arbitrary location.
+fn confine_tee_dir_to_home(dir: PathBuf) -> Option<PathBuf> {
+    let home = dirs::home_dir().and_then(|h| h.canonicalize().ok())?;
+
+    let mut existing = dir.as_path();
+    let mut tail = PathBuf::new();
+    let resolved = loop {
+        if let Ok(c) = existing.canonicalize() {
+            break c.join(&tail);
+        }
+        match existing.parent() {
+            Some(p) => {
+                if let Some(name) = existing.file_name() {
+                    tail = PathBuf::from(name).join(&tail);
+                }
+                existing = p;
+            }
+            None => break dir.clone(),
+        }
+    };
+
+    if resolved.starts_with(&home) {
+        Some(resolved)
+    } else {
+        eprintln!(
+            "[contextcrawler] warning: tee directory '{}' resolves outside $HOME — tee disabled",
+            dir.display()
+        );
+        None
+    }
+}
+
 /// Get the tee directory, respecting config and env overrides.
+///
+/// Config/env-supplied directories are confined to `$HOME`. The built-in
+/// default location is trusted as-is.
 fn get_tee_dir(config: &Config) -> Option<PathBuf> {
     // Env var override
     if let Ok(dir) = std::env::var("RTK_TEE_DIR") {
-        return Some(PathBuf::from(dir));
+        return confine_tee_dir_to_home(PathBuf::from(dir));
     }
 
     // Config override
     if let Some(ref dir) = config.tee.directory {
-        return Some(dir.clone());
+        return confine_tee_dir_to_home(dir.clone());
     }
 
     // Default: ~/.local/share/rtk/tee/
@@ -138,12 +178,38 @@ fn write_tee_file(
         raw.to_string()
     };
 
-    std::fs::write(&filepath, content).ok()?;
+    // Write with restricted permissions and a symlink-safe open. Raw command
+    // output may contain secrets, so the file is owner-only (0600) and we
+    // refuse to follow a symlink planted at the target path.
+    write_tee_content(&filepath, content.as_bytes())?;
 
     // Rotate old files
     cleanup_old_files(tee_dir, max_files);
 
     Some(filepath)
+}
+
+/// Create a tee file with owner-only permissions, refusing to follow symlinks.
+#[cfg(unix)]
+fn write_tee_content(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        // O_NOFOLLOW: if the final path component is a symlink, fail rather
+        // than write through it to an attacker-chosen target.
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut f = opts.open(path).ok()?;
+    f.write_all(bytes).ok()?;
+    Some(())
+}
+
+#[cfg(not(unix))]
+fn write_tee_content(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    std::fs::write(path, bytes).ok()
 }
 
 /// Write raw output to tee file if conditions are met.
