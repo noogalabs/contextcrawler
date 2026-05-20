@@ -214,7 +214,17 @@ pub fn run(
     // entries; otherwise skip them to keep results tidy (#1101).
     let search_hidden = effective_pattern.starts_with('.');
 
-    let mut builder = WalkBuilder::new(path);
+    // Normalise the search root before walking. A trailing slash (or `./`
+    // prefix) makes `strip_prefix` against the walker's entry paths fail,
+    // which silently falls back to emitting the full absolute path and
+    // breaks the "relative to search root" contract (#111 G5). Strip a
+    // single trailing slash so the prefix matches what `ignore` yields.
+    let walk_root: &str = {
+        let trimmed = path.strip_suffix('/').unwrap_or(path);
+        if trimmed.is_empty() { path } else { trimmed }
+    };
+
+    let mut builder = WalkBuilder::new(walk_root);
     builder
         .hidden(!search_hidden) // skip hidden files/dirs unless pattern targets dotfiles
         .git_ignore(true) // respect .gitignore
@@ -261,9 +271,12 @@ pub fn run(
             continue;
         }
 
-        // Store path relative to search root
+        // Store path relative to search root. `walk_root` is the
+        // trailing-slash-normalised form of `path`, so it matches the
+        // prefix of every entry the walker yields and `strip_prefix`
+        // succeeds reliably (#111 G5).
         let display_path = entry_path
-            .strip_prefix(path)
+            .strip_prefix(walk_root)
             .unwrap_or(entry_path)
             .to_string_lossy()
             .to_string();
@@ -607,6 +620,33 @@ mod tests {
         // With max=2, should not error
         let result = run("*.rs", "src", 2, None, "f", false, 0);
         assert!(result.is_ok());
+    }
+
+    // #111 G5: a search root with a trailing slash must still produce
+    // paths relative to the root — the walk_root normalisation strips the
+    // slash so strip_prefix succeeds instead of falling back to absolute.
+    #[test]
+    fn find_trailing_slash_path_runs() {
+        let result = run("*.rs", "src/", 50, None, "f", false, 0);
+        assert!(result.is_ok(), "trailing-slash search root should run cleanly");
+    }
+
+    #[test]
+    fn find_trailing_slash_path_yields_relative_paths() {
+        // Walk "src/" and confirm strip_prefix produces relative paths
+        // (no leading "src/" component, no absolute path) for every entry.
+        let walk_root = "src/".strip_suffix('/').unwrap_or("src/");
+        assert_eq!(walk_root, "src");
+        let walker = ignore::WalkBuilder::new(walk_root).build();
+        for entry in walker.flatten() {
+            let stripped = entry.path().strip_prefix(walk_root);
+            assert!(
+                stripped.is_ok(),
+                "strip_prefix must succeed for {:?} against {:?}",
+                entry.path(),
+                walk_root,
+            );
+        }
     }
 
     #[test]
