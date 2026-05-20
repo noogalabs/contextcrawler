@@ -526,6 +526,31 @@ fn print_manual_instructions(hook_command: &str, include_opencode: bool) {
     }
 }
 
+/// `true` if `command` is the legacy ContextCrawler/rtk rewrite *script*
+/// hook entry.
+///
+/// SECURITY (#100 G2 IMPORTANT 6): the legacy hook command is a filesystem
+/// path ending in `rtk-rewrite.sh`. A bare `contains(REWRITE_HOOK_FILE)`
+/// substring match would also delete an unrelated user hook whose command
+/// merely *mentions* that filename (e.g. `echo see rtk-rewrite.sh`). Match
+/// the final path component exactly instead — precise, and needs no
+/// install-time marker migration so existing installs stay removable.
+fn command_is_legacy_rewrite_hook(command: &str) -> bool {
+    // The legacy entry is a path the installer wrote (`~/.claude/hooks/
+    // rtk-rewrite.sh`), possibly bare or quoted. Take the last whitespace
+    // token, then its final path component.
+    command
+        .split_whitespace()
+        .next_back()
+        .map(|tok| tok.trim_matches(['"', '\'']))
+        .and_then(|tok| {
+            std::path::Path::new(tok)
+                .file_name()
+                .and_then(|n| n.to_str())
+        })
+        .is_some_and(|base| base == REWRITE_HOOK_FILE)
+}
+
 fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
     let hooks = match root
         .get_mut("hooks")
@@ -546,7 +571,9 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
             for hook in hooks_array {
                 if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
                     // Match both legacy script path and new binary command
-                    if command.contains(REWRITE_HOOK_FILE) || command == CLAUDE_HOOK_COMMAND {
+                    if command_is_legacy_rewrite_hook(command)
+                        || command == CLAUDE_HOOK_COMMAND
+                    {
                         return false;
                     }
                 }
@@ -1166,7 +1193,9 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            cmd == hook_command || cmd == CLAUDE_HOOK_COMMAND || cmd.contains(REWRITE_HOOK_FILE)
+            cmd == hook_command
+                || cmd == CLAUDE_HOOK_COMMAND
+                || command_is_legacy_rewrite_hook(cmd)
         })
 }
 
@@ -1392,7 +1421,7 @@ fn remove_legacy_hook_entries_from_json(root: &mut serde_json::Value) -> bool {
                 hooks.iter().all(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_FILE))
+                        .is_some_and(command_is_legacy_rewrite_hook)
                 })
             })
             .unwrap_or(false);
@@ -2758,9 +2787,61 @@ fn resolve_home_subdir(subdir: &str) -> Result<PathBuf> {
         })
 }
 
+/// Opt-in escape hatch for an env-var config root that resolves outside
+/// `$HOME`. Off by default — production must never silently follow a
+/// poisoned `RTK_CLAUDE_DIR` / `CODEX_HOME` / `HERMES_HOME` (e.g. from a
+/// project `.env`) to a write/delete root outside the user's home.
+const ALLOW_NONHOME_ROOT_ENV: &str = "CONTEXTCRAWLER_ALLOW_NONHOME_ROOT";
+
+/// Cache for the opt-in flag. The env var is read EXACTLY ONCE, on first use
+/// (#100 G2 Codex 2nd pass — PARTIAL 4): reading it per-call left a
+/// theoretical TOCTOU window where a mid-run env change could flip the
+/// escape-hatch decision between two `validate_env_root` calls.
+static NONHOME_ROOT_ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn nonhome_root_allowed() -> bool {
+    *NONHOME_ROOT_ALLOWED.get_or_init(|| {
+        std::env::var_os(ALLOW_NONHOME_ROOT_ENV).is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// `true` if `root`, after best-effort canonicalisation, does not start with
+/// `home`. Best-effort: a path that doesn't exist yet falls back to a
+/// lexical comparison of the raw path, which still catches the obvious
+/// accidents (`=/etc`, `=/tmp/x`, a `..` escape).
+fn root_escapes_home(root: &Path, home: &Path) -> bool {
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    !canon_root.starts_with(&canon_home)
+}
+
+/// Validate an env-var-derived config root (#100 G2 IMPORTANT 5).
+///
+/// A poisoned env var must not redirect file writes/deletes outside the
+/// user's home. If the resolved root escapes `$HOME` we bail — unless the
+/// caller has explicitly opted in via `CONTEXTCRAWLER_ALLOW_NONHOME_ROOT`.
+fn validate_env_root(root: PathBuf, env_name: &str) -> Result<PathBuf> {
+    if nonhome_root_allowed() {
+        return Ok(root);
+    }
+    if let Some(home) = dirs::home_dir() {
+        if root_escapes_home(&root, &home) {
+            anyhow::bail!(
+                "${} resolves outside $HOME: {}\n\
+                 Refusing to use a config root outside your home directory. \
+                 If this is intentional, set {}=1.",
+                env_name,
+                root.display(),
+                ALLOW_NONHOME_ROOT_ENV
+            );
+        }
+    }
+    Ok(root)
+}
+
 fn resolve_claude_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("RTK_CLAUDE_DIR") {
-        return Ok(PathBuf::from(dir));
+        return validate_env_root(PathBuf::from(dir), "RTK_CLAUDE_DIR");
     }
     resolve_home_subdir(CLAUDE_DIR)
 }
@@ -2769,27 +2850,33 @@ fn resolve_codex_dir() -> Result<PathBuf> {
     resolve_codex_dir_from(
         std::env::var_os("CODEX_HOME").map(PathBuf::from),
         dirs::home_dir(),
+        nonhome_root_allowed(),
     )
 }
 
 fn resolve_codex_dir_from(
     codex_home: Option<PathBuf>,
     home_dir: Option<PathBuf>,
+    allow_nonhome: bool,
 ) -> Result<PathBuf> {
     if let Some(path) = codex_home.filter(|path| !path.as_os_str().is_empty()) {
-        // Defence-in-depth (#27): if `$CODEX_HOME` resolves outside `$HOME`,
-        // emit a one-line stderr warning so accidental misconfiguration
-        // (`CODEX_HOME=/etc`, `CODEX_HOME=..`, etc.) is visible before init
-        // writes a config file or uninstall deletes one. Don't bail —
-        // upstream OpenAI Codex CLI accepts the same convention and legit
-        // non-home setups exist; the warning is the cheapest paranoid check.
-        if let Some(home) = home_dir.as_deref() {
-            if codex_home_path_escapes_home(&path, home) {
-                eprintln!(
-                    "[contextcrawler] WARNING: $CODEX_HOME resolves outside $HOME: {} \
-                     (continuing — set CODEX_HOME=unset if unintentional)",
-                    path.display()
-                );
+        // SECURITY (#100 G2 IMPORTANT 5): if `$CODEX_HOME` resolves outside
+        // `$HOME`, bail. A poisoned `CODEX_HOME` (e.g. from a project
+        // `.env`) would otherwise redirect init's config writes / uninstall
+        // deletes outside the user's home. The explicit opt-in
+        // `CONTEXTCRAWLER_ALLOW_NONHOME_ROOT=1` is the escape hatch for
+        // genuine non-home setups (upstream Codex CLI accepts them).
+        if !allow_nonhome {
+            if let Some(home) = home_dir.as_deref() {
+                if root_escapes_home(&path, home) {
+                    anyhow::bail!(
+                        "$CODEX_HOME resolves outside $HOME: {}\n\
+                         Refusing to use a config root outside your home directory. \
+                         If this is intentional, set {}=1.",
+                        path.display(),
+                        ALLOW_NONHOME_ROOT_ENV
+                    );
+                }
             }
         }
         return Ok(path);
@@ -2800,30 +2887,37 @@ fn resolve_codex_dir_from(
         .context("Cannot determine Codex config directory. Set $CODEX_HOME or $HOME.")
 }
 
-/// `true` if `codex_home`, after best-effort canonicalisation, does not start
-/// with `home`. Pure function — no I/O side effects, no warnings (the caller
-/// decides what to do with the result).
-///
-/// Best-effort: if `canonicalize()` fails (path doesn't exist yet — common
-/// on first-run init), we fall back to lexical comparison of the raw path,
-/// which catches the most obvious accidents (`CODEX_HOME=/etc`,
-/// `CODEX_HOME=/tmp/x`) without forcing the path to exist.
-fn codex_home_path_escapes_home(codex_home: &Path, home: &Path) -> bool {
-    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let canon_codex = std::fs::canonicalize(codex_home).unwrap_or_else(|_| codex_home.to_path_buf());
-    !canon_codex.starts_with(&canon_home)
-}
-
 fn resolve_hermes_home() -> Result<PathBuf> {
-    resolve_hermes_home_from_env(dirs::home_dir(), std::env::var_os("HERMES_HOME"))
+    resolve_hermes_home_from_env(
+        dirs::home_dir(),
+        std::env::var_os("HERMES_HOME"),
+        nonhome_root_allowed(),
+    )
 }
 
 fn resolve_hermes_home_from_env(
     home_dir: Option<PathBuf>,
     hermes_home: Option<OsString>,
+    allow_nonhome: bool,
 ) -> Result<PathBuf> {
     if let Some(path) = hermes_home.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        // SECURITY (#100 G2 IMPORTANT 5): reject a `$HERMES_HOME` that
+        // escapes `$HOME` unless explicitly opted in. See `validate_env_root`.
+        if !allow_nonhome {
+            if let Some(home) = home_dir.as_deref() {
+                if root_escapes_home(&path, home) {
+                    anyhow::bail!(
+                        "$HERMES_HOME resolves outside $HOME: {}\n\
+                         Refusing to use a config root outside your home directory. \
+                         If this is intentional, set {}=1.",
+                        path.display(),
+                        ALLOW_NONHOME_ROOT_ENV
+                    );
+                }
+            }
+        }
+        return Ok(path);
     }
 
     home_dir
@@ -3115,7 +3209,7 @@ fn cursor_hook_already_present(root: &serde_json::Value) -> bool {
             .is_some_and(|cmd| {
                 // Match the legacy command too so users who installed before
                 // the rebrand get correctly detected/removed.
-                cmd.contains(REWRITE_HOOK_FILE)
+                command_is_legacy_rewrite_hook(cmd)
                     || cmd == CURSOR_HOOK_COMMAND
                     || cmd == LEGACY_CURSOR_HOOK_COMMAND
             })
@@ -3210,7 +3304,7 @@ fn remove_legacy_cursor_hook_entries_from_json(root: &mut serde_json::Value) -> 
         !entry
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_FILE))
+            .is_some_and(command_is_legacy_rewrite_hook)
     });
 
     pre_tool_use.len() < original_len
@@ -3295,7 +3389,7 @@ fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
             .is_some_and(|cmd| {
                 // Match the legacy command too so users who installed before
                 // the rebrand get correctly detected/removed.
-                cmd.contains(REWRITE_HOOK_FILE)
+                command_is_legacy_rewrite_hook(cmd)
                     || cmd == CURSOR_HOOK_COMMAND
                     || cmd == LEGACY_CURSOR_HOOK_COMMAND
             })
@@ -3433,11 +3527,20 @@ fn show_claude_config() -> Result<()> {
         println!("[--] Global (~/.claude/CLAUDE.md): not found");
     }
 
-    // Check local CLAUDE.md
+    // Check local CLAUDE.md.
+    //
+    // Detect via the exact block markers the installer writes
+    // (`RTK_MD_REF` / `RTK_BLOCK_START`), not a bare `rtk` substring — the
+    // substring matched any unrelated mention of the word and misreported
+    // status (#100 G2 NICE-TO-HAVE 10).
     if local_claude_md.exists() {
         let content = fs::read_to_string(&local_claude_md)?;
-        if content.contains("rtk") {
-            println!("[ok] Local (./CLAUDE.md): ContextCrawler enabled");
+        if content.contains(RTK_MD_REF) {
+            println!("[ok] Local (./CLAUDE.md): @CONTEXTCRAWLER.md reference");
+        } else if content.contains(RTK_BLOCK_START) {
+            println!(
+                "[warn] Local (./CLAUDE.md): old RTK block (run: contextcrawler init to migrate)"
+            );
         } else {
             println!("[--] Local (./CLAUDE.md): exists but ContextCrawler not configured");
         }
@@ -3737,11 +3840,22 @@ fn patch_gemini_settings(
     let settings_path = gemini_dir.join(SETTINGS_JSON);
     let hook_cmd = hook_path.to_string_lossy().to_string();
 
-    // Read or create settings.json
+    // Read or create settings.json.
+    //
+    // SECURITY (#100 G2 IMPORTANT 4): on a parse failure return an error —
+    // NEVER fall back to `{}`. Replacing an unparseable settings.json with
+    // an empty object and reserialising silently destroys the user's whole
+    // Gemini config. This matches the fail-on-parse-error behaviour of the
+    // sibling `patch_settings_json_command` / `patch_cursor_hooks_json`.
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+        }
     } else {
         serde_json::json!({})
     };
@@ -5027,14 +5141,17 @@ mod tests {
 
     #[test]
     fn test_resolve_codex_dir_prefers_codex_home_and_ignores_empty_value() {
-        let codex_home = PathBuf::from("/tmp/custom-codex-home");
+        // A CODEX_HOME *inside* $HOME is accepted without the opt-in.
         let home_dir = PathBuf::from("/tmp/home");
+        let codex_home = home_dir.join("custom-codex-home");
 
         let preferred =
-            resolve_codex_dir_from(Some(codex_home.clone()), Some(home_dir.clone())).unwrap();
+            resolve_codex_dir_from(Some(codex_home.clone()), Some(home_dir.clone()), false)
+                .unwrap();
         let empty_falls_back =
-            resolve_codex_dir_from(Some(PathBuf::new()), Some(home_dir.clone())).unwrap();
-        let missing_falls_back = resolve_codex_dir_from(None, Some(home_dir.clone())).unwrap();
+            resolve_codex_dir_from(Some(PathBuf::new()), Some(home_dir.clone()), false).unwrap();
+        let missing_falls_back =
+            resolve_codex_dir_from(None, Some(home_dir.clone()), false).unwrap();
 
         assert_eq!(preferred, codex_home);
         assert_eq!(empty_falls_back, home_dir.join(".codex"));
@@ -5050,50 +5167,100 @@ mod tests {
 
         // Outside-home accidents that should be flagged.
         assert!(
-            codex_home_path_escapes_home(&PathBuf::from("/etc"), &home),
+            root_escapes_home(&PathBuf::from("/etc"), &home),
             "/etc should be flagged as outside /Users/test"
         );
         assert!(
-            codex_home_path_escapes_home(&PathBuf::from("/tmp/evil"), &home),
+            root_escapes_home(&PathBuf::from("/tmp/evil"), &home),
             "/tmp/evil should be flagged"
         );
         assert!(
-            codex_home_path_escapes_home(&PathBuf::from("/var/folders"), &home),
+            root_escapes_home(&PathBuf::from("/var/folders"), &home),
             "/var/folders should be flagged"
         );
 
         // Inside-home: standard locations should NOT be flagged.
         assert!(
-            !codex_home_path_escapes_home(&PathBuf::from("/Users/test/.codex"), &home),
+            !root_escapes_home(&PathBuf::from("/Users/test/.codex"), &home),
             "default ~/.codex must not be flagged"
         );
         assert!(
-            !codex_home_path_escapes_home(&PathBuf::from("/Users/test/custom-codex"), &home),
+            !root_escapes_home(&PathBuf::from("/Users/test/custom-codex"), &home),
             "alt path inside home must not be flagged"
         );
     }
 
     #[test]
-    fn test_resolve_codex_dir_returns_path_even_when_outside_home() {
-        // Behaviour contract: defence-in-depth WARNS (stderr) but does NOT
-        // bail when $CODEX_HOME points outside $HOME. The function still
-        // returns the path so legitimate non-home setups keep working.
-        // (Upstream OpenAI Codex CLI follows the same convention.)
+    fn test_resolve_codex_dir_rejects_path_outside_home() {
+        // SECURITY (#100 G2 IMPORTANT 5): a $CODEX_HOME that escapes $HOME
+        // must FAIL CLOSED — a poisoned env var must not redirect config
+        // writes/deletes outside the user's home.
         let escapes = PathBuf::from("/etc/codex-fake");
         let home = PathBuf::from("/Users/test");
-        let resolved = resolve_codex_dir_from(Some(escapes.clone()), Some(home)).unwrap();
-        assert_eq!(resolved, escapes, "function still returns the escaping path");
+        let result = resolve_codex_dir_from(Some(escapes.clone()), Some(home.clone()), false);
+        assert!(result.is_err(), "escaping CODEX_HOME must be rejected");
+
+        // With the explicit opt-in, the escaping path is honoured.
+        let allowed =
+            resolve_codex_dir_from(Some(escapes.clone()), Some(home), true).unwrap();
+        assert_eq!(allowed, escapes);
     }
 
     #[test]
     fn test_resolve_hermes_home_prefers_hermes_home() {
-        let hermes_home = OsString::from("~/custom hermes home");
+        // A HERMES_HOME inside $HOME is accepted without the opt-in.
         let home_dir = PathBuf::from("/tmp/home");
+        let hermes_home = OsString::from("/tmp/home/custom hermes home");
 
         let resolved =
-            resolve_hermes_home_from_env(Some(home_dir), Some(hermes_home.clone())).unwrap();
+            resolve_hermes_home_from_env(Some(home_dir), Some(hermes_home.clone()), false)
+                .unwrap();
 
         assert_eq!(resolved, PathBuf::from(hermes_home));
+    }
+
+    #[test]
+    fn test_resolve_hermes_home_rejects_path_outside_home() {
+        // SECURITY (#100 G2 IMPORTANT 5): an escaping $HERMES_HOME fails
+        // closed unless the explicit opt-in is set.
+        let home_dir = PathBuf::from("/Users/test");
+        let escapes = OsString::from("/etc/hermes-fake");
+
+        let rejected = resolve_hermes_home_from_env(
+            Some(home_dir.clone()),
+            Some(escapes.clone()),
+            false,
+        );
+        assert!(rejected.is_err(), "escaping HERMES_HOME must be rejected");
+
+        let allowed =
+            resolve_hermes_home_from_env(Some(home_dir), Some(escapes.clone()), true).unwrap();
+        assert_eq!(allowed, PathBuf::from(escapes));
+    }
+
+    #[test]
+    fn test_patch_gemini_settings_errors_on_malformed_json() {
+        // SECURITY (#100 G2 IMPORTANT 4): a malformed settings.json must
+        // cause an error, NOT be silently replaced with `{}` and
+        // reserialised (which destroys the user's whole Gemini config).
+        let temp = TempDir::new().unwrap();
+        let gemini_dir = temp.path();
+        let settings_path = gemini_dir.join(SETTINGS_JSON);
+        let original = "{ this is not valid json ";
+        fs::write(&settings_path, original).unwrap();
+
+        let hook_path = gemini_dir.join("hooks").join(GEMINI_HOOK_FILE);
+        let result = patch_gemini_settings(
+            gemini_dir,
+            &hook_path,
+            PatchMode::Auto,
+            InitContext::default(),
+        );
+
+        assert!(result.is_err(), "malformed settings.json must error");
+        // Critically — the original (malformed) file must be untouched.
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(after, original, "user's settings.json must NOT be clobbered");
     }
 
     #[test]
@@ -5101,9 +5268,10 @@ mod tests {
         let home_dir = PathBuf::from("/tmp/home");
 
         let empty_falls_back =
-            resolve_hermes_home_from_env(Some(home_dir.clone()), Some(OsString::new())).unwrap();
+            resolve_hermes_home_from_env(Some(home_dir.clone()), Some(OsString::new()), false)
+                .unwrap();
         let missing_falls_back =
-            resolve_hermes_home_from_env(Some(home_dir.clone()), None).unwrap();
+            resolve_hermes_home_from_env(Some(home_dir.clone()), None, false).unwrap();
 
         assert_eq!(empty_falls_back, home_dir.join(".hermes"));
         assert_eq!(missing_falls_back, home_dir.join(".hermes"));
@@ -5620,6 +5788,53 @@ mod tests {
         assert!(!removed);
     }
 
+    // ─── #100 G2 IMPORTANT 6: precise legacy hook match ───
+
+    #[test]
+    fn test_command_is_legacy_rewrite_hook_matches_real_entry() {
+        // The real installed legacy entry is a path to the script.
+        assert!(command_is_legacy_rewrite_hook(
+            "/home/user/.claude/hooks/rtk-rewrite.sh"
+        ));
+        assert!(command_is_legacy_rewrite_hook("rtk-rewrite.sh"));
+        assert!(command_is_legacy_rewrite_hook(
+            "\"/home/u/.claude/hooks/rtk-rewrite.sh\""
+        ));
+    }
+
+    #[test]
+    fn test_command_is_legacy_rewrite_hook_ignores_mere_mentions() {
+        // An unrelated hook that merely MENTIONS the filename must NOT be
+        // matched — the old `contains()` substring check deleted these.
+        assert!(!command_is_legacy_rewrite_hook(
+            "echo 'see rtk-rewrite.sh for details'"
+        ));
+        assert!(!command_is_legacy_rewrite_hook(
+            "my-tool --note rtk-rewrite.sh-backup"
+        ));
+        assert!(!command_is_legacy_rewrite_hook("contextcrawler hook claude"));
+    }
+
+    #[test]
+    fn test_remove_hook_preserves_unrelated_hook_mentioning_filename() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "echo rtk-rewrite.sh is great"
+                    }]
+                }]
+            }
+        });
+        let removed = remove_hook_from_json(&mut json_content);
+        assert!(
+            !removed,
+            "a hook merely mentioning rtk-rewrite.sh must not be deleted"
+        );
+    }
+
     // ─── Cursor hooks.json tests ───
 
     #[test]
@@ -5913,11 +6128,20 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
 
         let orig = std::env::var_os("RTK_CLAUDE_DIR");
+        // Tests point RTK_CLAUDE_DIR at a tempdir outside $HOME; opt in to
+        // the non-home root so `validate_env_root` (#100 G2 IMPORTANT 5)
+        // doesn't reject it.
+        let orig_allow = std::env::var_os(ALLOW_NONHOME_ROOT_ENV);
+        std::env::set_var(ALLOW_NONHOME_ROOT_ENV, "1");
         std::env::set_var("RTK_CLAUDE_DIR", &claude_dir);
         f(&claude_dir);
         match orig {
             Some(v) => std::env::set_var("RTK_CLAUDE_DIR", v),
             None => std::env::remove_var("RTK_CLAUDE_DIR"),
+        }
+        match orig_allow {
+            Some(v) => std::env::set_var(ALLOW_NONHOME_ROOT_ENV, v),
+            None => std::env::remove_var(ALLOW_NONHOME_ROOT_ENV),
         }
     }
 

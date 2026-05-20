@@ -63,6 +63,74 @@ fn proxy_nudge_suppressed_by_ci_env() {
     );
 }
 
+/// Run the binary, returning `(stdout, stderr, exit_code)`.
+fn run_proxy(args: &[&str]) -> (String, String, i32) {
+    let _guard = common::env_lock();
+    let mut cmd = Command::new(binary_path());
+    cmd.args(args);
+    cmd.env("CONTEXTCRAWLER_TEST_MODE", "1");
+    cmd.env("CONTEXTCRAWLER_NO_PROXY_NUDGE", "1");
+    cmd.env_remove("CI");
+    let out = cmd.output().expect("spawn contextcrawler");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// #100 G2 Codex 2nd pass — CRITICAL 2: a proxy `argv[0]` containing a path
+/// separator must be REJECTED, not executed. Otherwise
+/// `proxy ../../evil/npm` runs the attacker's binary while any
+/// basename-normalised hardening was computed for the bare `npm`.
+#[test]
+fn proxy_rejects_path_separator_argv0() {
+    for bad in ["../../evil/npm", "/usr/bin/whoami", "./local-tool", "sub/dir/cmd"] {
+        let (_stdout, stderr, code) = run_proxy(&["proxy", bad, "--version"]);
+        assert_ne!(
+            code, 0,
+            "proxy must reject path-bearing argv[0] `{bad}`, exit was 0"
+        );
+        assert!(
+            stderr.contains("path-bearing"),
+            "expected path-bearing rejection for `{bad}`, stderr was:\n{stderr}"
+        );
+    }
+}
+
+/// A bare tool name (no separator) is still accepted by the proxy path.
+#[test]
+fn proxy_accepts_bare_tool_name() {
+    let (_stdout, _stderr, code) = run_proxy(&["proxy", "whoami"]);
+    assert_eq!(code, 0, "proxy of a bare tool name must succeed");
+}
+
+/// #100 G2 Codex 2nd pass — PARTIAL 3: the proxy flag is `--via-shell`, so a
+/// proxied child whose OWN argument is literally `--shell` is passed through
+/// to the child intact rather than stolen by clap.
+#[test]
+fn proxy_passes_literal_shell_arg_to_child() {
+    // `echo --shell` should print `--shell` on stdout. `--shell` is no longer
+    // a contextcrawler flag, so clap leaves it in the child argv.
+    let (stdout, _stderr, code) = run_proxy(&["proxy", "echo", "--shell"]);
+    assert_eq!(code, 0, "proxy echo --shell must succeed");
+    assert!(
+        stdout.contains("--shell"),
+        "child must receive literal `--shell` arg; stdout was:\n{stdout}"
+    );
+}
+
+/// The renamed `--via-shell` flag still works as the explicit shell opt-in.
+#[test]
+fn proxy_via_shell_flag_still_functions() {
+    let (stdout, _stderr, code) = run_proxy(&["proxy", "--via-shell", "echo hello"]);
+    assert_eq!(code, 0, "proxy --via-shell must succeed");
+    assert!(
+        stdout.contains("hello"),
+        "--via-shell should word-split and run the command; stdout was:\n{stdout}"
+    );
+}
+
 #[test]
 fn proxy_nudge_suppressed_when_stderr_not_tty() {
     // When the test harness captures stderr (which it always does), stderr is

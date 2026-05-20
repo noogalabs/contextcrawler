@@ -10,7 +10,7 @@ use std::path::PathBuf;
 const CURRENT_HOOK_VERSION: u8 = 3;
 const WARN_INTERVAL_SECS: u64 = 24 * 3600;
 
-/// Hook status for diagnostics and `rtk gain`.
+/// Hook status for diagnostics and `contextcrawler gain`.
 #[derive(Debug, PartialEq, Clone)]
 pub enum HookStatus {
     /// Hook is installed and up to date.
@@ -19,6 +19,48 @@ pub enum HookStatus {
     Outdated,
     /// No hook file found (but Claude Code is installed).
     Missing,
+    /// Hook is registered but its target binary is missing / not
+    /// executable — the user thinks they're protected but aren't.
+    Broken,
+}
+
+/// Resolve the binary named by a hook command string and confirm it exists
+/// and is executable. The hook command is `<bin> hook <runtime>`; we verify
+/// the first token resolves on `$PATH` (or as a direct path).
+///
+/// SECURITY (#100 G2 IMPORTANT 7): a stale registration whose binary has
+/// been moved/deleted must NOT report healthy — the hook silently never
+/// fires and the user is unprotected.
+fn hook_binary_ok(hook_command: &str) -> bool {
+    let Some(bin) = hook_command.split_whitespace().next() else {
+        return false;
+    };
+    // Direct path — check it exists and (on Unix) is executable.
+    if bin.contains('/') || bin.contains('\\') {
+        return is_executable_file(std::path::Path::new(bin));
+    }
+    // Bare name — resolve via PATH.
+    crate::core::utils::resolve_binary(bin)
+        .map(|p| is_executable_file(&p))
+        .unwrap_or(false)
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Return the current hook status without printing anything.
@@ -36,6 +78,12 @@ pub fn status() -> HookStatus {
 
     // Check for new binary command in settings.json first
     if binary_hook_registered(&claude_dir) {
+        // SECURITY (#100 G2 IMPORTANT 7): a registered hook whose target
+        // binary is missing/not-executable is a false sense of security —
+        // report Broken so the user knows the hook can't actually fire.
+        if !hook_binary_ok(CLAUDE_HOOK_COMMAND) {
+            return HookStatus::Broken;
+        }
         // If old script file still exists alongside new command, report Outdated
         // (migration not complete — user should run `contextcrawler init -g` to clean up)
         let old_hook = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
@@ -100,6 +148,10 @@ fn check_and_warn() -> Option<()> {
             "[contextcrawler] /!\\ No hook installed — run `contextcrawler init -g` for automatic token savings"
         }
         HookStatus::Outdated => "[contextcrawler] /!\\ Hook outdated — run `contextcrawler init -g` to update",
+        HookStatus::Broken => {
+            "[contextcrawler] /!\\ Hook registered but its binary is missing — \
+             run `contextcrawler init -g` to repair (you are NOT currently protected)"
+        }
     };
 
     // Rate limit: warn once per day
@@ -121,10 +173,19 @@ fn check_and_warn() -> Option<()> {
     Some(())
 }
 
+/// Current on-disk hook version marker. The legacy `# rtk-hook-version:`
+/// form is still accepted during the rebrand transition so a hook installed
+/// before the rename is not misreported as version 0 (outdated).
+const HOOK_VERSION_MARKER: &str = "# contextcrawler-hook-version:";
+const LEGACY_HOOK_VERSION_MARKER: &str = "# rtk-hook-version:";
+
 pub fn parse_hook_version(content: &str) -> u8 {
     // Version tag must be in the first 5 lines (shebang + header convention)
     for line in content.lines().take(5) {
-        if let Some(rest) = line.strip_prefix("# rtk-hook-version:") {
+        let rest = line
+            .strip_prefix(HOOK_VERSION_MARKER)
+            .or_else(|| line.strip_prefix(LEGACY_HOOK_VERSION_MARKER));
+        if let Some(rest) = rest {
             if let Ok(v) = rest.trim().parse::<u8>() {
                 return v;
             }
@@ -191,6 +252,20 @@ mod tests {
     fn test_parse_hook_version_missing() {
         let content = "#!/usr/bin/env bash\n# old hook without version\n";
         assert_eq!(parse_hook_version(content), 0);
+    }
+
+    #[test]
+    fn test_parse_hook_version_new_marker() {
+        // The renamed `# contextcrawler-hook-version:` marker is recognised.
+        let content = "#!/usr/bin/env bash\n# contextcrawler-hook-version: 3\n";
+        assert_eq!(parse_hook_version(content), 3);
+    }
+
+    #[test]
+    fn test_parse_hook_version_legacy_marker_still_accepted() {
+        // Hooks installed before the rebrand keep their version, not 0.
+        let content = "#!/usr/bin/env bash\n# rtk-hook-version: 3\n";
+        assert_eq!(parse_hook_version(content), 3);
     }
 
     #[test]
@@ -315,9 +390,41 @@ mod tests {
         // With .claude dir present, status must be one of the valid variants
         let s = status();
         assert!(
-            s == HookStatus::Ok || s == HookStatus::Outdated || s == HookStatus::Missing,
+            matches!(
+                s,
+                HookStatus::Ok
+                    | HookStatus::Outdated
+                    | HookStatus::Missing
+                    | HookStatus::Broken
+            ),
             "Expected valid HookStatus variant, got {:?}",
             s
         );
+    }
+
+    #[test]
+    fn test_hook_binary_ok_missing_path() {
+        // A registered command pointing at a non-existent absolute path
+        // must not report healthy (#100 G2 IMPORTANT 7).
+        assert!(!hook_binary_ok("/nonexistent/contextcrawler hook claude"));
+    }
+
+    #[test]
+    fn test_hook_binary_ok_missing_bare_name() {
+        // A bare binary name that does not resolve on PATH is broken.
+        assert!(!hook_binary_ok("contextcrawler-definitely-not-on-path hook claude"));
+    }
+
+    #[test]
+    fn test_is_executable_file_rejects_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(!is_executable_file(tmp.path()));
+    }
+
+    #[test]
+    fn test_is_executable_file_rejects_missing() {
+        assert!(!is_executable_file(std::path::Path::new(
+            "/nonexistent/contextcrawler-xyz"
+        )));
     }
 }

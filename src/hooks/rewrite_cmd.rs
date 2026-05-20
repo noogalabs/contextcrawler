@@ -101,7 +101,13 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
                 let _ = std::io::stdout().flush();
                 std::process::exit(3);
             }
-            PermissionVerdict::Deny => unreachable!(),
+            PermissionVerdict::Deny => {
+                // Deny is already handled with `exit(2)` before this match.
+                // Reaching here would mean the verdict changed underneath
+                // us — fail CLOSED (exit 2 = deny) rather than panic, so a
+                // hook panic can never leave the agent's command unchecked.
+                std::process::exit(2);
+            }
         },
         None => {
             // No ContextCrawler equivalent. Exit 1 = passthrough.
