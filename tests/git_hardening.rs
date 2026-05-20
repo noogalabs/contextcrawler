@@ -284,6 +284,98 @@ fn c_diff_external_arg_is_rejected_with_deny_error() {
     );
 }
 
+// ---- #111 G4: transport-flag denylist on subcommand + passthrough args -----
+//
+// `check_forbidden_git_args` was only wired into the global `--config-override`
+// synthesis in main.rs. The per-subcommand `args` (and the OsString args that
+// flow to `run_passthrough` for unmodelled subcommands like `clone`) reached
+// git unvalidated, so `--upload-pack` / `--receive-pack` / `--exec-path` were
+// forwarded straight through → arbitrary-binary execution (issue #35). These
+// assert each spawn path now rejects the denied flags before git is spawned.
+
+/// Assert a contextcrawler git invocation is rejected with the standard
+/// deny error: non-zero exit and a stderr message naming contextcrawler
+/// and referencing issue #35.
+fn assert_git_args_rejected(cwd: &std::path::Path, args: &[&str]) {
+    let out = ccrawl_in(cwd)
+        .args(args)
+        .output()
+        .expect("contextcrawler git runs");
+    assert!(
+        !out.status.success(),
+        "contextcrawler must reject {:?} with a non-zero exit. stdout={:?} stderr={:?}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("contextcrawler") && stderr.contains("#35"),
+        "stderr for {:?} must explain why and reference issue #35. got={:?}",
+        args,
+        stderr
+    );
+}
+
+#[test]
+fn git_fetch_upload_pack_arg_is_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    assert_git_args_rejected(
+        &repo_path,
+        &["git", "fetch", "--upload-pack=/tmp/evil", "origin"],
+    );
+}
+
+#[test]
+fn git_push_receive_pack_arg_is_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    assert_git_args_rejected(
+        &repo_path,
+        &["git", "push", "--receive-pack=/tmp/evil", "origin", "main"],
+    );
+}
+
+#[test]
+fn git_clone_passthrough_upload_pack_arg_is_rejected() {
+    // `clone` is unmodelled — it routes through `run_passthrough`, which
+    // takes OsString args. Confirm the denylist fires on that path too.
+    let _guard = common::env_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_git_args_rejected(
+        dir.path(),
+        &[
+            "git",
+            "clone",
+            "--upload-pack=/tmp/evil",
+            "https://example.invalid/repo.git",
+        ],
+    );
+}
+
+#[test]
+fn benign_git_fetch_is_not_rejected_by_denylist() {
+    // `git fetch origin` against a repo with no `origin` remote fails at
+    // git's network/remote layer, NOT at the denylist. The denylist must
+    // not be the thing that stops it: assert stderr does not carry the
+    // contextcrawler deny message.
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "fetch", "origin"])
+        .output()
+        .expect("contextcrawler git fetch runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "benign `git fetch origin` must not trip the transport-flag denylist. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
 #[test]
 fn benign_git_status_still_succeeds() {
     let _guard = common::env_lock();
@@ -295,6 +387,116 @@ fn benign_git_status_still_succeeds() {
     assert!(
         out.status.success(),
         "contextcrawler git status (no attack args) must still succeed. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---- #111 G4 follow-up: value-taking option operands are not flags ---------
+//
+// `check_forbidden_git_args` rejected any token textually shaped like a
+// forbidden transport flag, even when the token was the VALUE of a
+// value-taking option (`-m`, `-F`, ...). A commit whose message happened to
+// be `--upload-pack=x` was blocked before `run_commit` ran. The scanner now
+// skips the operand after a recognised value-taking option.
+
+#[test]
+fn git_commit_message_shaped_like_forbidden_flag_is_not_rejected() {
+    // `-m --upload-pack=x` — the second token is the commit MESSAGE.
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("f.txt"), "x").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "f.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "-m", "--upload-pack=x"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "`git commit -m --upload-pack=x` — the token is the message, not a \
+         flag — must not trip the denylist. stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(
+        out.status.success(),
+        "the commit itself must succeed. stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
+#[test]
+fn git_commit_message_exactly_exec_path_is_not_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("g.txt"), "y").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "g.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "-m", "--exec-path"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "`git commit -m --exec-path` must not trip the denylist. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
+#[test]
+fn git_commit_attached_message_shaped_like_forbidden_flag_is_not_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("h.txt"), "z").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "h.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "--message=--receive-pack"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "`git commit --message=--receive-pack` must not trip the denylist. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
+#[test]
+fn git_commit_normal_message_still_works() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    std::fs::write(repo_path.join("i.txt"), "w").expect("write file");
+    let staged = ccrawl_in(&repo_path)
+        .args(["git", "add", "i.txt"])
+        .output()
+        .expect("git add runs");
+    assert!(staged.status.success(), "git add must succeed");
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "commit", "-m", "normal message"])
+        .output()
+        .expect("contextcrawler git commit runs");
+    assert!(
+        out.status.success(),
+        "`git commit -m \"normal message\"` must still succeed. \
          stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
