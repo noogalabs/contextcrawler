@@ -23,7 +23,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         "prettier",
         &args.join(" "),
         filter_prettier_output,
-        RunOptions::stdout_only(),
+        // On a non-zero exit (prettier error, syntax error, missing file) show
+        // the raw output instead of a filtered "all formatted" claim (#100,
+        // G5#6).
+        RunOptions::stdout_only().early_exit_on_failure(),
     )
 }
 
@@ -87,10 +90,20 @@ pub fn filter_prettier_output(output: &str) -> String {
 
     let mut result = String::new();
 
+    let has_success_marker = output.contains("All matched files use Prettier");
+
     if is_check_mode {
         // Check mode: show files that need formatting
         if files_to_format.is_empty() {
-            result.push_str("Prettier: All files formatted correctly\n");
+            // Only claim success when prettier actually printed its positive
+            // marker. Output that matched no filename heuristic AND carried no
+            // success marker (e.g. a prettier error) must be shown raw rather
+            // than mislabelled as formatted (#100, G5#6).
+            if has_success_marker {
+                result.push_str("Prettier: All files formatted correctly\n");
+            } else {
+                return output.trim().to_string();
+            }
         } else {
             result.push_str(&format!(
                 "Prettier: {} files need formatting\n",
@@ -182,5 +195,30 @@ Code style issues found in the above file(s). Forgot to run Prettier?
         let result = filter_prettier_output("   \n\n  ");
         assert!(result.contains("Error"));
         assert!(!result.contains("All files formatted"));
+    }
+
+    // --- #100 G5#6: error output must not be mislabelled as "all formatted" ---
+
+    #[test]
+    fn test_filter_error_output_not_marked_success() {
+        // A prettier error whose lines match no filename heuristic and carry
+        // no success marker must be shown raw, not "All files formatted".
+        let output = "[error] foo.ts: SyntaxError: Unexpected token (3:5)\n\
+                      [error] Could not resolve config";
+        let result = filter_prettier_output(output);
+        assert!(
+            !result.contains("All files formatted correctly"),
+            "error output must not be labelled as success, got: {}",
+            result
+        );
+        assert!(result.contains("SyntaxError"));
+    }
+
+    #[test]
+    fn test_filter_unrecognised_output_shown_raw() {
+        let output = "some unexpected prettier diagnostic line";
+        let result = filter_prettier_output(output);
+        assert!(!result.contains("All files formatted correctly"));
+        assert!(result.contains("unexpected prettier diagnostic"));
     }
 }

@@ -2820,13 +2820,43 @@ fn run_cli() -> Result<i32> {
                     cli.verbose,
                 )?,
                 PnpmCommands::Install { args } => pnpm_cmd::run(
-                    pnpm_cmd::PnpmCommand::Install,
+                    pnpm_cmd::PnpmCommand::Install {
+                        subcommand: "install".to_string(),
+                    },
                     &merge_pnpm_args(&filter, &args),
                     cli.verbose,
                 )?,
                 PnpmCommands::Typecheck { args } => tsc_cmd::run(&args, cli.verbose)?,
                 PnpmCommands::Other(args) => {
-                    pnpm_cmd::run_passthrough(&merge_pnpm_args_os(&filter, &args), cli.verbose)?
+                    // #100 G5#7 follow-up: pnpm's install-class aliases
+                    // (`i`, `add`, `up`, `dedupe`, `rebuild`/`rb`, `prune`,
+                    // `import`) land here as an external subcommand. The raw
+                    // passthrough path does NOT surface postinstall / audit /
+                    // deprecation warnings, so route those aliases through the
+                    // same `filter_pnpm_install` treatment `pnpm install` gets.
+                    let first = args
+                        .first()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string);
+                    match first {
+                        Some(sub) if pnpm_cmd::is_install_subcommand(&sub) => {
+                            // Drop the leading subcommand; the rest are args.
+                            let rest: Vec<String> = args
+                                .iter()
+                                .skip(1)
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .collect();
+                            pnpm_cmd::run(
+                                pnpm_cmd::PnpmCommand::Install { subcommand: sub },
+                                &merge_pnpm_args(&filter, &rest),
+                                cli.verbose,
+                            )?
+                        }
+                        _ => pnpm_cmd::run_passthrough(
+                            &merge_pnpm_args_os(&filter, &args),
+                            cli.verbose,
+                        )?,
+                    }
                 }
             }
         }

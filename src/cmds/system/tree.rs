@@ -32,8 +32,32 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         cmd.arg("-I").arg(&ignore_pattern);
     }
 
+    // Forward options first, then a `--` boundary, then path operands. Without
+    // the boundary a user path beginning with `-` (e.g. a directory named
+    // `-la`) would be parsed by `tree` as an option (#100, G5#2).
+    // `tree` short options that consume the following argument as their value;
+    // that argument must stay on the option side of the `--` boundary.
+    const VALUE_FLAGS: &[&str] = &["-L", "-I", "-P", "-o", "--filelimit"];
+    let mut flags: Vec<&str> = Vec::new();
+    let mut paths: Vec<&str> = Vec::new();
+    let mut expect_value = false;
     for arg in args {
-        cmd.arg(arg);
+        if expect_value {
+            flags.push(arg);
+            expect_value = false;
+        } else if arg.starts_with('-') {
+            flags.push(arg);
+            expect_value = VALUE_FLAGS.contains(&arg.as_str());
+        } else {
+            paths.push(arg);
+        }
+    }
+    for flag in flags {
+        cmd.arg(flag);
+    }
+    cmd.arg("--");
+    for path in paths {
+        cmd.arg(path);
     }
 
     runner::run_filtered(

@@ -126,17 +126,36 @@ fn run_filtered(name: &str, args: &[String], verbose: u8, skip_env: bool) -> Res
         eprintln!("Running: {} {}", name, args_display);
     }
 
+    // Install-class subcommands can emit supply-chain-relevant warnings
+    // (deprecated/malicious-postinstall WARN, audit findings). Those must
+    // never be silently dropped (#100, G5#7).
+    let is_install = args
+        .first()
+        .map(|a| is_install_subcommand(a))
+        .unwrap_or(false);
+
     runner::run_filtered(
         cmd,
         name,
         &args_display,
-        filter_npm_output,
+        |output| filter_npm_output(output, is_install),
         runner::RunOptions::default(),
     )
 }
 
-/// Filter npm run output - strip boilerplate, progress bars, npm WARN
-fn filter_npm_output(output: &str) -> String {
+/// Install-class npm subcommands where dependency-tree mutations happen and
+/// `npm WARN` / `npm notice` / audit lines carry security signal.
+fn is_install_subcommand(arg: &str) -> bool {
+    matches!(
+        arg,
+        "install" | "i" | "ci" | "update" | "up" | "audit" | "rebuild" | "dedupe" | "prune"
+    )
+}
+
+/// Filter npm run output - strip boilerplate, progress bars, npm WARN.
+/// When `is_install` is set, `npm WARN` / `npm notice` / audit lines are
+/// preserved regardless of compaction so supply-chain warnings surface.
+fn filter_npm_output(output: &str, is_install: bool) -> String {
     let mut result = Vec::new();
 
     for line in output.lines() {
@@ -144,11 +163,12 @@ fn filter_npm_output(output: &str) -> String {
         if line.starts_with('>') && line.contains('@') {
             continue;
         }
-        // Skip npm lifecycle scripts
-        if line.trim_start().starts_with("npm WARN") {
+        // Skip npm lifecycle scripts — but keep them for install-class
+        // subcommands so postinstall / deprecation warnings are not lost.
+        if !is_install && line.trim_start().starts_with("npm WARN") {
             continue;
         }
-        if line.trim_start().starts_with("npm notice") {
+        if !is_install && line.trim_start().starts_with("npm notice") {
             continue;
         }
         // Skip progress indicators
@@ -186,11 +206,24 @@ npm notice
    Creating an optimized production build...
    ✓ Build completed
 "#;
-        let result = filter_npm_output(output);
+        let result = filter_npm_output(output, false);
         assert!(!result.contains("npm WARN"));
         assert!(!result.contains("npm notice"));
         assert!(!result.contains("> project@"));
         assert!(result.contains("Build completed"));
+    }
+
+    #[test]
+    fn test_filter_npm_install_surfaces_warnings() {
+        // #100 G5#7: install-class subcommands must surface npm WARN / notice
+        // lines so a malicious-postinstall warning is not silently swallowed.
+        let output = "npm WARN deprecated foo@1.0.0: do not use\n\
+                      npm notice New version available\n\
+                      added 12 packages";
+        let result = filter_npm_output(output, true);
+        assert!(result.contains("npm WARN deprecated foo"));
+        assert!(result.contains("npm notice"));
+        assert!(result.contains("added 12 packages"));
     }
 
     #[test]
@@ -234,7 +267,7 @@ npm notice
     #[test]
     fn test_filter_npm_output_empty() {
         let output = "\n\n\n";
-        let result = filter_npm_output(output);
+        let result = filter_npm_output(output, false);
         assert_eq!(result, "ok");
     }
 }

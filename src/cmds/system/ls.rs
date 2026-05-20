@@ -54,6 +54,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         }
     }
 
+    // Insert a `--` boundary so a user path that begins with `-` (e.g. a file
+    // literally named `-la`) is treated as an operand, not an `ls` option
+    // (#100, G5#1).
+    cmd.arg("--");
     if paths.is_empty() {
         cmd.arg(".");
     } else {

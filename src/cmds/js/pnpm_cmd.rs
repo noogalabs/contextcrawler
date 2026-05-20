@@ -295,15 +295,43 @@ fn extract_outdated_text(output: &str) -> Option<DependencyState> {
 pub enum PnpmCommand {
     List { depth: usize },
     Outdated,
-    Install,
+    /// Install-class invocation. `subcommand` is the actual pnpm
+    /// subcommand the user typed (`install`, `add`, `up`, ...) so the
+    /// alias is preserved when we spawn pnpm — we only normalise the
+    /// *routing*, not the user's intent.
+    Install { subcommand: String },
 }
 
 pub fn run(cmd: PnpmCommand, args: &[String], verbose: u8) -> Result<i32> {
     match cmd {
         PnpmCommand::List { depth } => run_list(depth, args, verbose),
         PnpmCommand::Outdated => run_outdated(args, verbose),
-        PnpmCommand::Install => run_install(args, verbose),
+        PnpmCommand::Install { subcommand } => run_install(&subcommand, args, verbose),
     }
+}
+
+/// pnpm install-class subcommands and their aliases. Any of these can run
+/// package lifecycle scripts (`postinstall`, etc.) and/or emit audit /
+/// deprecation warnings, so they must be routed through `filter_pnpm_install`
+/// rather than the raw passthrough path which would swallow those lines
+/// (#100, G5#7 follow-up). Mirrors npm's `is_install_subcommand` resolution.
+///
+/// pnpm aliases (per `pnpm help`): `install`/`i`, `add`, `update`/`up`,
+/// `dedupe`, `rebuild`/`rb`, `prune`, `import`.
+pub fn is_install_subcommand(arg: &str) -> bool {
+    matches!(
+        arg,
+        "install"
+            | "i"
+            | "add"
+            | "update"
+            | "up"
+            | "dedupe"
+            | "rebuild"
+            | "rb"
+            | "prune"
+            | "import"
+    )
 }
 
 fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
@@ -424,26 +452,28 @@ fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
     Ok(0)
 }
 
-fn run_install(args: &[String], verbose: u8) -> Result<i32> {
+fn run_install(subcommand: &str, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
     // Issue #37.
     check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
 
     let mut cmd = secure_node_command("pnpm");
-    cmd.arg("install");
+    cmd.arg(subcommand);
 
     for arg in args {
         cmd.arg(arg);
     }
 
     if verbose > 0 {
-        eprintln!("pnpm install running...");
+        eprintln!("pnpm {} running...", subcommand);
     }
 
-    let result = exec_capture(&mut cmd).context("Failed to run pnpm install")?;
+    let result = exec_capture(&mut cmd)
+        .with_context(|| format!("Failed to run pnpm {}", subcommand))?;
 
-    if let Some(code) = passthrough_if_truncated(&result, "pnpm install") {
+    let label = format!("pnpm {}", subcommand);
+    if let Some(code) = passthrough_if_truncated(&result, &label) {
         return Ok(code);
     }
 
@@ -457,7 +487,7 @@ fn run_install(args: &[String], verbose: u8) -> Result<i32> {
 
     println!("{}", filtered);
 
-    timer.track("pnpm install", "contextcrawler pnpm install", &combined, &filtered);
+    timer.track(&label, &format!("contextcrawler {}", label), &combined, &filtered);
 
     Ok(0)
 }
@@ -481,6 +511,20 @@ fn filter_pnpm_install(output: &str) -> String {
         // Keep error lines
         if line.contains("ERR") || line.contains("error") || line.contains("ERROR") {
             result.push(line.to_string());
+            continue;
+        }
+
+        // Keep supply-chain-relevant warnings. pnpm install can emit
+        // deprecation / postinstall / audit warnings that must never be
+        // silently swallowed (#100, G5#7).
+        let lower = line.to_lowercase();
+        if lower.contains("warn")
+            || lower.contains("deprecat")
+            || lower.contains("notice")
+            || lower.contains("audit")
+            || lower.contains("vulnerab")
+        {
+            result.push(line.trim().to_string());
             continue;
         }
 
@@ -555,5 +599,56 @@ mod tests {
         // Test that run_passthrough compiles and has correct signature
         let _args: Vec<OsString> = vec![OsString::from("help")];
         // Compile-time verification that the function exists with correct signature
+    }
+
+    // --- #100 G5#7 follow-up: pnpm install-class alias routing ---
+
+    #[test]
+    fn test_pnpm_install_aliases_recognised() {
+        // Every install-family alias must route through the install
+        // handler so audit / postinstall warnings are surfaced.
+        for sub in &[
+            "install", "i", "add", "update", "up", "dedupe", "rebuild", "rb", "prune", "import",
+        ] {
+            assert!(
+                is_install_subcommand(sub),
+                "pnpm '{}' should be treated as install-class",
+                sub
+            );
+        }
+    }
+
+    #[test]
+    fn test_pnpm_non_install_subcommands_not_routed() {
+        // Non-lifecycle subcommands must NOT be misrouted to the install
+        // filter (they have their own handling / passthrough).
+        for sub in &["run", "list", "outdated", "exec", "why", "store", "patch", "publish"] {
+            assert!(
+                !is_install_subcommand(sub),
+                "pnpm '{}' should NOT be treated as install-class",
+                sub
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_pnpm_install_surfaces_warnings() {
+        // `pnpm i` / `pnpm add` / `pnpm up` all reach filter_pnpm_install
+        // once routed; confirm WARN / deprecation / audit lines survive
+        // the filter (mirror of npm's install-surfacing test).
+        let output = "Progress: resolved 120, reused 118\n\
+                       WARN deprecated left-pad@1.0.0: do not use\n\
+                       deprecated request@2.88.2: no longer maintained\n\
+                       1 vulnerability found (1 high)\n\
+                       audit: run pnpm audit for details\n\
+                       Packages: +12\n\
+                       dependencies:\n\
+                       + express 4.18.2";
+        let result = filter_pnpm_install(output);
+        assert!(result.contains("WARN deprecated left-pad"), "lost WARN line");
+        assert!(result.contains("deprecated request"), "lost deprecation line");
+        assert!(result.contains("vulnerability found"), "lost vuln line");
+        assert!(result.contains("audit:"), "lost audit line");
+        assert!(!result.contains("Progress:"), "progress bar should be stripped");
     }
 }
