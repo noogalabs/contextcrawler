@@ -301,6 +301,88 @@ fn benign_git_status_still_succeeds() {
     );
 }
 
+// ---- G4/#100: git exit-code propagation ------------------------------------
+//
+// run_status (compact), run_stash (list/show) and run_worktree (list) applied
+// the output filter BEFORE checking git's exit code. A non-zero git exit was
+// absorbed and the caller saw apparent success. These tests run each path in
+// a NON-repo tempdir — git exits 128 — and assert contextcrawler propagates a
+// non-zero exit instead of reporting success.
+
+/// A bare tempdir that is deliberately NOT a git repo. git invoked here
+/// exits non-zero ("fatal: not a git repository").
+fn non_repo_dir() -> tempfile::TempDir {
+    tempfile::tempdir().expect("create non-repo tempdir")
+}
+
+#[test]
+fn git_status_propagates_failure_exit_code() {
+    let _guard = common::env_lock();
+    let dir = non_repo_dir();
+    let out = ccrawl_in(dir.path())
+        .args(["git", "status"])
+        .output()
+        .expect("contextcrawler git status runs");
+    assert!(
+        !out.status.success(),
+        "git status outside a repo must propagate a non-zero exit, not be \
+         filtered into apparent success. stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn git_stash_list_propagates_failure_exit_code() {
+    let _guard = common::env_lock();
+    let dir = non_repo_dir();
+    let out = ccrawl_in(dir.path())
+        .args(["git", "stash", "list"])
+        .output()
+        .expect("contextcrawler git stash list runs");
+    assert!(
+        !out.status.success(),
+        "git stash list outside a repo must propagate a non-zero exit. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn git_stash_show_propagates_failure_exit_code() {
+    let _guard = common::env_lock();
+    let dir = non_repo_dir();
+    let out = ccrawl_in(dir.path())
+        .args(["git", "stash", "show"])
+        .output()
+        .expect("contextcrawler git stash show runs");
+    assert!(
+        !out.status.success(),
+        "git stash show outside a repo must propagate a non-zero exit. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn git_worktree_list_propagates_failure_exit_code() {
+    let _guard = common::env_lock();
+    let dir = non_repo_dir();
+    let out = ccrawl_in(dir.path())
+        .args(["git", "worktree", "list"])
+        .output()
+        .expect("contextcrawler git worktree list runs");
+    assert!(
+        !out.status.success(),
+        "git worktree list outside a repo must propagate a non-zero exit. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn benign_git_log_still_succeeds() {
     let _guard = common::env_lock();

@@ -37,7 +37,13 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     if verbose > 0 {
-        eprintln!("Running: psql {}", args.join(" "));
+        // The argv can carry a DSN with an inline password
+        // (`postgres://user:pass@host`). Scrub before it reaches stderr —
+        // verbose output is routinely captured into agent context. (#100 G4)
+        eprintln!(
+            "Running: psql {}",
+            crate::core::tracking::scrub_secrets(&args.join(" "))
+        );
     }
 
     runner::run_filtered(
@@ -191,6 +197,33 @@ fn filter_expanded(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // G4/#100: verbose mode logs the psql argv, which may carry a DSN with an
+    // inline password (`postgres://user:pass@host`). The log path scrubs the
+    // argv through `scrub_secrets` before printing. This pins the contract:
+    // the password is redacted and the rest of the DSN survives for context.
+    #[test]
+    fn test_verbose_log_scrubs_dsn_password() {
+        let args = ["postgres://admin:hunter2@db.internal:5432/app".to_string()];
+        let logged = crate::core::tracking::scrub_secrets(&args.join(" "));
+        assert!(
+            !logged.contains("hunter2"),
+            "inline DSN password must not survive into the verbose log: {logged}"
+        );
+        // Host / user / db remain so the log is still useful for debugging.
+        assert!(logged.contains("db.internal"), "host should survive: {logged}");
+        assert!(logged.contains("admin"), "user should survive: {logged}");
+    }
+
+    #[test]
+    fn test_verbose_log_scrubs_password_flag() {
+        let args = ["--password=topsecret".to_string(), "-h".to_string(), "db".to_string()];
+        let logged = crate::core::tracking::scrub_secrets(&args.join(" "));
+        assert!(
+            !logged.contains("topsecret"),
+            "--password value must be redacted in the verbose log: {logged}"
+        );
+    }
 
     #[test]
     fn test_snapshot_table_format() {
