@@ -570,11 +570,15 @@ pub fn secure_git_command() -> Command {
 /// the attacker can convince you to clone from. `--exec-path` swaps the
 /// directory git looks in for its own helpers (`git-fetch-pack` etc.),
 /// equivalent in blast radius.
+/// `--config-env=<key>=<envvar>` lets git pull a config value out of an
+/// arbitrary environment variable — a documented env-injection RCE vector
+/// (it can populate `core.sshCommand`, `core.pager`, etc. from a tainted
+/// env var, sidestepping the `-c` key denylist). Denied unconditionally.
 const FORBIDDEN_GIT_FLAGS_EXACT: &[&str] =
-    &["--upload-pack", "--receive-pack", "--exec-path"];
+    &["--upload-pack", "--receive-pack", "--exec-path", "--config-env"];
 
 const FORBIDDEN_GIT_FLAGS_PREFIX: &[&str] =
-    &["--upload-pack=", "--receive-pack=", "--exec-path="];
+    &["--upload-pack=", "--receive-pack=", "--exec-path=", "--config-env="];
 
 /// Config keys (case-insensitive prefix match) that contextcrawler
 /// refuses to forward via `-c key=val`. Each of these, when set,
@@ -598,6 +602,13 @@ const FORBIDDEN_GIT_FLAGS_PREFIX: &[&str] =
 /// variable name (only the subsection is case-sensitive), so we lowercase
 /// both sides of the comparison; redundant `Camel` / `lower` variants are
 /// not needed but are tolerated as no-ops.
+///   - `alias.*` — a git alias whose value starts with `!` runs an
+///     arbitrary shell command; the whole `alias.` namespace is gated.
+///   - `credential.helper` (and `credential.<url>.helper`) — the credential
+///     helper is exec'd by any command that authenticates to a remote.
+///   - `filter.*` — `filter.<name>.clean` / `.smudge` / `.process` are
+///     exec'd when a path with a matching `gitattributes` filter is
+///     checked out or staged; the whole `filter.` namespace is gated.
 const FORBIDDEN_GIT_CONFIG_KEY_PREFIXES: &[&str] = &[
     "diff.external",
     "core.editor",
@@ -609,6 +620,9 @@ const FORBIDDEN_GIT_CONFIG_KEY_PREFIXES: &[&str] = &[
     "protocol.",
     "uploadpack.packobjectshook",
     "safe.directory",
+    "alias.",
+    "credential.",
+    "filter.",
 ];
 
 /// Scan args for any flag in the git deny list. Returns `Err` with a
@@ -824,6 +838,36 @@ mod secure_git_tests {
     #[test]
     fn rejects_c_safe_directory() {
         assert!(check_forbidden_git_args(&["-c", "safe.directory=/tmp/evil", "status"]).is_err());
+    }
+
+    #[test]
+    fn rejects_config_env_flag() {
+        // `--config-env=<key>=<envvar>` pulls a config value out of an
+        // arbitrary env var — env-injection RCE that sidesteps the `-c`
+        // key denylist. Both shapes must bounce.
+        assert!(
+            check_forbidden_git_args(&["--config-env=core.sshCommand=EVIL", "fetch"]).is_err()
+        );
+        assert!(
+            check_forbidden_git_args(&["--config-env", "core.pager=EVIL", "log"]).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_c_alias_credential_filter() {
+        // Exec-capable config families: a `!`-prefixed alias runs a shell
+        // command; a credential helper is exec'd on auth; a filter's
+        // clean/smudge/process sub-keys are exec'd on checkout/stage.
+        assert!(check_forbidden_git_args(&["-c", "alias.x=!touch /tmp/pwn", "x"]).is_err());
+        assert!(
+            check_forbidden_git_args(&["-c", "credential.helper=/tmp/evil", "fetch"]).is_err()
+        );
+        assert!(
+            check_forbidden_git_args(&["-c", "filter.lfs.process=/tmp/evil", "checkout"]).is_err()
+        );
+        assert!(
+            check_forbidden_git_args(&["-c", "filter.x.clean=/tmp/evil", "add"]).is_err()
+        );
     }
 
     #[test]
@@ -1094,6 +1138,11 @@ const FORBIDDEN_CARGO_ENV_EXACT: &[&str] = &[
     "CARGO_BUILD_RUSTC",
     // Compile-time tooling that runs build scripts / linker phases.
     "RUSTFLAGS",
+    // Higher-precedence sibling of RUSTFLAGS (0x1f-separated). Cargo
+    // honours it ahead of RUSTFLAGS, so stripping only RUSTFLAGS leaves
+    // a hole — `-C linker=` / `-C link-arg=` smuggled in here still hits
+    // rustc. Strip both.
+    "CARGO_ENCODED_RUSTFLAGS",
     "RUSTDOCFLAGS",
     "CC",
     "CXX",
@@ -1300,6 +1349,12 @@ mod secure_cargo_tests {
         assert!(
             removed.contains("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"),
             "dynamic CARGO_TARGET_*_LINKER not stripped"
+        );
+        // CARGO_ENCODED_RUSTFLAGS is the higher-precedence sibling of
+        // RUSTFLAGS — explicitly assert it is stripped (issue #100/G1).
+        assert!(
+            removed.contains("CARGO_ENCODED_RUSTFLAGS"),
+            "CARGO_ENCODED_RUSTFLAGS must be stripped (higher precedence than RUSTFLAGS)"
         );
 
         // Cleanup so we don't poison the rest of the suite.
@@ -2164,6 +2219,11 @@ mod tests {
 /// (`PRISMA_*_BINARY`, `PLAYWRIGHT_BROWSERS_PATH`, `NEXT_SHARP_PATH`).
 const NODE_ENV_VARS_EXACT: &[&str] = &[
     "NODE_OPTIONS",
+    // Prepends attacker-controlled directories to Node's module
+    // resolution path — lets a planted `evil/index.js` shadow a real
+    // dependency that the tool then `require()`s. Module-resolution
+    // hijack, same blast radius as NODE_OPTIONS=--require.
+    "NODE_PATH",
     "PRISMA_QUERY_ENGINE_BINARY",
     "PRISMA_SCHEMA_ENGINE_BINARY",
     "PRISMA_INTROSPECTION_ENGINE_BINARY",
@@ -2179,6 +2239,8 @@ const NODE_ENV_VARS_EXACT: &[&str] = &[
 /// - `NODE_OPTIONS` (covers `--require <path>` preload hijack — works on
 ///   EVERY Node process, including npm/pnpm/npx/vitest/jest/playwright/
 ///   tsc/eslint/prettier/prisma/next).
+/// - `NODE_PATH` (module-resolution shadowing — prepended dirs let a
+///   planted module shadow a real dependency the tool `require()`s).
 /// - Every var whose name starts with `NPM_CONFIG_` OR `npm_config_`
 ///   (both prefixes are honored by npm/pnpm — case-sensitive — so we
 ///   sweep both case-spelled variants dynamically).
@@ -2445,6 +2507,35 @@ mod secure_node_tests {
         std::env::set_var("NPM_CONFIG_TEST_SENTINEL", "1");
         let _cmd2 = secure_node_command("node");
         std::env::remove_var("NPM_CONFIG_TEST_SENTINEL");
+    }
+
+    #[test]
+    fn secure_node_command_strips_node_path() {
+        // NODE_PATH lets an attacker prepend module-resolution dirs and
+        // shadow a real dependency. Confirm secure_node_command removes
+        // every var in NODE_ENV_VARS_EXACT — NODE_PATH included.
+        let cmd = secure_node_command("node");
+        let removed: std::collections::HashSet<String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for name in NODE_ENV_VARS_EXACT {
+            assert!(
+                removed.contains(*name),
+                "{} must be env_remove()'d by secure_node_command",
+                name
+            );
+        }
+        assert!(
+            removed.contains("NODE_PATH"),
+            "NODE_PATH must be stripped (module-resolution shadowing, issue #100/G1)"
+        );
     }
 }
 

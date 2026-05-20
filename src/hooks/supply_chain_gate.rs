@@ -40,7 +40,9 @@ pub enum Verdict {
     Allow,
     /// One or more packages failed the gate. Caller should refuse the auto-allow.
     Block(Vec<Finding>),
-    /// Network or other transient failure. Caller policy (fail-open by default).
+    /// Network or other transient failure (TOML parse, registry timeout,
+    /// OSV lookup error). Callers fail CLOSED: the auto-allow is downgraded
+    /// to Ask so the user is prompted rather than the install waved through.
     Unavailable(String),
 }
 
@@ -814,7 +816,8 @@ pub fn render(verdict: &Verdict) -> String {
         }
         Verdict::Allow => "[contextcrawler supply-chain] all packages passed".into(),
         Verdict::Unavailable(e) => format!(
-            "[contextcrawler supply-chain] WARN — gate unavailable ({}). Fail-open.",
+            "[contextcrawler supply-chain] WARN — gate unavailable ({}). \
+             Failing closed: auto-allow downgraded to Ask.",
             e
         ),
         Verdict::Block(findings) => {

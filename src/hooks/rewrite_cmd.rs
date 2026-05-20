@@ -61,13 +61,33 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
                 // ===== contextzip-downstream: end Tirith gate =====
 
                 // ===== contextzip-downstream: supply-chain gate fires here =====
+                // SECURITY: a `Block` verdict (failed gate) AND an
+                // `Unavailable` verdict (registry/OSV lookup failed) both
+                // downgrade the auto-allow to Ask. Treating `Unavailable`
+                // as a silent allow would be fail-open: every network
+                // timeout or OSV outage would wave installs straight
+                // through. The gate is opt-in (`supply_chain.enabled`), so
+                // once a user has turned it on we fail CLOSED on error.
                 let sc_verdict = supply_chain_gate::check(cmd);
                 supply_chain_gate::log_event(cmd, &sc_verdict);
-                if let supply_chain_gate::Verdict::Block(_) = &sc_verdict {
-                    eprintln!("{}", supply_chain_gate::render(&sc_verdict));
-                    print!("{}", rewritten);
-                    let _ = std::io::stdout().flush();
-                    std::process::exit(3);
+                match &sc_verdict {
+                    supply_chain_gate::Verdict::Block(_) => {
+                        eprintln!("{}", supply_chain_gate::render(&sc_verdict));
+                        print!("{}", rewritten);
+                        let _ = std::io::stdout().flush();
+                        std::process::exit(3);
+                    }
+                    supply_chain_gate::Verdict::Unavailable(_) => {
+                        eprintln!("{}", supply_chain_gate::render(&sc_verdict));
+                        eprintln!(
+                            "[contextcrawler] supply-chain gate could not verify; \
+                             downgrading auto-allow to Ask."
+                        );
+                        print!("{}", rewritten);
+                        let _ = std::io::stdout().flush();
+                        std::process::exit(3);
+                    }
+                    supply_chain_gate::Verdict::Skip | supply_chain_gate::Verdict::Allow => {}
                 }
                 // ===== contextzip-downstream: end supply-chain gate =====
 
@@ -203,6 +223,51 @@ mod tests {
             // Sentinel: ensure Default and Allow are distinct enum variants.
             // If this ever fails, the entire permission model is broken.
             assert_ne!(PermissionVerdict::Default, PermissionVerdict::Allow);
+        }
+    }
+
+    /// SECURITY: the supply-chain gate must fail CLOSED. A `Block` verdict
+    /// AND an `Unavailable` verdict (registry timeout / OSV outage / TOML
+    /// parse error) both downgrade the auto-allow to Ask (exit 3). Only
+    /// `Skip` / `Allow` proceed silently. If `Unavailable` were treated as
+    /// a silent allow, every transient network failure would wave installs
+    /// through — fail-open. See issue #100 (G1).
+    mod supply_chain_fail_closed {
+        use crate::hooks::supply_chain_gate::Verdict;
+
+        /// The exit code `run()` applies for a given supply-chain verdict
+        /// once the upstream permission verdict is Allow.
+        ///   Skip / Allow   → 0 (proceed, auto-allow)
+        ///   Block          → 3 (ask — gate failed)
+        ///   Unavailable    → 3 (ask — gate could not verify, fail closed)
+        fn supply_chain_exit_code(v: &Verdict) -> i32 {
+            match v {
+                Verdict::Skip | Verdict::Allow => 0,
+                Verdict::Block(_) => 3,
+                Verdict::Unavailable(_) => 3,
+            }
+        }
+
+        #[test]
+        fn unavailable_downgrades_to_ask_not_allow() {
+            let v = Verdict::Unavailable("registry timeout".into());
+            assert_eq!(
+                supply_chain_exit_code(&v),
+                3,
+                "Unavailable MUST downgrade to Ask (3), never silently allow (0)"
+            );
+        }
+
+        #[test]
+        fn block_still_downgrades_to_ask() {
+            let v = Verdict::Block(vec![]);
+            assert_eq!(supply_chain_exit_code(&v), 3);
+        }
+
+        #[test]
+        fn allow_and_skip_proceed() {
+            assert_eq!(supply_chain_exit_code(&Verdict::Allow), 0);
+            assert_eq!(supply_chain_exit_code(&Verdict::Skip), 0);
         }
     }
 }
