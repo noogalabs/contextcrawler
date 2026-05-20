@@ -3530,6 +3530,27 @@ fn long_option_key(arg: &str) -> Option<&str> {
     Some(stripped.split('=').next().unwrap_or(stripped))
 }
 
+/// Does a long-option `key` match any name in `forbidden`, allowing for the
+/// GNU `getopt_long` abbreviation rule?
+///
+/// curl and wget both use `getopt_long`, which accepts ANY unambiguous prefix
+/// of a long option: `--conf=file` invokes `--config`, `--out=x` invokes
+/// `--output-document`. An exact-match deny-list is bypassed by every such
+/// abbreviation. So a key matches when it is a (possibly partial) prefix of a
+/// forbidden name — for each forbidden name `F`, reject when `F.starts_with(key)`.
+///
+/// This deliberately over-rejects: a very short ambiguous abbreviation (`--c`)
+/// is rejected even though the tool itself might error on ambiguity. That is
+/// the SAFE direction — over-rejecting a flag is acceptable, under-rejecting is
+/// the vulnerability. An empty key never matches (handled by the caller; a bare
+/// `--` is the operand separator, not an abbreviation of everything).
+fn long_key_matches_forbidden(key: &str, forbidden: &[&str]) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    forbidden.iter().any(|name| name.starts_with(key))
+}
+
 /// Scan a *single-dash short-flag token* for any forbidden short flag.
 ///
 /// curl/wget short flags both bundle (`-sK` == `-s -K`) and accept attached
@@ -3573,6 +3594,29 @@ pub fn check_forbidden_curl_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
     // Forbidden single-letter short flags. `-K` takes a value that consumes
     // the rest of the token, so any occurrence in a single-dash bundle rejects.
     const FORBIDDEN_SHORT: &[&str] = &["K"];
+    // Value-consuming flags in their *separate-value* form: the token that
+    // follows is a VALUE, not a flag, so it must not be scanned for forbidden
+    // flags. `curl --data -K` — the `-K` is `--data`'s payload. Only the
+    // separate form consumes the next token; the attached form (`--data=X`,
+    // `-dX`) does not. See finding G4/#100 (third pass).
+    const VALUE_FLAGS: &[&str] = &[
+        "--data",
+        "--data-binary",
+        "--data-raw",
+        "--data-urlencode",
+        "--header",
+        "--form",
+        "--url",
+        "--user",
+        "--user-agent",
+        "--referer",
+        "-d",
+        "-H",
+        "-F",
+        "-A",
+        "-e",
+        "-u",
+    ];
 
     let mut i = 0;
     let mut operands_only = false;
@@ -3595,16 +3639,26 @@ pub fn check_forbidden_curl_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
 
         // --config / -K — match the bare token AND every bypass shape:
         // long attached-value (`--config=file`), short attached-value
-        // (`-Kfile`), short bundling (`-sK`, `-sKfile`). The long key is
-        // normalised; the short token is char-scanned so a forbidden flag
+        // (`-Kfile`), short bundling (`-sK`, `-sKfile`), and GNU getopt_long
+        // abbreviations (`--conf=file`). The long key is normalised then
+        // prefix-matched; the short token is char-scanned so a forbidden flag
         // anywhere in a single-dash bundle rejects. See G4/#100.
         if let Some(key) = long_option_key(a) {
-            if FORBIDDEN_LONG.contains(&key) {
+            if long_key_matches_forbidden(key, FORBIDDEN_LONG) {
                 return Err(cloud_deny_message("curl", a));
             }
         }
         if short_token_has_forbidden(a, FORBIDDEN_SHORT) {
             return Err(cloud_deny_message("curl", a));
+        }
+
+        // A recognised value-taking flag in its *separate-value* form consumes
+        // the next token as a VALUE — skip the forbidden-flag scan for it so a
+        // `-`-looking value (`--data -K`) is not wrongly rejected. The attached
+        // form (`--data=X`) carries its own value and does not consume `i+1`.
+        if VALUE_FLAGS.contains(&a) {
+            i += 2;
+            continue;
         }
 
         // --output <path> / -o <path>
@@ -3715,31 +3769,64 @@ pub fn check_forbidden_wget_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
     // consumes the rest of its token, so any occurrence in a single-dash
     // bundle (`-qO`, `-Ofile`, `-iurls.txt`) rejects.
     const FORBIDDEN_SHORT: &[&str] = &["e", "O", "i"];
+    // Value-consuming flags in their *separate-value* form: the next token is
+    // a VALUE, not a flag, so skip the forbidden-flag scan for it. Only the
+    // separate form consumes the next token; the attached form (`--header=X`)
+    // does not. See finding G4/#100 (third pass).
+    const VALUE_FLAGS: &[&str] = &[
+        "--header",
+        "--post-data",
+        "--post-file",
+        "--body-data",
+        "--body-file",
+        "--user-agent",
+        "--referer",
+        "--user",
+        "--http-user",
+        "--password",
+        "--http-password",
+        "-U",
+    ];
 
+    let mut i = 0;
     let mut operands_only = false;
-    for arg in args {
-        let a = arg.as_ref();
+    while i < args.len() {
+        let a = args[i].as_ref();
 
         // A bare `--` ends option parsing — subsequent args are operands.
         // See finding G4/#100 (second pass).
         if a == "--" {
             operands_only = true;
+            i += 1;
             continue;
         }
         if operands_only {
+            i += 1;
             continue;
         }
 
-        // Long attached-value form (`--output-document=x`) via normalised key;
+        // Long attached-value form (`--output-document=x`) via normalised key,
+        // then prefix-matched for GNU getopt_long abbreviations (`--out=x`);
         // short bundling / attached-value form (`-Ofile`, `-qO`) via char-scan.
         if let Some(key) = long_option_key(a) {
-            if FORBIDDEN_LONG.contains(&key) {
+            if long_key_matches_forbidden(key, FORBIDDEN_LONG) {
                 return Err(cloud_deny_message("wget", a));
             }
         }
         if short_token_has_forbidden(a, FORBIDDEN_SHORT) {
             return Err(cloud_deny_message("wget", a));
         }
+
+        // A recognised value-taking flag in its *separate-value* form consumes
+        // the next token as a VALUE — skip the forbidden-flag scan for it so a
+        // `-`-looking value is not wrongly rejected. The attached form
+        // (`--header=X`) carries its own value and does not consume `i+1`.
+        if VALUE_FLAGS.contains(&a) {
+            i += 2;
+            continue;
+        }
+
+        i += 1;
     }
     Ok(())
 }
@@ -4022,6 +4109,34 @@ mod secure_cloud_tests {
         assert!(check_forbidden_curl_args(&["-sL", "https://x"]).is_ok());
     }
 
+    // G4/#100 (third pass): curl uses GNU getopt_long — any unambiguous prefix
+    // of a long option invokes it. `--conf=file` IS `--config=file`. The
+    // abbreviated form must not bypass the deny-list.
+    #[test]
+    fn rejects_curl_abbreviated_long_option() {
+        assert!(check_forbidden_curl_args(&["--conf=file"]).is_err());
+        assert!(check_forbidden_curl_args(&["--co=file"]).is_err());
+        assert!(check_forbidden_curl_args(&["--conf", "file"]).is_err());
+        assert!(check_forbidden_curl_args(&["--c=file"]).is_err());
+        // exact form still rejected (regression guard)
+        assert!(check_forbidden_curl_args(&["--config=file"]).is_err());
+    }
+
+    // G4/#100 (third pass): a `-`-looking VALUE of a separate-value flag is a
+    // value, not a flag — `curl --data -K` must be allowed. But a real flag
+    // after an *attached*-value flag (`--data=foo -K`) is still a flag.
+    #[test]
+    fn curl_value_flag_does_not_false_positive() {
+        // -K here is the value of --data, not a flag
+        assert!(check_forbidden_curl_args(&["--data", "-K", "https://x"]).is_ok());
+        assert!(check_forbidden_curl_args(&["-d", "-K", "https://x"]).is_ok());
+        assert!(check_forbidden_curl_args(&["-H", "-K", "https://x"]).is_ok());
+        // attached-value form does NOT consume the next token — -K is a flag
+        assert!(check_forbidden_curl_args(&["--data=foo", "-K", "https://x"]).is_err());
+        // lowercase -k (--insecure) is case-distinct from -K and allowed
+        assert!(check_forbidden_curl_args(&["-k", "https://x"]).is_ok());
+    }
+
     #[test]
     fn rejects_curl_output_to_rc_files() {
         assert!(check_forbidden_curl_args(&["https://x", "--output", "/home/u/.bashrc"]).is_err());
@@ -4110,6 +4225,30 @@ mod secure_cloud_tests {
         assert!(check_forbidden_wget_args(&["--tries=3", "https://x"]).is_ok());
         assert!(check_forbidden_wget_args(&["-q", "https://x"]).is_ok());
         assert!(check_forbidden_wget_args(&["--no-check-certificate", "https://x"]).is_ok());
+    }
+
+    // G4/#100 (third pass): wget uses GNU getopt_long — `--out=x` is an
+    // unambiguous prefix of `--output-document`. The abbreviated long form
+    // must not bypass the deny-list.
+    #[test]
+    fn rejects_wget_abbreviated_long_option() {
+        assert!(check_forbidden_wget_args(&["--out=x"]).is_err());
+        assert!(check_forbidden_wget_args(&["--output-doc=x"]).is_err());
+        assert!(check_forbidden_wget_args(&["--exec", "robots=off"]).is_err());
+        assert!(check_forbidden_wget_args(&["--conf=file"]).is_err());
+        // exact form still rejected (regression guard)
+        assert!(check_forbidden_wget_args(&["--output-document=x"]).is_err());
+    }
+
+    // G4/#100 (third pass): a `-`-looking VALUE of a separate-value flag must
+    // not be scanned as a flag. `wget --header -O ...` — the `-O` is the
+    // header value. The attached form does still expose the next token.
+    #[test]
+    fn wget_value_flag_does_not_false_positive() {
+        assert!(check_forbidden_wget_args(&["--header", "-O", "https://x"]).is_ok());
+        assert!(check_forbidden_wget_args(&["--post-data", "-e", "https://x"]).is_ok());
+        // attached-value form does NOT consume the next token — -O is a flag
+        assert!(check_forbidden_wget_args(&["--header=foo", "-O", "https://x"]).is_err());
     }
 
     #[test]
