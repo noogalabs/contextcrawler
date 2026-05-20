@@ -1655,9 +1655,17 @@ const META_FLAGS: &[&str] = &["--version", "-V", "--help", "-h"];
 /// fell through to `run_fallback` → raw exec and produced parse_failure
 /// rows. The regression test `meta_passthrough_covers_all_subcommand_only_wrappers`
 /// guards against future drift.
+///
+/// Issue #96 extension: the Python/Ruby subcommand-style wrappers
+/// (`pytest`, `ruff`, `mypy`, `rake`, `rubocop`, `rspec`, `pip`) have the
+/// same shape — clap captures `--version` into a `trailing_var_arg` and the
+/// filter handler then mangles version output (production DB recorded
+/// `pytest --version` at −75% savings over 90 calls). Route their meta-flag
+/// invocations to clean passthrough too.
 const META_PASSTHROUGH_BINS: &[&str] = &[
     "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
     "gh", "glab", "aws", "psql", "prisma", "gt",
+    "pytest", "ruff", "mypy", "rake", "rubocop", "rspec", "pip",
 ];
 
 fn cmd_has_meta_flag(args: &[String]) -> bool {
@@ -1667,10 +1675,14 @@ fn cmd_has_meta_flag(args: &[String]) -> bool {
 /// Timed raw passthrough used by the meta-flag intercept. Records a
 /// passthrough row (so the call shows up in `gain --history`) but bypasses
 /// clap/parse_failure entirely.
+///
+/// Uses `secure_meta_command` rather than a bare `resolved_command` so the
+/// meta-flag path keeps the same runtime-env hardening (RUBYOPT/PYTHONPATH/
+/// NODE_OPTIONS strip) the per-tool clap filter handlers apply. See #36/#96.
 fn run_simple_passthrough(cmd: &str, args: &[String]) -> Result<i32> {
     use crate::core::tracking::TimedExecution;
     let timer = TimedExecution::start();
-    let status = crate::core::utils::resolved_command(cmd)
+    let status = crate::core::utils::secure_meta_command(cmd)
         .args(args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -1699,6 +1711,13 @@ fn run_simple_passthrough(cmd: &str, args: &[String]) -> Result<i32> {
 /// Documented grep format flags that should run raw rather than go through
 /// rtk's filter. Short letters are matched anywhere inside a single-`-` bundle
 /// (e.g. `-c`, `-ci`, `-cE`). Long forms match exactly.
+///
+/// `-l` is a special case (issue #97). clap's `Grep` variant claims `-l` for
+/// `--max-len` (a usize). Standard `grep -l` (`--files-with-matches`) takes
+/// no value, so `grep -l pattern file` makes clap try to parse `pattern` as a
+/// usize and fail → `run_fallback`. We treat bare `-l` as a format flag (route
+/// to rg) ONLY when it is NOT followed by a numeric token — `-l 80` stays the
+/// app's `--max-len` and is left for clap.
 fn grep_format_flag_present(args: &[String]) -> bool {
     const LONG_FLAGS: &[&str] = &[
         "--count",
@@ -1709,9 +1728,21 @@ fn grep_format_flag_present(args: &[String]) -> bool {
     ];
     const SHORT_LETTERS: &[char] = &['c', 'L', 'o', 'Z'];
 
-    for arg in args {
+    for (i, arg) in args.iter().enumerate() {
         if LONG_FLAGS.contains(&arg.as_str()) {
             return true;
+        }
+        // Bare `-l`: standard grep --files-with-matches unless the next token
+        // is numeric (then it's this app's `-l <max_len>`).
+        if arg == "-l" {
+            let next_is_numeric = args
+                .get(i + 1)
+                .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false);
+            if !next_is_numeric {
+                return true;
+            }
+            continue;
         }
         if arg.starts_with("--") || arg.len() < 2 || !arg.starts_with('-') {
             continue;
@@ -1722,6 +1753,12 @@ fn grep_format_flag_present(args: &[String]) -> bool {
             continue;
         }
         if body.chars().any(|c| SHORT_LETTERS.contains(&c)) {
+            return true;
+        }
+        // Bundled `-l` (e.g. `-il`, `-ln`): a bundled `-l` can never carry a
+        // separate numeric value, so it is always standard grep's
+        // --files-with-matches. Route to rg.
+        if body.len() > 1 && body.contains('l') {
             return true;
         }
     }
@@ -1744,36 +1781,55 @@ enum GrepPreprocess {
     Passthrough(Vec<String>),
 }
 
+/// Short grep flags that are safe to drop entirely before handing args to
+/// clap. clap's `Grep` variant doesn't declare them, so leaving them in
+/// triggers a parse failure → `run_fallback`. Each is a behavioural no-op
+/// for the downstream consumer:
+///
+/// - `r`/`R` — recursive. rg is recursive by default (issue #88).
+/// - `E` — extended regex. rg's regex engine is extended by default, so
+///   `grep -E` adds nothing (issue #97).
+/// - `H` — print filename. rg already prints filenames in multi-file /
+///   recursive mode; forcing it for a single file is cosmetic (issue #97).
+///
+/// These are stripped from bare short flags AND from alphabetic bundles
+/// (`-rnE` → `-n`, `-HnE` → `-n`). Stripping is applied on the passthrough
+/// path too — rg reads bare `-r` as `--replace`, so a stale `-r` would
+/// silently corrupt matches.
+const GREP_STRIPPABLE_SHORTS: &[u8] = &[b'r', b'R', b'E', b'H'];
+
 /// Two-pass pre-clap normaliser for `grep` subcommand args.
 ///
-/// Pass 1 strips `-r`/`-R`/`--recursive` (rg is recursive by default).
+/// Pass 1 strips behavioural-no-op short flags (`-r`/`-R`/`-E`/`-H` and
+/// `--recursive`) so clap can parse the remainder cleanly.
 /// Pass 2 detects context flags (`-A`/`-B`/`-C`, `--after-context` etc.)
 /// and routes the stripped args to passthrough so rg handles them
 /// natively. Stripping is intentionally applied to the passthrough path
 /// too — rg interprets bare `-r` as `--replace` (replacement string),
 /// not recursive, so leaving it in would silently produce wrong matches.
-/// See issue #88 and the Codex review on the original fix.
+/// See issues #88 and #97, and the Codex review on the original fix.
 fn preprocess_grep_args(args: Vec<String>) -> GrepPreprocess {
-    // Pass 1: strip recursive flags from short bundles + long forms.
+    // Pass 1: strip no-op short flags from short bundles + long forms.
     // Iterator-based; only allocate a new String when a bundle actually
     // needs rewriting. Tokens that survive untouched are moved as-is.
     let mut stripped: Vec<String> = Vec::with_capacity(args.len());
     for arg in args.into_iter() {
-        if arg == "-r" || arg == "-R" || arg == "--recursive" {
+        if arg == "-r" || arg == "-R" || arg == "-E" || arg == "-H" || arg == "--recursive" {
             continue;
         }
-        // Single-`-` bundle of alphabetic chars: strip r/R, keep rest.
+        // Single-`-` bundle of alphabetic chars: strip r/R/E/H, keep rest.
         // Avoid the chars().collect::<Vec<_>>() — scan bytes directly.
         if arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") {
             let body = &arg[1..];
             let bytes = body.as_bytes();
             let all_alpha = bytes.iter().all(|b| b.is_ascii_alphabetic());
             if all_alpha {
-                let has_recursive = bytes.iter().any(|b| *b == b'r' || *b == b'R');
-                if has_recursive {
+                let has_strippable =
+                    bytes.iter().any(|b| GREP_STRIPPABLE_SHORTS.contains(b));
+                if has_strippable {
                     let kept: String = body
                         .bytes()
-                        .filter(|b| *b != b'r' && *b != b'R')
+                        .filter(|b| !GREP_STRIPPABLE_SHORTS.contains(b))
                         .map(|b| b as char)
                         .collect();
                     if kept.is_empty() {
@@ -1991,9 +2047,31 @@ mod grep_format_flag_tests {
     }
 
     #[test]
-    fn dash_l_alone_does_not_trigger() {
-        // -l is rtk's --max-len in this app; keep current behaviour.
+    fn dash_l_with_numeric_value_does_not_trigger() {
+        // `-l 80` is this app's --max-len; leave it for clap. Issue #97.
         assert!(!grep_format_flag_present(&args(&["-l", "80", "pattern", "file"])));
+    }
+
+    #[test]
+    fn dash_l_with_non_numeric_next_triggers() {
+        // `grep -l pattern file` is standard grep --files-with-matches.
+        // clap would try to read `pattern` as the --max-len usize and fail,
+        // so route to rg. Issue #97.
+        assert!(grep_format_flag_present(&args(&["-l", "needle", "a.txt"])));
+    }
+
+    #[test]
+    fn dash_l_at_end_triggers() {
+        // Trailing `-l` has no value to consume — standard grep -l.
+        assert!(grep_format_flag_present(&args(&["needle", "-l"])));
+    }
+
+    #[test]
+    fn bundled_dash_l_triggers() {
+        // `-il` / `-ln` bundle `-l` with other flags — a bundled `-l` can
+        // never carry a numeric value, so it is always standard grep -l.
+        assert!(grep_format_flag_present(&args(&["-il", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&["-ln", "pattern", "file"])));
     }
 
     #[test]
@@ -2147,6 +2225,50 @@ mod grep_preprocess_tests {
         assert_eq!(out, GrepPreprocess::Passthrough(v(&["-B", "2", "needle", "file"])));
     }
 
+    // ---- issue #97: strip -E / -H no-op flags ----
+
+    #[test]
+    fn test_preprocess_grep_strips_bare_E() {
+        // -E (extended regex) is a no-op for rg → strip, clap parses cleanly.
+        let out = preprocess_grep_args(v(&["-E", "needle", "a.txt"]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", "a.txt"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_bare_H() {
+        // -H (with-filename) is cosmetic for rg → strip.
+        let out = preprocess_grep_args(v(&["-H", "needle", "a.txt"]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", "a.txt"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_bundled_rnE() {
+        // -rnE: r + E stripped, -n survives.
+        let out = preprocess_grep_args(v(&["-rnE", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_bundled_HnE() {
+        // -HnE: H + E stripped, -n survives.
+        let out = preprocess_grep_args(v(&["-HnE", "needle", "a.txt"]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "a.txt"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_strips_E_only_bundle_fully() {
+        // -E alone in a bundle leaves nothing → token dropped entirely.
+        let out = preprocess_grep_args(v(&["-E", "-n", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_E_with_context_strips_E_before_passthrough() {
+        // -E + -A3: E stripped, context flag routes to passthrough.
+        let out = preprocess_grep_args(v(&["-E", "-A3", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A3", "needle", "."])));
+    }
+
     // ---- run_cli pipeline-ordering regression tests ----
     //
     // These mirror the run_cli ordering: preprocess first, then format-flag
@@ -2201,6 +2323,65 @@ mod grep_preprocess_tests {
         // stripped args fires and we route to passthrough with -c.
         assert_eq!(out, v(&["-c", "needle", "."]));
     }
+
+    // ---- issue #97: residual flags must never reach clap unrecognised ----
+
+    /// No alphabetic single-`-` token in the pipeline output is a flag that
+    /// clap's `Grep` variant would reject. clap declares `-l -m -t -n`
+    /// (plus `trailing_var_arg`). `-r/-R/-E/-H` get stripped; format flags
+    /// route to passthrough. Anything else surviving here must be a clap-
+    /// known short or part of a passthrough route.
+    fn pipeline_has_clap_rejecting_flag(out: &[String]) -> bool {
+        // `-E` and `-H` are the flags #97 targets; if either survives a
+        // Stripped route it would hit clap and fail.
+        out.iter().any(|a| a == "-E" || a == "-H")
+    }
+
+    #[test]
+    fn test_pipeline_E_does_not_leave_clap_rejecting_flag() {
+        let out = run_cli_grep_pipeline(v(&["-E", "needle", "a.txt"]));
+        assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
+        assert_eq!(out, v(&["needle", "a.txt"]));
+    }
+
+    #[test]
+    fn test_pipeline_H_does_not_leave_clap_rejecting_flag() {
+        let out = run_cli_grep_pipeline(v(&["-H", "needle", "a.txt"]));
+        assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
+        assert_eq!(out, v(&["needle", "a.txt"]));
+    }
+
+    #[test]
+    fn test_pipeline_rnE_bundle_clean() {
+        let out = run_cli_grep_pipeline(v(&["-rnE", "needle", "."]));
+        assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
+        assert!(!out.iter().any(|a| a == "-r"), "stale -r in {:?}", out);
+        assert_eq!(out, v(&["-n", "needle", "."]));
+    }
+
+    #[test]
+    fn test_pipeline_HnE_bundle_clean() {
+        let out = run_cli_grep_pipeline(v(&["-HnE", "needle", "a.txt"]));
+        assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
+        assert_eq!(out, v(&["-n", "needle", "a.txt"]));
+    }
+
+    #[test]
+    fn test_pipeline_bare_l_routes_to_format_passthrough() {
+        // `grep -l needle a.txt` → format-flag intercept fires (standard
+        // grep --files-with-matches), routed to rg. `-l` survives because
+        // run_grep_format_passthrough hands it to rg, which understands it.
+        let out = run_cli_grep_pipeline(v(&["-l", "needle", "a.txt"]));
+        assert_eq!(out, v(&["-l", "needle", "a.txt"]));
+    }
+
+    #[test]
+    fn test_pipeline_dash_o_routes_to_format_passthrough() {
+        // `-o` (only-matching) was already a format flag — verify it still
+        // routes to passthrough rather than reaching clap.
+        let out = run_cli_grep_pipeline(v(&["-o", "needle", "a.txt"]));
+        assert_eq!(out, v(&["-o", "needle", "a.txt"]));
+    }
 }
 
 #[cfg(test)]
@@ -2254,6 +2435,7 @@ mod meta_flag_tests {
         let expected = [
             "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
             "gh", "glab", "aws", "psql", "prisma", "gt",
+            "pytest", "ruff", "mypy", "rake", "rubocop", "rspec", "pip",
         ];
         for bin in expected {
             assert!(
@@ -2275,12 +2457,15 @@ fn run_cli() -> Result<i32> {
     // the listed long forms) routes straight to passthrough. Clap rejects these
     // (e.g. -c is unknown) and recording a parse_failure for each one clutters
     // the tracking DB without informing the user of anything actionable. See #13.
-    // Note: -l is intentionally NOT in this set — this app's clap claims -l for
-    // --max-len. Users wanting standard grep -l (list matching files) should use
-    // either --files-with-matches or `contextcrawler proxy grep -l ...`.
+    // Note: `-l` is ambiguous — this app's clap claims `-l` for `--max-len`
+    // (a usize). `grep -l <numeric>` is left for clap as `--max-len`; bare
+    // `grep -l <pattern>` and bundled `-l` are standard grep --files-with-
+    // matches and get routed to rg, since clap would otherwise fail parsing
+    // the pattern as a usize (#97).
     // `parsed_argv` mirrors `std::env::args()` but is swapped out below when
-    // the grep pre-clap stripper removes recursive flags — so clap re-parses
-    // the cleaned form rather than the raw one it would have rejected (#88).
+    // the grep pre-clap stripper removes recursive / no-op flags — so clap
+    // re-parses the cleaned form rather than the raw one it would have
+    // rejected (#88, #97).
     let mut parsed_argv: Vec<String> = std::env::args().collect();
     {
         let raw_args: Vec<String> = std::env::args().skip(1).collect();

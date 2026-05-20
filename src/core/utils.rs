@@ -2590,6 +2590,34 @@ pub fn secure_go_command(name: &str) -> Command {
     cmd
 }
 
+/// Build a hardened `Command` for a meta-flag passthrough invocation
+/// (`contextcrawler <tool> --version` / `--help`).
+///
+/// The meta-flag intercept (issue #90/#96) bypasses the per-tool clap
+/// filter handlers — and with them the `secure_*_command` env hardening
+/// those handlers apply. Routing meta passthrough through a bare
+/// `resolved_command` would re-expose the very runtime-env injection
+/// vectors issue #36 closed (e.g. `RUBYOPT`/`PYTHONPATH` reaching
+/// `rake`/`pytest`). This dispatcher picks the right hardened builder per
+/// tool so meta passthrough keeps the same defence as the filter path.
+pub fn secure_meta_command(name: &str) -> Command {
+    match name {
+        "cargo" => secure_cargo_command(),
+        "pnpm" | "npm" | "npx" | "prisma" => secure_node_command(name),
+        "go" => secure_go_command(name),
+        "pytest" | "ruff" | "mypy" | "pip" => secure_python_command(name),
+        "rake" | "rubocop" | "rspec" => secure_ruby_command(name),
+        // docker/kubectl/gh/glab/aws/psql/gt have no runtime-env code-load
+        // vector of their own; the universal strip (BASH_FUNC_*, LD_PRELOAD,
+        // etc.) still applies.
+        _ => {
+            let mut cmd = resolved_command(name);
+            apply_universal_env_strip(&mut cmd);
+            cmd
+        }
+    }
+}
+
 // ── Per-tool arg deny lists ─────────────────────────────────────────────
 //
 // Each tool exposes flags that read code or config from an attacker-
