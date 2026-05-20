@@ -26,6 +26,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
 // ---------------------------------------------------------------------------
@@ -190,13 +191,29 @@ fn config_candidates() -> Vec<PathBuf> {
     out
 }
 
-fn load_config() -> Config {
+/// Read the supply-chain config from disk (first candidate that exists wins).
+fn read_config_from_disk() -> Config {
     for path in config_candidates() {
         if let Ok(content) = fs::read_to_string(&path) {
             return toml::from_str(&content).unwrap_or_default();
         }
     }
     Config::default()
+}
+
+/// Process-lifetime cache for the supply-chain config.
+///
+/// The gate now runs on EVERY hook-routed Bash command (the hottest path in
+/// the tool), so an uncached `load_config()` would hit disk on every agent
+/// command even when the gate is disabled. The hook process is short-lived
+/// (one invocation per agent command) so a process-lifetime cache is correct;
+/// even if the hook ran long-lived, config doesn't change mid-process so the
+/// cache stays valid. Codex-review follow-up for #100.
+static CONFIG_CACHE: OnceLock<Config> = OnceLock::new();
+
+/// Returns the supply-chain config, reading disk at most once per process.
+fn load_config() -> &'static Config {
+    CONFIG_CACHE.get_or_init(read_config_from_disk)
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +884,19 @@ mod tests {
 
     fn names(install: &ParsedInstall) -> Vec<&str> {
         install.packages.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn load_config_caches_after_first_read() {
+        // `load_config()` is backed by a process-lifetime OnceLock. Whatever
+        // the first call resolves, every subsequent call must return the
+        // exact same `&'static Config` — no second disk read. Comparing the
+        // pointer identity proves the cache (not just value equality).
+        let first = load_config() as *const Config;
+        let second = load_config() as *const Config;
+        let third = load_config() as *const Config;
+        assert_eq!(first, second);
+        assert_eq!(second, third);
     }
 
     #[test]

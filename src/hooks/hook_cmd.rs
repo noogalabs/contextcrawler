@@ -378,6 +378,17 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     process_claude_payload_with(v, permissions::check_command)
 }
 
+/// Stderr line emitted when a gate flags a command `Ask` but it has no
+/// contextcrawler rewrite, so the only fail-closed option is a hard Deny.
+/// Factored out so the exact wording is testable without firing a live gate.
+/// Codex-review follow-up for #100.
+fn gate_no_rewrite_deny_log(cmd: &str) -> String {
+    format!(
+        "[contextcrawler] gate flagged '{cmd}' (ask) but it has no rewrite; \
+         denying (protocol limitation)"
+    )
+}
+
 /// `process_claude_payload` parameterised on the permission-verdict checker
 /// so tests can inject a deterministic verdict (production always passes
 /// `permissions::check_command`, which is config-driven). #100 G2 Codex 2nd
@@ -469,6 +480,11 @@ fn process_claude_payload_with(
             // "ask" — a bare `Skip` would pass the command through unchecked
             // (fail open). Fail CLOSED with a deny so the user must confirm.
             if gate_ask {
+                // The Deny is correct (fail closed), but a bare un-rewritable
+                // command — e.g. a gate false-positive on `ls` — would
+                // otherwise be blocked with no operator-visible reason. Emit
+                // a clear stderr line so the WHY is observable.
+                eprintln!("{}", gate_no_rewrite_deny_log(cmd));
                 return PayloadAction::Deny {
                     reason: "contextcrawler: defence-in-depth gate flagged this command \
                              and it has no contextcrawler rewrite; denying for review"
@@ -758,6 +774,20 @@ mod tests {
     fn copilot_cli_input(cmd: &str) -> Value {
         let args = serde_json::to_string(&json!({ "command": cmd })).unwrap();
         json!({ "toolName": "bash", "toolArgs": args })
+    }
+
+    /// The no-rewrite-Deny path emits a clear, operator-visible log line so a
+    /// gate false-positive on a bare un-rewritable command isn't blocked
+    /// silently. Codex-review follow-up for #100.
+    #[test]
+    fn gate_no_rewrite_deny_log_explains_why() {
+        let line = gate_no_rewrite_deny_log("ls");
+        assert!(line.starts_with("[contextcrawler] "));
+        assert!(line.contains("'ls'"));
+        assert!(line.contains("(ask)"));
+        assert!(line.contains("no rewrite"));
+        assert!(line.contains("denying"));
+        assert!(line.contains("protocol limitation"));
     }
 
     #[test]
