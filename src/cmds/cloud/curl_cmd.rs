@@ -382,6 +382,89 @@ mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
     }
 
+    #[test]
+    fn test_filter_curl_json_braces_and_whitespace_inside_string_value() {
+        // A string value containing JSON-structural characters AND runs of
+        // whitespace — none of it must be touched. This is the case that
+        // would break a naive "strip all whitespace" minifier.
+        let raw = "{\n  \"tpl\": \"{  \\\"k\\\":  1  }\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"tpl\":\"{  \\\"k\\\":  1  }\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_unicode() {
+        let raw = "{\n  \"name\": \"café \\u00e9 日本語 🎉\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"name\":\"café \\u00e9 日本語 🎉\"}");
+    }
+
+    #[test]
+    fn test_filter_curl_json_preserves_number_forms() {
+        // Negative, exponent, zero, high-precision fraction — all byte-exact.
+        let raw = "{\n  \"neg\": -42,\n  \"exp\": 6.022e23,\n  \"zero\": 0,\n  \"frac\": 0.1234567890123456\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(
+            &*result.content,
+            r#"{"neg":-42,"exp":6.022e23,"zero":0,"frac":0.1234567890123456}"#
+        );
+    }
+
+    #[test]
+    fn test_filter_curl_json_nested_structure_minified() {
+        let raw = "{\n  \"a\": {\n    \"b\": {\n      \"c\": [\n        1,\n        2\n      ]\n    }\n  }\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, r#"{"a":{"b":{"c":[1,2]}}}"#);
+    }
+
+    #[test]
+    fn test_filter_curl_json_escaped_backslash_before_quote() {
+        // Trailing escaped backslash inside a string: the `\\` must not let the
+        // following `"` be misread as still-inside-string.
+        let raw = "{\n  \"path\": \"C:\\\\dir\\\\\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"path\":\"C:\\\\dir\\\\\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&result.content).is_ok());
+    }
+
+    #[test]
+    fn test_filter_curl_json_literal_escape_sequences_in_string() {
+        // `\n` `\t` inside the JSON string are two-char escape sequences, not
+        // real whitespace — they must survive verbatim.
+        let raw = "{\n  \"s\": \"line1\\nline2\\tcol\"\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, "{\"s\":\"line1\\nline2\\tcol\"}");
+    }
+
+    #[test]
+    fn test_filter_curl_json_empty_object_and_array_passthrough() {
+        // Already minimal — minify_json returns None → borrowed passthrough.
+        for body in ["{}", "[]", r#"{"a":[]}"#] {
+            let result = filter_curl_output(body, true);
+            assert_eq!(&*result.content, body);
+            assert!(matches!(result.content, Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn test_filter_curl_json_crlf_whitespace_stripped() {
+        // Windows-style CRLF indentation is insignificant whitespace too.
+        let raw = "{\r\n  \"a\": 1\r\n}";
+        let result = filter_curl_output(raw, true);
+        assert_eq!(&*result.content, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_filter_curl_json_minified_roundtrips_semantically() {
+        // The whole contract: filtered JSON parses to the SAME value as raw.
+        let raw = "{\n  \"id\": 7,\n  \"tags\": [\"x\", \"y\"],\n  \"meta\": {\"ok\": true}\n}";
+        let result = filter_curl_output(raw, true);
+        let raw_val: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let filt_val: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(raw_val, filt_val, "minified JSON must be the same value as raw");
+    }
+
     // --- Cow optimization: passthrough must not allocate ---
 
     #[test]
