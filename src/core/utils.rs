@@ -3116,14 +3116,31 @@ pub fn check_forbidden_gradle_args<S: AsRef<str>>(args: &[S]) -> Result<(), Stri
 pub fn check_forbidden_go_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_ref();
+        let raw = args[i].as_ref();
+
+        // Go's flag parser accepts ONE or TWO leading dashes for every flag
+        // (https://pkg.go.dev/flag — "command line flag syntax"), so
+        // `--toolexec=/x` bypasses a single-dash-only matcher. Canonicalize a
+        // double-dash flag token to single-dash form purely for MATCHING — the
+        // checker only inspects argv, it never rewrites it, so `raw` (the value
+        // actually spawned) is untouched. A bare `--` is the end-of-options
+        // separator: leave it as-is so it can't masquerade as a `-` flag.
+        let a: &str = if raw == "--" {
+            raw
+        } else if raw.starts_with("--") {
+            // Strip exactly ONE dash, so `--toolexec` -> `-toolexec` and
+            // `---x` -> `--x` — never collapses past a single leading dash.
+            &raw[1..]
+        } else {
+            raw
+        };
 
         // `-toolexec` / `-exec`: exact form consumes the next arg, attached
         // `-toolexec=/x` carries the value inline. Either way it's RCE.
         if a == "-toolexec" || a.starts_with("-toolexec=") {
             return Err(pyrbjvm_deny_message_with_issue(
                 "go",
-                a,
+                raw,
                 "-toolexec runs an arbitrary binary for every compile/link step",
                 "#111",
             ));
@@ -3131,7 +3148,7 @@ pub fn check_forbidden_go_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> 
         if a == "-exec" || a.starts_with("-exec=") {
             return Err(pyrbjvm_deny_message_with_issue(
                 "go",
-                a,
+                raw,
                 "-exec runs an arbitrary binary instead of the compiled test/program",
                 "#111",
             ));
@@ -3152,7 +3169,7 @@ pub fn check_forbidden_go_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> 
                 if value.contains("-toolexec") || value.contains("-exec=") {
                     return Err(pyrbjvm_deny_message_with_issue(
                         "go",
-                        a,
+                        raw,
                         "-gcflags/-ldflags/-asmflags value smuggles -toolexec/-exec (RCE)",
                         "#111",
                     ));

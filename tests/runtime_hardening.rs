@@ -321,6 +321,82 @@ fn go_build_plain_invocation_is_not_rejected() {
     );
 }
 
+// Go's flag parser accepts ONE or TWO leading dashes for every flag, so the
+// double-dash spelling of each dangerous flag must be rejected just like the
+// single-dash form (#111 G6 follow-up).
+
+#[test]
+fn go_build_double_dash_toolexec_attached_is_rejected() {
+    let out = run_with_env(&["go", "build", "--toolexec=/tmp/evil", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build --toolexec= should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_build_double_dash_toolexec_spaced_is_rejected() {
+    let out = run_with_env(&["go", "build", "--toolexec", "/tmp/evil", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build --toolexec (spaced) should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_test_double_dash_exec_is_rejected() {
+    let out = run_with_env(&["go", "test", "--exec", "/x", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go test --exec should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_build_double_dash_gcflags_toolexec_smuggling_is_rejected() {
+    let out = run_with_env(&["go", "build", "--gcflags=-toolexec=/x", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build --gcflags=-toolexec= should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_build_double_dash_gcflags_all_toolexec_smuggling_is_rejected() {
+    let out = run_with_env(&["go", "build", "--gcflags=all=-toolexec=/x", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build --gcflags=all=-toolexec= should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn go_build_double_dash_ldflags_toolexec_smuggling_is_rejected() {
+    let out = run_with_env(&["go", "build", "--ldflags=-toolexec=/x", "./..."], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to forward") && stderr.contains("#111"),
+        "go build --ldflags=-toolexec= should be rejected. stderr={}",
+        stderr
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
 #[test]
 fn pytest_config_file_is_rejected() {
     // `-c evil.ini` points pytest at an attacker pytest.ini that can set
