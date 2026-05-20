@@ -2590,6 +2590,167 @@ pub fn secure_go_command(name: &str) -> Command {
     cmd
 }
 
+/// Build a hardened `Command` for a meta-flag passthrough invocation
+/// (`contextcrawler <tool> --version` / `--help`).
+///
+/// The meta-flag intercept (issue #90/#96) bypasses the per-tool clap
+/// filter handlers — and with them the `secure_*_command` env hardening
+/// those handlers apply. Routing meta passthrough through a bare
+/// `resolved_command` would re-expose the very runtime-env injection
+/// vectors issue #36 closed (e.g. `RUBYOPT`/`PYTHONPATH` reaching
+/// `rake`/`pytest`). This dispatcher picks the right hardened builder per
+/// tool so meta passthrough keeps the same defence as the filter path.
+pub fn secure_meta_command(name: &str) -> Command {
+    match name {
+        "cargo" => secure_cargo_command(),
+        "pnpm" | "npm" | "npx" | "prisma" => secure_node_command(name),
+        "go" => secure_go_command(name),
+        "pytest" | "ruff" | "mypy" | "pip" => secure_python_command(name),
+        "rake" | "rubocop" | "rspec" => secure_ruby_command(name),
+        // Codex review of #96/#97: docker/kubectl/gh/glab/aws/psql/gt all
+        // have tool-specific `secure_*_command` builders that strip MORE
+        // than the universal set (DOCKER_CONFIG/DOCKER_HOST, KUBECONFIG,
+        // AWS_CONFIG_FILE/AWS_SHARED_CREDENTIALS_FILE, PSQLRC, GH_CONFIG_DIR,
+        // etc. — issues #36/#37/#38). Routing them to the generic fallback
+        // silently re-exposed those env-injection vectors on the meta-flag
+        // passthrough path. Dispatch each to its dedicated builder so meta
+        // passthrough is at least as hardened as the normal filter path.
+        "docker" => secure_docker_command(),
+        "kubectl" => secure_kubectl_command(),
+        "aws" => secure_aws_command(),
+        "psql" => secure_psql_command(),
+        "gh" => secure_gh_command(),
+        "glab" => secure_glab_command(),
+        "gt" => secure_gt_command(),
+        // Any binary with no tool-specific builder: the universal strip
+        // (BASH_FUNC_*, LD_PRELOAD, interpreter env vars, etc.) still
+        // applies. No binary in META_PASSTHROUGH_BINS should land here —
+        // the test `meta_dispatch_routes_every_passthrough_bin` guards it.
+        _ => {
+            let mut cmd = resolved_command(name);
+            apply_universal_env_strip(&mut cmd);
+            cmd
+        }
+    }
+}
+
+#[cfg(test)]
+mod secure_meta_dispatch_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Collect the set of env vars `cmd` will `env_remove()` (get_envs yields
+    /// (key, None) for removals).
+    fn removed_envs(cmd: &Command) -> HashSet<String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// CRITICAL regression guard (Codex review of #96/#97): every binary in
+    /// `META_PASSTHROUGH_BINS` that has a tool-specific `secure_*_command`
+    /// builder MUST be dispatched there by `secure_meta_command`, not to the
+    /// generic universal-strip fallback. Each assertion sets the tool's
+    /// dangerous env vars and confirms the meta-command strips them — a var
+    /// the generic fallback would NOT touch.
+    #[test]
+    fn meta_dispatch_routes_cloud_bins_to_tool_specific_hardening() {
+        // (binary, &[env vars only the tool-specific builder strips])
+        let cases: &[(&str, &[&str])] = &[
+            ("docker", DOCKER_STRIP_ENV),
+            ("kubectl", KUBECTL_STRIP_ENV),
+            ("aws", AWS_STRIP_ENV),
+            ("psql", PSQL_STRIP_ENV),
+            ("gh", GH_STRIP_ENV),
+            ("glab", GLAB_STRIP_ENV),
+            ("gt", GT_STRIP_ENV),
+        ];
+        for (bin, strip_list) in cases {
+            let removed = removed_envs(&secure_meta_command(bin));
+            for var in *strip_list {
+                assert!(
+                    removed.contains(*var),
+                    "secure_meta_command({bin:?}) must strip {var} \
+                     (tool-specific hardening) — it routed to the generic \
+                     fallback, re-exposing the issue #36/#37/#38 env vector",
+                );
+            }
+        }
+    }
+
+    /// Interpreter-backed bins must keep their runtime-env code-load
+    /// hardening on the meta-flag path too.
+    #[test]
+    fn meta_dispatch_routes_interpreter_bins_to_tool_specific_hardening() {
+        for var in PYTHON_DANGEROUS_ENVS {
+            assert!(
+                removed_envs(&secure_meta_command("pytest")).contains(*var),
+                "secure_meta_command(\"pytest\") must strip {var}",
+            );
+        }
+        for var in RUBY_DANGEROUS_ENVS {
+            assert!(
+                removed_envs(&secure_meta_command("rake")).contains(*var),
+                "secure_meta_command(\"rake\") must strip {var}",
+            );
+        }
+        for var in GO_DANGEROUS_ENVS {
+            assert!(
+                removed_envs(&secure_meta_command("go")).contains(*var),
+                "secure_meta_command(\"go\") must strip {var}",
+            );
+        }
+        for var in NODE_ENV_VARS_EXACT {
+            assert!(
+                removed_envs(&secure_meta_command("npm")).contains(*var),
+                "secure_meta_command(\"npm\") must strip {var}",
+            );
+        }
+        for var in FORBIDDEN_CARGO_ENV_EXACT {
+            assert!(
+                removed_envs(&secure_meta_command("cargo")).contains(*var),
+                "secure_meta_command(\"cargo\") must strip {var}",
+            );
+        }
+    }
+
+    /// Every binary that has a dedicated builder strips strictly MORE than
+    /// the universal set — so its meta-command's removed-env set must be a
+    /// strict superset of the generic fallback's. This catches a regression
+    /// where a bin silently reverts to the default arm.
+    #[test]
+    fn meta_dispatch_no_passthrough_bin_uses_bare_fallback() {
+        // Bins with a dedicated builder (everything in META_PASSTHROUGH_BINS;
+        // each maps to a tool-specific arm after the #96/#97 fix).
+        let tool_specific = [
+            "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl", "gh",
+            "glab", "aws", "psql", "prisma", "gt", "pytest", "ruff", "mypy",
+            "rake", "rubocop", "rspec", "pip",
+        ];
+        for bin in tool_specific {
+            let mut fallback = resolved_command(bin);
+            apply_universal_env_strip(&mut fallback);
+            let fallback_set = removed_envs(&fallback);
+            let meta_set = removed_envs(&secure_meta_command(bin));
+            assert!(
+                meta_set.len() > fallback_set.len()
+                    && fallback_set.is_subset(&meta_set),
+                "secure_meta_command({bin:?}) strips {} vars but the bare \
+                 fallback strips {} — {bin} appears to have hit the generic \
+                 arm instead of its tool-specific builder",
+                meta_set.len(),
+                fallback_set.len(),
+            );
+        }
+    }
+}
+
 // ── Per-tool arg deny lists ─────────────────────────────────────────────
 //
 // Each tool exposes flags that read code or config from an attacker-
