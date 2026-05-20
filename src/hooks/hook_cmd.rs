@@ -5,6 +5,12 @@
 
 use super::constants::PRE_TOOL_USE_KEY;
 use super::permissions::{self, PermissionVerdict};
+// ===== contextzip-downstream: defence-in-depth gate imports begin =====
+// G1 finding #2 (#100): the Tirith + supply-chain gates only ran on the
+// legacy `contextcrawler rewrite` path (rewrite_cmd.rs). Wire them into the
+// live Claude PreToolUse hook path too.
+use super::{supply_chain_gate, tirith_gate};
+// ===== contextzip-downstream: defence-in-depth gate imports end =====
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
@@ -315,6 +321,59 @@ enum PayloadAction {
     Ignore,
 }
 
+/// Outcome of running the defence-in-depth gates (Tirith + supply-chain)
+/// against a command. A pure, unit-testable verdict mapping — `gate_decision`
+/// computes this from the two gate verdicts so the wiring can be tested
+/// without spawning subprocesses. G1 finding #2 (#100).
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum GateDecision {
+    /// Both gates clean (or disabled / no install actions). Proceed unchanged.
+    Proceed,
+    /// A gate wants the user prompted: downgrade any auto-allow to Ask.
+    /// Either a Tirith downgrade, or the supply-chain gate could not verify
+    /// (`Unavailable` — fail closed).
+    Ask,
+    /// The supply-chain gate hard-blocked the command. Fail closed with a
+    /// Claude `deny` verdict — reuses the #102 `PayloadAction::Deny`.
+    Deny { reason: String },
+}
+
+/// Map the two gate verdicts to a single `GateDecision`.
+///
+/// Pure: no I/O, no process spawning — the `tirith_gate::check` /
+/// `supply_chain_gate::check` calls (which DO spawn / hit the network) happen
+/// in `process_claude_payload_with`; this function only classifies their
+/// results. Precedence: a supply-chain `Block` (Deny) outranks any Ask.
+fn gate_decision(
+    tirith_verdict: &tirith_gate::Verdict,
+    sc_verdict: &supply_chain_gate::Verdict,
+) -> GateDecision {
+    // Block outranks everything — the supply-chain gate hard-failed.
+    if let supply_chain_gate::Verdict::Block(_) = sc_verdict {
+        return GateDecision::Deny {
+            reason: supply_chain_gate::render(sc_verdict),
+        };
+    }
+
+    // Tirith: a flagged command or a "required but unavailable" tirith both
+    // downgrade to Ask. `should_downgrade` already honours the opt-in
+    // (`CONTEXTCRAWLER_TIRITH_REQUIRED`) — when tirith is not required and is
+    // merely unavailable it returns `None`, so this is a no-op by default.
+    if tirith_gate::should_downgrade(tirith_verdict).is_some() {
+        return GateDecision::Ask;
+    }
+
+    // Supply-chain `Unavailable` — registry/OSV lookup failed. The gate is
+    // opt-in (`supply_chain.enabled`); once enabled we fail CLOSED: prompt
+    // the user rather than wave the install through on a network blip.
+    if let supply_chain_gate::Verdict::Unavailable(_) = sc_verdict {
+        return GateDecision::Ask;
+    }
+
+    // Tirith Allow/Unavailable-not-required, supply-chain Skip/Allow.
+    GateDecision::Proceed
+}
+
 fn process_claude_payload(v: &Value) -> PayloadAction {
     process_claude_payload_with(v, permissions::check_command)
 }
@@ -328,6 +387,9 @@ fn process_claude_payload_with(
     v: &Value,
     check: impl Fn(&str) -> PermissionVerdict,
 ) -> PayloadAction {
+    // Set by the defence-in-depth gates below: when a gate returns Ask, the
+    // permission `Allow` must be suppressed so Claude Code prompts the user.
+    let mut gate_ask = false;
     // Distinguish "legitimately no command to rewrite" (Ignore — correct)
     // from "malformed payload shape" (Deny — fail closed, #100 G2).
     let cmd = match v.pointer("/tool_input/command") {
@@ -365,13 +427,60 @@ fn process_claude_payload_with(
         };
     }
 
+    // ===== contextzip-downstream: defence-in-depth gates begin =====
+    // G1 finding #2 (#100): run the Tirith + supply-chain gates on the live
+    // hook path, mirroring `hooks/rewrite_cmd.rs`. Both gates are opt-in and
+    // are no-ops when disabled (Tirith → `Unavailable` + not required;
+    // supply-chain → `Skip` when `supply_chain.enabled` is false), so the
+    // default behaviour is byte-for-byte unchanged.
+    let tirith_verdict = tirith_gate::check(cmd);
+    let sc_verdict = supply_chain_gate::check(cmd);
+    supply_chain_gate::log_event(cmd, &sc_verdict);
+
+    match gate_decision(&tirith_verdict, &sc_verdict) {
+        GateDecision::Proceed => {}
+        GateDecision::Ask => {
+            // A gate wants the user prompted. Log the Tirith downgrade (if it
+            // was Tirith that fired) and force the rewrite path to Ask by
+            // overriding the permission verdict — a gate Ask must win over a
+            // permissions `Allow` so Claude Code prompts.
+            if let Some((reason, tirith_json)) = tirith_gate::should_downgrade(&tirith_verdict) {
+                tirith_gate::log_downgrade(cmd, reason, tirith_json);
+            }
+            gate_ask = true;
+        }
+        GateDecision::Deny { reason } => {
+            // Supply-chain hard block — fail closed with the #102 deny
+            // machinery (`PayloadAction::Deny` → `emit_claude_deny`).
+            return PayloadAction::Deny {
+                reason,
+                audit_tag: "deny:supply_chain_block",
+                cmd: cmd.to_string(),
+            };
+        }
+    }
+    // ===== contextzip-downstream: defence-in-depth gates end =====
+
     let rewritten = match get_rewritten(cmd) {
         Some(r) => r,
         None => {
+            // No contextcrawler equivalent. If a gate flagged the command,
+            // the Claude PreToolUse protocol gives us nowhere to express
+            // "ask" — a bare `Skip` would pass the command through unchecked
+            // (fail open). Fail CLOSED with a deny so the user must confirm.
+            if gate_ask {
+                return PayloadAction::Deny {
+                    reason: "contextcrawler: defence-in-depth gate flagged this command \
+                             and it has no contextcrawler rewrite; denying for review"
+                        .to_string(),
+                    audit_tag: "deny:gate_no_rewrite",
+                    cmd: cmd.to_string(),
+                };
+            }
             return PayloadAction::Skip {
                 reason: "skip:no_match",
                 cmd: cmd.to_string(),
-            }
+            };
         }
     };
 
@@ -389,7 +498,12 @@ fn process_claude_payload_with(
         "updatedInput": updated_input
     });
 
-    if verdict == PermissionVerdict::Allow {
+    // A gate Ask suppresses the auto-allow (G1 #2 / #100): even with an
+    // explicit permissions `Allow`, a flagged-by-Tirith or unverifiable
+    // supply-chain command must let Claude Code prompt rather than run
+    // unattended. Omitting `permissionDecision` falls through to the host
+    // tool's own prompt — exactly the Ask semantics rewrite_cmd.rs uses.
+    if verdict == PermissionVerdict::Allow && !gate_ask {
         // `hook_output` is a `json!` object literal, so `as_object_mut`
         // is always `Some` — but use a checked branch rather than
         // `.unwrap()` so the hook can never panic on the payload path.
@@ -1037,6 +1151,101 @@ mod tests {
         let result = run_claude_inner(&input).expect("non-string command must emit a verdict");
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    // --- Defence-in-depth gate wiring (G1 #2 / #100) ---
+
+    use super::supply_chain_gate::Verdict as ScVerdict;
+    use super::tirith_gate::Verdict as TirithVerdict;
+
+    /// supply-chain `Block` → Deny (reuses #102 deny machinery downstream).
+    #[test]
+    fn test_gate_decision_supply_chain_block_is_deny() {
+        let d = gate_decision(&TirithVerdict::Allow, &ScVerdict::Block(vec![]));
+        assert!(matches!(d, GateDecision::Deny { .. }));
+    }
+
+    /// supply-chain `Unavailable` → Ask (fail closed).
+    #[test]
+    fn test_gate_decision_supply_chain_unavailable_is_ask() {
+        let d = gate_decision(
+            &TirithVerdict::Allow,
+            &ScVerdict::Unavailable("registry timeout".into()),
+        );
+        assert_eq!(d, GateDecision::Ask);
+    }
+
+    /// Both gates clean → Proceed unchanged.
+    #[test]
+    fn test_gate_decision_both_clean_is_proceed() {
+        assert_eq!(
+            gate_decision(&TirithVerdict::Allow, &ScVerdict::Skip),
+            GateDecision::Proceed
+        );
+        assert_eq!(
+            gate_decision(&TirithVerdict::Allow, &ScVerdict::Allow),
+            GateDecision::Proceed
+        );
+    }
+
+    /// Tirith `Unavailable` without `CONTEXTCRAWLER_TIRITH_REQUIRED` is a
+    /// no-op — the default disabled-gate behaviour. Proceed.
+    #[test]
+    fn test_gate_decision_tirith_unavailable_not_required_is_proceed() {
+        std::env::remove_var("CONTEXTCRAWLER_TIRITH_REQUIRED");
+        assert_eq!(
+            gate_decision(&TirithVerdict::Unavailable, &ScVerdict::Skip),
+            GateDecision::Proceed
+        );
+    }
+
+    /// Tirith `Block` always downgrades to Ask (no opt-in needed for a
+    /// positive flag).
+    #[test]
+    fn test_gate_decision_tirith_block_is_ask() {
+        let d = gate_decision(
+            &TirithVerdict::Block {
+                tirith_json: "{}".into(),
+            },
+            &ScVerdict::Skip,
+        );
+        assert_eq!(d, GateDecision::Ask);
+    }
+
+    /// Precedence: a supply-chain `Block` outranks a Tirith Ask.
+    #[test]
+    fn test_gate_decision_block_outranks_ask() {
+        let d = gate_decision(
+            &TirithVerdict::Block {
+                tirith_json: "{}".into(),
+            },
+            &ScVerdict::Block(vec![]),
+        );
+        assert!(matches!(d, GateDecision::Deny { .. }));
+    }
+
+    /// No-regression: with both gates disabled (the default — supply-chain
+    /// `enabled` false → `Skip`, tirith not required), `git status` still
+    /// rewrites to `contextcrawler git status` and no deny is emitted. This
+    /// exercises the real `process_claude_payload` (which calls the live
+    /// gate `check` functions).
+    #[test]
+    fn test_disabled_gates_no_regression() {
+        std::env::remove_var("CONTEXTCRAWLER_TIRITH_REQUIRED");
+        let result = run_claude_inner(&claude_input("git status"))
+            .expect("git status must still produce a rewrite verdict");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str())
+                .unwrap(),
+            "contextcrawler git status"
+        );
+        assert!(
+            v.pointer("/hookSpecificOutput/permissionDecision").is_none()
+                || v["hookSpecificOutput"]["permissionDecision"] != "deny",
+            "disabled gates must never emit a deny"
+        );
     }
 
     // --- Cursor handler ---
