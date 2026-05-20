@@ -370,6 +370,14 @@ fn gate_decision(
         return GateDecision::Ask;
     }
 
+    // Supply-chain `Ask` — an install verb was detected but its package set
+    // is unvettable (lockfile / requirements / constraints install). Not a
+    // hard failure, but we fail CLOSED: prompt the user to confirm the
+    // unvetted set rather than wave it through. See #111 G1.
+    if let supply_chain_gate::Verdict::Ask(_) = sc_verdict {
+        return GateDecision::Ask;
+    }
+
     // Tirith Allow/Unavailable-not-required, supply-chain Skip/Allow.
     GateDecision::Proceed
 }
