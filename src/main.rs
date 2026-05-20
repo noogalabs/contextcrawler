@@ -3085,6 +3085,43 @@ fn run_cli() -> Result<i32> {
                 "next" => next_cmd::run(&args[1..], cli.verbose)?,
                 "prettier" => prettier_cmd::run(&args[1..], cli.verbose)?,
                 "playwright" => playwright_cmd::run(&args[1..], cli.verbose)?,
+                // ServiceNow Fluent SDK: capture output and route through the
+                // `servicenow-sdk-build` TOML filter. npm_cmd::exec barely
+                // touches this output (~0.5% savings) because it's not npm —
+                // it's a verbose, ANSI-heavy SDK build log.
+                "@servicenow/sdk" => {
+                    let timer = core::tracking::TimedExecution::start();
+                    let output = core::utils::resolved_command("npx")
+                        .args(&args)
+                        .stdin(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .output()
+                        .context("Failed to run npx @servicenow/sdk")?;
+                    // SDK emits [now-sdk] lines to stdout; merge stderr in case
+                    // a future version splits diagnostics across both streams.
+                    let raw = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    let lookup = format!("npx {}", args.join(" "));
+                    let filtered = match core::toml_filter::find_matching_filter(&lookup) {
+                        Some(f) => core::toml_filter::apply_filter(f, &raw),
+                        None => raw.clone(),
+                    };
+                    print!("{}", filtered);
+                    if !filtered.ends_with('\n') {
+                        println!();
+                    }
+                    timer.track(
+                        &lookup,
+                        &format!("contextcrawler npx {}", args.join(" ")),
+                        &raw,
+                        &filtered,
+                    );
+                    core::utils::exit_code_from_output(&output, &lookup)
+                }
                 _ => npm_cmd::exec(&args, cli.verbose, cli.skip_env)?,
             }
         }

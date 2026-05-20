@@ -1,0 +1,57 @@
+[filters.servicenow-sdk-build]
+description = "Compact ServiceNow Fluent SDK build output (npx @servicenow/sdk build)"
+match_command = "@servicenow/sdk\\s+build\\b"
+strip_ansi = true
+
+# Stage 2 — line-by-line substitutions. Drop the noisy "[now-sdk] " prefix and
+# the verbose advisory tail that repeats on every TS11 warning.
+replace = [
+  { pattern = "^\\[now-sdk\\]\\s+", replacement = "" },
+  { pattern = " to match the app scope and avoid collisions with properties from other scopes", replacement = "" },
+]
+
+# Stage 3 — short-circuit a clean build. `unless` keeps real warnings/errors
+# from being swallowed: if the blob mentions a warning or error the rule is
+# skipped and we fall through to keep_lines_matching.
+match_output = [
+  { pattern = "Build completed successfully", message = "ok (build succeeded, no warnings)", unless = "WARN:|ERROR|error TS\\d" },
+]
+
+# Stage 4 — keep only the signal. Boilerplate ("Initiating the build
+# process", "Building project from <path>"), the source-snippet line and the
+# caret-underline line under each warning all fall away.
+keep_lines_matching = [
+  "^WARN:",
+  "^ERROR",
+  "^Build (completed|failed)",
+  "error TS\\d",
+]
+
+max_lines = 80
+on_empty = "snsdk build: ok"
+
+[[tests.servicenow-sdk-build]]
+name = "build with TS11 warnings keeps warning headlines + status, drops snippet/caret"
+input = """
+[now-sdk] Initiating the build process ...
+[now-sdk] Building project from /Users/x/proj...
+[now-sdk] WARN: src/fluent/properties/thunder_properties.now.ts:9:9 - warning TS11: Property names should begin with 'x_bspp_catalogue.' to match the app scope and avoid collisions with properties from other scopes
+9   name: 'thunder.app_picker_qualifier',
+            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[now-sdk] WARN: src/fluent/properties/thunder_properties.now.ts:17:9 - warning TS11: Property names should begin with 'x_bspp_catalogue.' to match the app scope and avoid collisions with properties from other scopes
+17   name: 'thunder.catalogue_admin_group',
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[now-sdk] Build completed successfully
+"""
+expected = """WARN: src/fluent/properties/thunder_properties.now.ts:9:9 - warning TS11: Property names should begin with 'x_bspp_catalogue.'
+WARN: src/fluent/properties/thunder_properties.now.ts:17:9 - warning TS11: Property names should begin with 'x_bspp_catalogue.'
+Build completed successfully"""
+
+[[tests.servicenow-sdk-build]]
+name = "clean build short-circuits to ok"
+input = """
+[now-sdk] Initiating the build process ...
+[now-sdk] Building project from /Users/x/proj...
+[now-sdk] Build completed successfully
+"""
+expected = "ok (build succeeded, no warnings)"
