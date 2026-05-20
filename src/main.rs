@@ -1772,9 +1772,10 @@ fn grep_format_flag_present(args: &[String]) -> bool {
 /// dropping `-r` doesn't change behaviour.
 ///
 /// `Passthrough` — call contains context flags (`-A`/`-B`/`-C` or their long
-/// forms) that the rtk-backed grep filter can't honour line-by-line; route
-/// the whole call to `run_grep_format_passthrough` (which uses rg natively
-/// and understands recursive flags).
+/// forms) or the print-filename flag (`-H`/`--with-filename`) that the
+/// rtk-backed grep filter can't honour line-by-line; route the whole call to
+/// `run_grep_format_passthrough` (which uses rg natively and understands
+/// recursive flags, context flags, and `-H`).
 #[derive(Debug, PartialEq, Eq)]
 enum GrepPreprocess {
     Stripped(Vec<String>),
@@ -1789,14 +1790,18 @@ enum GrepPreprocess {
 /// - `r`/`R` — recursive. rg is recursive by default (issue #88).
 /// - `E` — extended regex. rg's regex engine is extended by default, so
 ///   `grep -E` adds nothing (issue #97).
-/// - `H` — print filename. rg already prints filenames in multi-file /
-///   recursive mode; forcing it for a single file is cosmetic (issue #97).
+///
+/// `-H` (print-filename-prefix) is intentionally NOT in this set. Codex
+/// review of #96/#97: stripping it silently dropped filename output from
+/// `grep -H -c …` / `grep -H -o …`. rg honours `-H` / `--with-filename`,
+/// so any grep call carrying `-H` is routed to `run_grep_format_passthrough`
+/// instead — same treatment as the `-A`/`-B`/`-C` context flags.
 ///
 /// These are stripped from bare short flags AND from alphabetic bundles
-/// (`-rnE` → `-n`, `-HnE` → `-n`). Stripping is applied on the passthrough
-/// path too — rg reads bare `-r` as `--replace`, so a stale `-r` would
-/// silently corrupt matches.
-const GREP_STRIPPABLE_SHORTS: &[u8] = &[b'r', b'R', b'E', b'H'];
+/// (`-rnE` → `-n`). Stripping is applied on the passthrough path too — rg
+/// reads bare `-r` as `--replace`, so a stale `-r` would silently corrupt
+/// matches.
+const GREP_STRIPPABLE_SHORTS: &[u8] = &[b'r', b'R', b'E'];
 
 /// Two-pass pre-clap normaliser for `grep` subcommand args.
 ///
@@ -1814,10 +1819,10 @@ fn preprocess_grep_args(args: Vec<String>) -> GrepPreprocess {
     // needs rewriting. Tokens that survive untouched are moved as-is.
     let mut stripped: Vec<String> = Vec::with_capacity(args.len());
     for arg in args.into_iter() {
-        if arg == "-r" || arg == "-R" || arg == "-E" || arg == "-H" || arg == "--recursive" {
+        if arg == "-r" || arg == "-R" || arg == "-E" || arg == "--recursive" {
             continue;
         }
-        // Single-`-` bundle of alphabetic chars: strip r/R/E/H, keep rest.
+        // Single-`-` bundle of alphabetic chars: strip r/R/E, keep rest.
         // Avoid the chars().collect::<Vec<_>>() — scan bytes directly.
         if arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") {
             let body = &arg[1..];
@@ -1843,9 +1848,11 @@ fn preprocess_grep_args(args: Vec<String>) -> GrepPreprocess {
         stripped.push(arg);
     }
 
-    // Pass 2: detect context flags anywhere in the stripped args. If any
-    // present, route stripped args to passthrough.
-    if has_grep_context_flag(&stripped) {
+    // Pass 2: detect context flags OR the print-filename flag (`-H`)
+    // anywhere in the stripped args. If any present, route stripped args to
+    // passthrough — rg honours `-A`/`-B`/`-C` and `-H` natively, the
+    // rtk-backed line-by-line filter can't.
+    if has_grep_context_flag(&stripped) || has_grep_with_filename_flag(&stripped) {
         return GrepPreprocess::Passthrough(stripped);
     }
 
@@ -1882,6 +1889,30 @@ fn has_grep_context_flag(args: &[String]) -> bool {
             {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// True if any arg is grep's print-filename flag (`-H` short, `-H` inside an
+/// alphabetic bundle, or `--with-filename` long form). Codex review of
+/// #96/#97: `-H` used to be stripped, which silently dropped filename
+/// output from `grep -H -c …` / `grep -H -o …`. rg honours `-H` /
+/// `--with-filename`, so we route any `-H`-carrying call to passthrough.
+fn has_grep_with_filename_flag(args: &[String]) -> bool {
+    for arg in args {
+        if arg == "--with-filename" {
+            return true;
+        }
+        if !arg.starts_with('-') || arg.starts_with("--") || arg.len() < 2 {
+            continue;
+        }
+        // Bare `-H` or `-H` inside an all-alphabetic short bundle (`-Hn`,
+        // `-iHc`). Digits would mean it's a context-flag bundle, handled
+        // separately; `-H` itself never takes a value.
+        let body = &arg[1..];
+        if body.bytes().any(|b| b == b'H') {
+            return true;
         }
     }
     false
@@ -2225,7 +2256,7 @@ mod grep_preprocess_tests {
         assert_eq!(out, GrepPreprocess::Passthrough(v(&["-B", "2", "needle", "file"])));
     }
 
-    // ---- issue #97: strip -E / -H no-op flags ----
+    // ---- issue #97: strip -E no-op flag, route -H to passthrough ----
 
     #[test]
     fn test_preprocess_grep_strips_bare_E() {
@@ -2235,10 +2266,12 @@ mod grep_preprocess_tests {
     }
 
     #[test]
-    fn test_preprocess_grep_strips_bare_H() {
-        // -H (with-filename) is cosmetic for rg → strip.
+    fn test_preprocess_grep_routes_bare_H_to_passthrough() {
+        // Codex review of #96/#97: -H (print-filename) is NOT stripped —
+        // doing so dropped filename output. It routes to passthrough so rg
+        // honours --with-filename. -H is preserved in the args.
         let out = preprocess_grep_args(v(&["-H", "needle", "a.txt"]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", "a.txt"])));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-H", "needle", "a.txt"])));
     }
 
     #[test]
@@ -2249,10 +2282,11 @@ mod grep_preprocess_tests {
     }
 
     #[test]
-    fn test_preprocess_grep_strips_bundled_HnE() {
-        // -HnE: H + E stripped, -n survives.
+    fn test_preprocess_grep_bundled_HnE_routes_to_passthrough() {
+        // -HnE: E stripped, but the surviving -Hn bundle carries -H so the
+        // call routes to passthrough (rg honours -H natively). -n is kept.
         let out = preprocess_grep_args(v(&["-HnE", "needle", "a.txt"]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "a.txt"])));
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-Hn", "needle", "a.txt"])));
     }
 
     #[test]
@@ -2328,13 +2362,16 @@ mod grep_preprocess_tests {
 
     /// No alphabetic single-`-` token in the pipeline output is a flag that
     /// clap's `Grep` variant would reject. clap declares `-l -m -t -n`
-    /// (plus `trailing_var_arg`). `-r/-R/-E/-H` get stripped; format flags
-    /// route to passthrough. Anything else surviving here must be a clap-
-    /// known short or part of a passthrough route.
+    /// (plus `trailing_var_arg`). `-r/-R/-E` get stripped; `-H` and format
+    /// flags route to passthrough (never reaching clap). Anything else
+    /// surviving here must be a clap-known short or part of a passthrough
+    /// route.
     fn pipeline_has_clap_rejecting_flag(out: &[String]) -> bool {
-        // `-E` and `-H` are the flags #97 targets; if either survives a
-        // Stripped route it would hit clap and fail.
-        out.iter().any(|a| a == "-E" || a == "-H")
+        // `-E` is the only flag #97 strips outright; if it survives a
+        // Stripped route it would hit clap and fail. `-H` is intentionally
+        // NOT checked here — it routes to passthrough, so a surviving bare
+        // `-H` is correct (Codex review of #96/#97).
+        out.iter().any(|a| a == "-E")
     }
 
     #[test]
@@ -2345,10 +2382,13 @@ mod grep_preprocess_tests {
     }
 
     #[test]
-    fn test_pipeline_H_does_not_leave_clap_rejecting_flag() {
+    fn test_pipeline_H_routes_to_passthrough_preserving_filename_flag() {
+        // Codex review of #96/#97: `grep -H needle a.txt` routes to
+        // passthrough with `-H` preserved so rg emits the filename prefix.
+        // `-H` reaching the output here is correct — it goes to rg, not clap.
         let out = run_cli_grep_pipeline(v(&["-H", "needle", "a.txt"]));
         assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
-        assert_eq!(out, v(&["needle", "a.txt"]));
+        assert_eq!(out, v(&["-H", "needle", "a.txt"]));
     }
 
     #[test]
@@ -2360,10 +2400,11 @@ mod grep_preprocess_tests {
     }
 
     #[test]
-    fn test_pipeline_HnE_bundle_clean() {
+    fn test_pipeline_HnE_bundle_routes_to_passthrough() {
+        // -HnE: -E stripped, surviving -Hn bundle carries -H → passthrough.
         let out = run_cli_grep_pipeline(v(&["-HnE", "needle", "a.txt"]));
         assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
-        assert_eq!(out, v(&["-n", "needle", "a.txt"]));
+        assert_eq!(out, v(&["-Hn", "needle", "a.txt"]));
     }
 
     #[test]
