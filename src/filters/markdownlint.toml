@@ -5,6 +5,10 @@ strip_ansi = true
 strip_lines_matching = [
   "^\\s*$",
 ]
+# tail_lines runs before max_lines (stages 6 then 7). markdownlint has no
+# summary line, but reserving the tail keeps the last diagnostics visible
+# instead of head-truncating to the first 50 on an overflowing run.
+tail_lines = 49
 max_lines = 50
 truncate_lines_at = 120
 
@@ -22,3 +26,112 @@ expected = "README.md:1:1 MD041/first-line-heading/first-line-h1 First line in f
 name = "empty input passes through"
 input = ""
 expected = ""
+
+[[tests.markdownlint]]
+name = "overflow keeps last diagnostics past max_lines"
+input = """
+README.md:1:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:2:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:3:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:4:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:5:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:6:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:7:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:8:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:9:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:10:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:11:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:12:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:13:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:14:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:15:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:16:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:17:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:18:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:19:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:20:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:21:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:22:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:23:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:24:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:25:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:26:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:27:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:28:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:29:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:30:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:31:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:32:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:33:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:34:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:35:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:36:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:37:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:38:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:39:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:40:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:41:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:42:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:43:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:44:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:45:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:46:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:47:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:48:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:49:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:50:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:51:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:52:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+"""
+expected = """
+... (3 lines omitted)
+README.md:4:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:5:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:6:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:7:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:8:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:9:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:10:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:11:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:12:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:13:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:14:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:15:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:16:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:17:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:18:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:19:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:20:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:21:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:22:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:23:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:24:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:25:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:26:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:27:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:28:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:29:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:30:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:31:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:32:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:33:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:34:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:35:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:36:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:37:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:38:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:39:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:40:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:41:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:42:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:43:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:44:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:45:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:46:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:47:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:48:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:49:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:50:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:51:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+README.md:52:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+"""

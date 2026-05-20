@@ -36,11 +36,10 @@ strip_lines_matching = [
   "^note: Using new build system",
 ]
 max_lines = 60
-# NOTE (#100/G8): on_empty also fires when xcodebuild crashes with no stdout.
-# The TOML filter schema has no exit-code field — the engine only sees output
-# text — so this cannot be gated on exit status without an engine change
-# (out of scope here). Accepted limitation.
-on_empty = "xcodebuild: ok"
+# NOTE (#111/G8): on_empty must NOT assert success. xcodebuild can exit with no
+# stdout on a hard crash (segfault, killed). Passing empty output through ("")
+# lets the agent see the real empty result + exit code instead of a false "ok".
+on_empty = ""
 
 [[tests.xcodebuild]]
 name = "strips build phases, keeps errors and summary"
@@ -98,6 +97,6 @@ Executed 2 tests, with 1 failure in 0.003 seconds
 expected = "Test Suite 'All tests' started at 2026-03-10 12:00:00\nTest Suite 'AppTests' started at 2026-03-10 12:00:00\nTest Case '-[AppTests testExample]' passed (0.001 seconds).\nTest Case '-[AppTests testFailing]' failed (0.002 seconds).\nTest Suite 'AppTests' passed at 2026-03-10 12:00:01\nExecuted 2 tests, with 1 failure in 0.003 seconds"
 
 [[tests.xcodebuild]]
-name = "empty input returns on_empty message"
+name = "empty input passes through (crash not masked as ok)"
 input = ""
-expected = "xcodebuild: ok"
+expected = ""
