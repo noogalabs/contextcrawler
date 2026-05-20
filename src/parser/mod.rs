@@ -143,37 +143,56 @@ pub fn emit_passthrough_warning(tool: &str, reason: &str) {
 ///
 /// Returns `None` if no valid JSON object found.
 pub fn extract_json_object(input: &str) -> Option<&str> {
-    // Try vitest-specific marker first (most reliable)
+    // `start_pos` is a BYTE offset into `input` for the opening `{`.
+    //
+    // G7/#111: a previous version used a char index as a byte offset, which
+    // panics ("byte index is not a char boundary") or returns corrupt JSON
+    // when any multibyte char precedes the closing brace. We track byte
+    // offsets exclusively via `char_indices()` and `find`/`rfind` (which
+    // already return byte offsets).
     let start_pos = if let Some(pos) = input.find("\"numTotalTests\"") {
-        // Walk backward to find opening brace of this object
+        // Walk backward to find opening brace of this object.
+        // `rfind` returns a byte offset — safe to use directly.
         input[..pos].rfind('{').unwrap_or(0)
     } else {
-        // Fallback: find first `{` on its own line or after whitespace
+        // Fallback: find first `{` that is the first non-whitespace char on
+        // its line. Locating the byte offset of each line via the substring's
+        // position in `input` keeps us correct regardless of line-ending
+        // bytes (`\r\n` vs `\n`) — `lines()` strips `\r`, so reconstructing
+        // `l.len() + 1` per line drifts on CRLF input.
         let mut found_start = None;
-        for (idx, line) in input.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('{') {
-                // Calculate byte offset
-                found_start = Some(
-                    input[..]
-                        .lines()
-                        .take(idx)
-                        .map(|l| l.len() + 1)
-                        .sum::<usize>(),
-                );
-                break;
+        let mut byte_offset = 0usize;
+        for line in input.lines() {
+            // Byte offset of `line`'s start within `input`. `lines()` yields
+            // CR-stripped slices, but each slice still points into `input`,
+            // so its start offset is exact.
+            let line_start = byte_offset;
+            if let Some(idx) = line.find(|c: char| !c.is_whitespace()) {
+                if line[idx..].starts_with('{') {
+                    found_start = Some(line_start + idx);
+                    break;
+                }
+            }
+            // Advance past this line plus its line ending. `lines()` strips
+            // either `\n` or `\r\n`, so consult the actual bytes in `input`.
+            byte_offset += line.len();
+            let rest = &input[byte_offset..];
+            if rest.starts_with("\r\n") {
+                byte_offset += 2;
+            } else if rest.starts_with('\n') || rest.starts_with('\r') {
+                byte_offset += 1;
             }
         }
         found_start?
     };
 
-    // Brace-balance forward from start_pos
+    // Brace-balance forward from start_pos using char_indices(), which yields
+    // the BYTE offset of each char — so `end_pos` lands on a char boundary.
     let mut depth = 0;
     let mut in_string = false;
     let mut escape_next = false;
-    let chars: Vec<char> = input[start_pos..].chars().collect();
 
-    for (i, &ch) in chars.iter().enumerate() {
+    for (rel_byte, ch) in input[start_pos..].char_indices() {
         if escape_next {
             escape_next = false;
             continue;
@@ -186,8 +205,9 @@ pub fn extract_json_object(input: &str) -> Option<&str> {
             '}' if !in_string => {
                 depth -= 1;
                 if depth == 0 {
-                    // Found matching closing brace
-                    let end_pos = start_pos + i + 1; // +1 to include the `}`
+                    // Byte offset of the closing `}` plus its own byte length
+                    // (always 1 for `}`, but use len_utf8() for clarity).
+                    let end_pos = start_pos + rel_byte + ch.len_utf8();
                     return Some(&input[start_pos..end_pos]);
                 }
             }
@@ -318,5 +338,56 @@ Scope: all 6 workspace projects
         let extracted = extract_json_object(input).expect("Should extract JSON");
         assert!(extracted.contains("test {should} not confuse parser"));
         assert_eq!(extracted, input);
+    }
+
+    #[test]
+    fn test_extract_json_object_multibyte_content() {
+        // G7/#111: multibyte chars (Thai, emoji, em-dash) inside the JSON
+        // object must not panic or corrupt the byte slice. The em-dash and
+        // emoji precede the closing brace, so a char-index-as-byte-offset
+        // bug would slice short or mid-char.
+        let input = r#"{"numTotalTests": 3, "message": "résumé — テスト 🎉 done"}"#;
+        let extracted = extract_json_object(input).expect("Should extract JSON");
+        assert_eq!(extracted, input);
+        assert!(extracted.ends_with('}'));
+        // Slice must be valid UTF-8 (no panic on len/chars).
+        assert!(extracted.contains("テスト 🎉"));
+    }
+
+    #[test]
+    fn test_extract_json_object_multibyte_prefix_and_content() {
+        // Multibyte chars in BOTH the non-JSON prefix and the object body.
+        let input = "テスト出力: ロード中…\n\n{\"numTotalTests\": 2, \"name\": \"café ☕\"}\n";
+        let extracted = extract_json_object(input).expect("Should extract JSON");
+        assert!(extracted.starts_with('{'));
+        assert!(extracted.ends_with('}'));
+        assert!(extracted.contains("café ☕"));
+        // Round-trips as valid JSON.
+        let v: serde_json::Value = serde_json::from_str(extracted).expect("valid JSON");
+        assert_eq!(v["numTotalTests"], 2);
+    }
+
+    #[test]
+    fn test_extract_json_object_crlf_line_endings() {
+        // G7/#111: CRLF input — the fallback path reconstructs line byte
+        // offsets, which must account for the 2-byte \r\n ending.
+        let input = "Scope: all 6 workspace projects\r\n WARN deprecated\r\n\r\n{\"foo\": 1, \"name\": \"tëst\"}\r\n";
+        let extracted = extract_json_object(input).expect("Should extract JSON");
+        assert!(extracted.starts_with('{'));
+        assert!(extracted.ends_with('}'));
+        let v: serde_json::Value = serde_json::from_str(extracted).expect("valid JSON");
+        assert_eq!(v["foo"], 1);
+        assert_eq!(v["name"], "tëst");
+    }
+
+    #[test]
+    fn test_extract_json_object_crlf_with_multibyte_prefix() {
+        // CRLF endings AND multibyte chars in the prefix lines — the byte
+        // offset must stay aligned through both.
+        let input = "ロード中…\r\nWARN: 警告\r\n\r\n{\"numTotalTests\": 1, \"ok\": true}\r\n";
+        let extracted = extract_json_object(input).expect("Should extract JSON");
+        let v: serde_json::Value = serde_json::from_str(extracted).expect("valid JSON");
+        assert_eq!(v["numTotalTests"], 1);
+        assert_eq!(v["ok"], true);
     }
 }

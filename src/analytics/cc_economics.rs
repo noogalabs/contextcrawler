@@ -168,7 +168,9 @@ struct Totals {
     cc_cache_read_tokens: u64,
     rtk_commands: usize,
     rtk_saved_tokens: usize,
-    rtk_avg_savings_pct: f64,
+    /// Volume-weighted savings pct. `None` when there is no ccusage baseline
+    /// to compare against — see `compute_totals` for the gating rationale.
+    rtk_avg_savings_pct: Option<f64>,
     weighted_input_cpt: Option<f64>,
     savings_weighted: Option<f64>,
     blended_cpt: Option<f64>,
@@ -320,7 +322,7 @@ fn compute_totals(periods: &[PeriodEconomics]) -> Totals {
         cc_cache_read_tokens: 0,
         rtk_commands: 0,
         rtk_saved_tokens: 0,
-        rtk_avg_savings_pct: 0.0,
+        rtk_avg_savings_pct: None,
         weighted_input_cpt: None,
         savings_weighted: None,
         blended_cpt: None,
@@ -328,9 +330,6 @@ fn compute_totals(periods: &[PeriodEconomics]) -> Totals {
         savings_blended: None,
         savings_active: None,
     };
-
-    let mut pct_sum = 0.0;
-    let mut pct_count = 0;
 
     for p in periods {
         if let Some(cost) = p.cc_cost {
@@ -360,14 +359,25 @@ fn compute_totals(periods: &[PeriodEconomics]) -> Totals {
         if let Some(saved) = p.rtk_saved_tokens {
             totals.rtk_saved_tokens += saved;
         }
-        if let Some(pct) = p.rtk_savings_pct {
-            pct_sum += pct;
-            pct_count += 1;
-        }
     }
 
-    if pct_count > 0 {
-        totals.rtk_avg_savings_pct = pct_sum / pct_count as f64;
+    // G7/#111: volume-weighted savings pct. The previous code took an
+    // unweighted mean of each period's pct (1 cmd at 90% + 1000 at 10%
+    // reported as 50%). Instead aggregate the underlying token volumes and
+    // derive a single pct — consistent with `set_rtk_from_month`'s
+    // `saved / (saved + input + output)` and `discover::effective_savings_pct`.
+    //
+    // #111 G7 follow-up: the pct is only meaningful when there IS a ccusage
+    // baseline to compare against. With no ccusage data the denominator
+    // collapses to `saved` alone, so `saved / saved` reports a meaningless
+    // 100%. Gate on the ccusage component being present and leave the metric
+    // as `None` ("no baseline" — serialises to JSON null, renders as "—")
+    // otherwise. The `savings_denom > 0` divide-by-zero guard stays.
+    let cc_baseline = totals.cc_input_tokens as usize + totals.cc_output_tokens as usize;
+    let savings_denom = totals.rtk_saved_tokens + cc_baseline;
+    if cc_baseline > 0 && savings_denom > 0 {
+        totals.rtk_avg_savings_pct =
+            Some(totals.rtk_saved_tokens as f64 / savings_denom as f64 * 100.0);
     }
 
     // Compute global weighted metrics
@@ -1145,11 +1155,101 @@ mod tests {
         assert_eq!(totals.cc_output_tokens, 15_000);
         assert_eq!(totals.rtk_commands, 15);
         assert_eq!(totals.rtk_saved_tokens, 5000);
-        assert_eq!(totals.rtk_avg_savings_pct, 55.0);
+        // G7/#111: volume-weighted, not an unweighted mean of (50%, 60%).
+        // saved=5000, input=15000, output=15000 → 5000/35000 = 14.2857%
+        let pct = totals
+            .rtk_avg_savings_pct
+            .expect("ccusage baseline present → Some");
+        assert!(
+            (pct - (5000.0 / 35_000.0 * 100.0)).abs() < 1e-9,
+            "expected volume-weighted pct, got {pct}",
+        );
 
         assert!(totals.weighted_input_cpt.is_some());
         assert!(totals.savings_weighted.is_some());
         assert!(totals.blended_cpt.is_some());
         assert!(totals.active_cpt.is_some());
+    }
+
+    #[test]
+    fn test_compute_totals_weighted_pct_not_unweighted_mean() {
+        // G7/#111: the canonical example — 1 low-volume period at a high pct
+        // plus 1 high-volume period at a low pct. An unweighted mean would
+        // report ~50%; the volume-weighted figure must track the bulk volume.
+        //
+        // Period A: saved=9000, input=500,  output=500   → period pct ~90%
+        // Period B: saved=1000, input=4500, output=4500  → period pct ~10%
+        // Weighted: saved=10000, input=5000, output=5000
+        //           → 10000 / (10000+5000+5000) = 10000/20000 = 50%? No —
+        // pick volumes so the weighted answer is unambiguously NOT the mean:
+        // Period A: saved=900,  input=50,    output=50    (denom 1000, ~90%)
+        // Period B: saved=1000, input=4500,  output=4500  (denom 10000, ~10%)
+        // Weighted: 1900 / (1900 + 4550 + 4550) = 1900 / 11000 = 17.27%
+        let periods = vec![
+            PeriodEconomics {
+                label: "2026-01".to_string(),
+                cc_input_tokens: Some(50),
+                cc_output_tokens: Some(50),
+                rtk_saved_tokens: Some(900),
+                rtk_savings_pct: Some(90.0),
+                ..PeriodEconomics::new("2026-01")
+            },
+            PeriodEconomics {
+                label: "2026-02".to_string(),
+                cc_input_tokens: Some(4500),
+                cc_output_tokens: Some(4500),
+                rtk_saved_tokens: Some(1000),
+                rtk_savings_pct: Some(10.0),
+                ..PeriodEconomics::new("2026-02")
+            },
+        ];
+
+        let totals = compute_totals(&periods);
+        // Hand-computed volume-weighted value.
+        let expected = 1900.0 / 11_000.0 * 100.0; // ≈ 17.2727%
+        let pct = totals
+            .rtk_avg_savings_pct
+            .expect("ccusage baseline present → Some");
+        assert!(
+            (pct - expected).abs() < 1e-9,
+            "expected volume-weighted {expected}, got {pct}",
+        );
+        // And explicitly NOT the unweighted mean of 90% and 10% (= 50%).
+        assert!(
+            (pct - 50.0).abs() > 1.0,
+            "must not be the unweighted mean (50%)"
+        );
+    }
+
+    #[test]
+    fn test_compute_totals_no_ccusage_baseline_not_100pct() {
+        // #111 G7 follow-up: RTK saved tokens but ZERO ccusage input/output.
+        // Without a baseline the old formula degenerated to saved/saved = 100%.
+        // The metric must NOT report 100% — it has no baseline, so it is None.
+        let periods = vec![
+            PeriodEconomics {
+                label: "2026-01".to_string(),
+                rtk_commands: Some(5),
+                rtk_saved_tokens: Some(8000),
+                ..PeriodEconomics::new("2026-01")
+            },
+            PeriodEconomics {
+                label: "2026-02".to_string(),
+                rtk_commands: Some(3),
+                rtk_saved_tokens: Some(2000),
+                ..PeriodEconomics::new("2026-02")
+            },
+        ];
+
+        let totals = compute_totals(&periods);
+        assert_eq!(totals.rtk_saved_tokens, 10_000);
+        assert_eq!(totals.cc_input_tokens, 0);
+        assert_eq!(totals.cc_output_tokens, 0);
+        // No ccusage baseline → no meaningful pct. Must be None, never 100%.
+        assert!(
+            totals.rtk_avg_savings_pct.is_none(),
+            "no ccusage baseline must yield None, got {:?}",
+            totals.rtk_avg_savings_pct
+        );
     }
 }
