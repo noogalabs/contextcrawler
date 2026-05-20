@@ -1794,6 +1794,52 @@ mod tests {
         assert!(recorded_output <= input_tokens, "savings can never go negative");
     }
 
+    // End-to-end: a streaming filter whose output exceeds its raw baseline
+    // (e.g. `tsc -b` / `git push` adding framing) must be recorded by the
+    // tracking DB with savings clamped to 0% — never a negative percentage.
+    // This exercises the same `estimate_tokens(output).min(input_tokens)`
+    // clamp `TimedExecution::track` applies, then the `record` -> `savings_pct`
+    // path, against an isolated in-memory tracker.
+    #[test]
+    fn test_streaming_clamp_records_zero_percent_floor() {
+        let raw = "ok";
+        let inflated =
+            "═══════════════════════════════════════\nTypeScript: 0 errors\n";
+
+        let input_tokens = estimate_tokens(raw);
+        // The clamp `TimedExecution::track` applies before recording.
+        let output_tokens = estimate_tokens(inflated).min(input_tokens);
+        assert!(
+            estimate_tokens(inflated) > input_tokens,
+            "precondition: streaming filter inflated the output"
+        );
+
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record(
+                "tsc -b",
+                "contextcrawler tsc -b",
+                input_tokens,
+                output_tokens,
+                5,
+            )
+            .expect("Failed to record");
+
+        let rec = tracker
+            .get_recent(10)
+            .expect("Failed to get recent")
+            .into_iter()
+            .find(|r| r.rtk_cmd == "contextcrawler tsc -b")
+            .expect("record not found");
+
+        assert_eq!(rec.saved_tokens, 0, "clamped: no negative savings");
+        assert!(
+            rec.savings_pct >= 0.0 && rec.savings_pct < 0.001,
+            "savings floored at 0%, got {:.2}%",
+            rec.savings_pct
+        );
+    }
+
     // The clamp must NOT touch a genuine saving — a filter that shrinks
     // output keeps its real (smaller) token count.
     #[test]
