@@ -1193,6 +1193,12 @@ pub fn secure_cargo_command() -> Command {
     for name in dynamic {
         cmd.env_remove(name);
     }
+    // Force-disable ANSI colour in cargo output regardless of any
+    // inherited `CARGO_TERM_COLOR` / TTY heuristics. This is the
+    // env-side companion to the cargo ANSI-stripping fix (G5): the
+    // filter state machines match plain-text markers, so colour codes
+    // wrapping those markers must never reach our parser.
+    cmd.env("CARGO_TERM_COLOR", "never");
     cmd
 }
 
@@ -1363,6 +1369,29 @@ mod secure_cargo_tests {
         }
         std::env::remove_var("CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER");
         std::env::remove_var("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+    }
+
+    /// G5/G6: `secure_cargo_command` must force `CARGO_TERM_COLOR=never`
+    /// so cargo output never carries ANSI escapes that would wrap the
+    /// plain-text markers the filter state machines match on.
+    #[test]
+    fn secure_cargo_command_forces_term_color_never() {
+        let cmd = secure_cargo_command();
+        let set: Option<String> = cmd
+            .get_envs()
+            .find_map(|(k, v)| {
+                if k.to_string_lossy() == "CARGO_TERM_COLOR" {
+                    Some(v.map(|x| x.to_string_lossy().to_string()))
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        assert_eq!(
+            set.as_deref(),
+            Some("never"),
+            "secure_cargo_command must set CARGO_TERM_COLOR=never (got {set:?})"
+        );
     }
 
     #[test]
@@ -2618,6 +2647,7 @@ pub fn secure_ruby_command(name: &str) -> Command {
 /// JVM env vars that prepend arguments / load javaagents at JVM startup.
 const JVM_DANGEROUS_ENVS: &[&str] = &[
     "JAVA_OPTS",
+    "_JAVA_OPTIONS",
     "JAVA_TOOL_OPTIONS",
     "JDK_JAVA_OPTIONS",
     "GRADLE_OPTS",
@@ -2658,12 +2688,17 @@ pub fn secure_dotnet_command(name: &str) -> Command {
 /// Go env vars that influence build/test toolchain behavior. `GOFLAGS`
 /// prepends args to every go invocation; `GOPROXY` redirects module
 /// downloads; `CC`/`CXX`/`PKG_CONFIG` swap the compiler driver invoked
-/// during cgo builds (arbitrary binary on PATH → RCE).
+/// during cgo builds (arbitrary binary on PATH → RCE). `GOENV` points
+/// `go` at an alternate environment config file (`go env -w` target):
+/// an attacker-controlled GOENV file can set `GOFLAGS`, `GOPROXY`,
+/// `CC`, etc. — an indirect path to every vector above, so it must be
+/// stripped alongside them.
 const GO_DANGEROUS_ENVS: &[&str] = &[
     "GOFLAGS",
     "GOPATH",
     "GOROOT",
     "GOPROXY",
+    "GOENV",
     "CC",
     "CXX",
     "PKG_CONFIG",
@@ -3101,6 +3136,7 @@ mod secure_pyrbjvmdotnet_tests {
     fn jvm_command_lists_cover_known_vectors() {
         for v in [
             "JAVA_OPTS",
+            "_JAVA_OPTIONS",
             "JAVA_TOOL_OPTIONS",
             "JDK_JAVA_OPTIONS",
             "GRADLE_OPTS",
@@ -3125,9 +3161,48 @@ mod secure_pyrbjvmdotnet_tests {
 
     #[test]
     fn go_command_lists_cover_known_vectors() {
-        for v in ["GOFLAGS", "GOPATH", "GOROOT", "GOPROXY", "CC", "CXX", "PKG_CONFIG"] {
+        for v in ["GOFLAGS", "GOPATH", "GOROOT", "GOPROXY", "GOENV", "CC", "CXX", "PKG_CONFIG"] {
             assert!(GO_DANGEROUS_ENVS.contains(&v));
         }
+    }
+
+    /// Collect the env vars a built `Command` will `env_remove()`.
+    fn removed_env_names(cmd: &Command) -> std::collections::HashSet<String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// G6 finding 1: `_JAVA_OPTIONS` (distinct undocumented HotSpot var
+    /// that prepends JVM args at startup) must be stripped from the
+    /// child env of every JVM tool builder.
+    #[test]
+    fn secure_jvm_command_strips_underscore_java_options() {
+        for tool in ["gradle", "gradlew", "java"] {
+            let removed = removed_env_names(&secure_jvm_command(tool));
+            assert!(
+                removed.contains("_JAVA_OPTIONS"),
+                "secure_jvm_command({tool:?}) must strip _JAVA_OPTIONS"
+            );
+        }
+    }
+
+    /// G6 finding 4: `GOENV` points `go` at an alternate env config file
+    /// that can set GOFLAGS/GOPROXY/CC — must be stripped from the child
+    /// env of the go builder.
+    #[test]
+    fn secure_go_command_strips_goenv() {
+        let removed = removed_env_names(&secure_go_command("go"));
+        assert!(
+            removed.contains("GOENV"),
+            "secure_go_command must strip GOENV"
+        );
     }
 
     // The builders themselves should at least produce a Command that

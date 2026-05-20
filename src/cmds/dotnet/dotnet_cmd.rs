@@ -258,14 +258,14 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
 
 fn build_binlog_path(subcommand: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "rtk_dotnet_{}_{}.binlog",
+        "contextcrawler_dotnet_{}_{}.binlog",
         subcommand,
         unique_temp_suffix()
     ))
 }
 
 fn build_trx_results_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("rtk_dotnet_testresults_{}", unique_temp_suffix()))
+    std::env::temp_dir().join(format!("contextcrawler_dotnet_testresults_{}", unique_temp_suffix()))
 }
 
 fn unique_temp_suffix() -> String {
@@ -293,7 +293,7 @@ fn resolve_trx_results_dir(subcommand: &str, args: &[String]) -> (Option<PathBuf
 }
 
 fn build_format_report_path() -> PathBuf {
-    std::env::temp_dir().join(format!("rtk_dotnet_format_{}.json", unique_temp_suffix()))
+    std::env::temp_dir().join(format!("contextcrawler_dotnet_format_{}.json", unique_temp_suffix()))
 }
 
 fn resolve_format_report_path(args: &[String]) -> (Option<PathBuf>, bool) {
@@ -857,6 +857,15 @@ fn normalize_build_summary(
         if summary.project_count == 0 {
             summary.project_count = 1;
         }
+    } else {
+        // The process exit code is authoritative. `summary.succeeded`
+        // may have been set `true` by the English text marker
+        // ("Build succeeded" / "0 Warning(s) 0 Error(s)") in
+        // `parse_build_from_text` — a non-zero exit that still prints
+        // that text (custom MSBuild targets, post-build failures)
+        // would otherwise render `ok`. A failed exit can NEVER be a
+        // successful build, regardless of any text marker (G6 #100).
+        summary.succeeded = false;
     }
 
     summary
@@ -1536,6 +1545,38 @@ mod tests {
         let normalized = normalize_build_summary(summary, true);
         assert!(normalized.succeeded);
         assert_eq!(normalized.project_count, 1);
+    }
+
+    /// G6 #100: a non-zero process exit must NEVER render `ok`, even if
+    /// the binlog text parser set `succeeded = true` from the English
+    /// "Build succeeded" marker. Exit code is authoritative.
+    #[test]
+    fn test_normalize_build_summary_failed_exit_overrides_text_marker() {
+        // Simulate a summary where parse_build_from_text saw the
+        // "Build succeeded" marker but the process actually exited != 0.
+        let summary = binlog::BuildSummary {
+            succeeded: true,
+            project_count: 3,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            duration_text: None,
+        };
+
+        let normalized = normalize_build_summary(summary, false);
+        assert!(
+            !normalized.succeeded,
+            "non-zero exit must force succeeded=false regardless of text marker"
+        );
+
+        let rendered = format_build_output(&normalized, Path::new("x.binlog"));
+        assert!(
+            rendered.contains("fail dotnet build:"),
+            "verdict must be 'fail' on a non-zero exit, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("ok dotnet build:"),
+            "verdict must NOT render 'ok' on a non-zero exit"
+        );
     }
 
     #[test]

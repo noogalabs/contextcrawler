@@ -25,6 +25,8 @@ const GOLANGCI_SUBCOMMANDS: &[&str] = &[
     "version",
 ];
 
+/// golangci-lint global flags that consume a SEPARATE following arg
+/// (i.e. `--flag value`, not `--flag=value`).
 const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
     "-c",
     "--color",
@@ -33,6 +35,14 @@ const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
     "--mem-profile-path",
     "--trace-path",
 ];
+
+/// golangci-lint global BOOLEAN flags — they never consume a following
+/// arg. Kept separate from [`GLOBAL_FLAGS_WITH_VALUE`] so that an
+/// unrecognised global flag can be detected: any `-`/`--` token that is
+/// in neither table is unknown, and `find_subcommand_index` then bails
+/// to passthrough rather than guessing whether it eats the next arg
+/// (a wrong guess can mis-classify the real subcommand — G6 #100).
+const GLOBAL_BOOL_FLAGS: &[&str] = &["-h", "--help", "-v", "--verbose", "--no-config", "--version"];
 
 #[derive(Debug, PartialEq, Eq)]
 struct RunInvocation {
@@ -193,6 +203,16 @@ fn find_subcommand_index(args: &[String]) -> Option<usize> {
         }
 
         if let Some(flag) = split_flag_name(arg) {
+            let known = GLOBAL_FLAGS_WITH_VALUE.contains(&flag)
+                || GLOBAL_BOOL_FLAGS.contains(&flag);
+            if !known {
+                // Unknown global flag: we cannot know whether it
+                // consumes the next arg. Guessing wrong would let a
+                // following `run` token be misread as the subcommand
+                // (or a real subcommand be skipped). Bail to
+                // passthrough — never silently mis-parse (G6 #100).
+                return None;
+            }
             if golangci_flag_takes_separate_value(arg, flag) {
                 i += 1;
             }
@@ -546,6 +566,26 @@ mod tests {
     fn test_classify_invocation_version_subcommand_is_passthrough() {
         assert_eq!(
             classify_invocation(&["version".into()]),
+            Invocation::Passthrough
+        );
+    }
+
+    /// G6 #100: an unknown global flag must NOT be guessed at. Whether
+    /// it consumes the next arg is unknowable, so `classify_invocation`
+    /// bails to passthrough rather than risk misreading a following
+    /// `run` token as the subcommand (or skipping the real one).
+    #[test]
+    fn test_classify_invocation_unknown_global_flag_is_passthrough() {
+        // `--frobnicate` is not a real golangci global flag. If it were
+        // (wrongly) treated as boolean, `run` would be misclassified as
+        // the subcommand and the filtered path engaged with `value` as
+        // a run arg. Passthrough is the only safe verdict.
+        assert_eq!(
+            classify_invocation(&["--frobnicate".into(), "run".into(), "./...".into()]),
+            Invocation::Passthrough
+        );
+        assert_eq!(
+            classify_invocation(&["--unknown".into(), "value".into(), "run".into()]),
             Invocation::Passthrough
         );
     }

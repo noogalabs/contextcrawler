@@ -9,6 +9,32 @@ use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
+/// Hard cap on the size of a `.binlog` / `.trx` artifact we will ingest.
+/// These files are read wholesale into memory; a hostile or malformed
+/// file (or a gzip bomb inside a `.binlog`) could otherwise OOM the
+/// process. 256 MiB comfortably covers any genuine build/test artifact.
+/// Applied both to the on-disk byte count AND to the decompressed
+/// binlog payload (gzip-bomb defence: a tiny file can inflate hugely).
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read an entire file, refusing it up-front if it exceeds
+/// [`MAX_ARTIFACT_BYTES`]. The size is checked from filesystem metadata
+/// before any allocation, so an oversize file never gets read.
+pub(crate) fn read_capped(path: &Path) -> Result<Vec<u8>> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("Failed to stat {}", path.display()))?
+        .len();
+    if len > MAX_ARTIFACT_BYTES {
+        anyhow::bail!(
+            "Refusing {}: {} bytes exceeds the {} byte artifact size cap",
+            path.display(),
+            len,
+            MAX_ARTIFACT_BYTES
+        );
+    }
+    std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinlogIssue {
     pub code: String,
@@ -286,13 +312,17 @@ struct ParsedEventFields {
 }
 
 fn parse_events_from_binlog(path: &Path) -> Result<ParsedBinlog> {
-    let bytes = std::fs::read(path)
+    let bytes = read_capped(path)
         .with_context(|| format!("Failed to read binlog at {}", path.display()))?;
     if bytes.is_empty() {
         anyhow::bail!("Failed to parse binlog at {}: empty file", path.display());
     }
 
-    let mut decoder = GzDecoder::new(bytes.as_slice());
+    // Cap the *decompressed* payload too: a small `.binlog` can be a
+    // gzip bomb that inflates to gigabytes. `take()` limits the decoder
+    // to MAX_ARTIFACT_BYTES + 1 — if it actually yields that many we
+    // know the real payload is over the cap and reject it.
+    let mut decoder = GzDecoder::new(bytes.as_slice()).take(MAX_ARTIFACT_BYTES + 1);
     let mut payload = Vec::new();
     decoder.read_to_end(&mut payload).with_context(|| {
         format!(
@@ -300,6 +330,13 @@ fn parse_events_from_binlog(path: &Path) -> Result<ParsedBinlog> {
             path.display()
         )
     })?;
+    if payload.len() as u64 > MAX_ARTIFACT_BYTES {
+        anyhow::bail!(
+            "Refusing binlog at {}: decompressed payload exceeds the {} byte cap",
+            path.display(),
+            MAX_ARTIFACT_BYTES
+        );
+    }
 
     let mut reader = BinReader::new(&payload);
     let file_format_version = reader
@@ -1137,6 +1174,42 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
+
+    /// G6 #100: `read_capped` must reject an oversize file BEFORE
+    /// allocating, so a hostile `.binlog`/`.trx` can't OOM the process.
+    #[test]
+    fn read_capped_rejects_oversize_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cc_g6_read_capped_{}.bin",
+            std::process::id()
+        ));
+        // Sparse file one byte over the cap — no real disk allocation.
+        let f = std::fs::File::create(&tmp).expect("create temp");
+        f.set_len(MAX_ARTIFACT_BYTES + 1).expect("set_len");
+        drop(f);
+
+        let result = read_capped(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+
+        let err = result.expect_err("oversize file must be rejected");
+        assert!(
+            err.to_string().contains("exceeds the"),
+            "error must name the size cap, got: {err}"
+        );
+    }
+
+    /// A within-cap file is read normally.
+    #[test]
+    fn read_capped_accepts_normal_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cc_g6_read_capped_ok_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"hello").expect("write temp");
+        let result = read_capped(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(result.expect("within-cap read"), b"hello");
+    }
 
     fn write_7bit_i32(buf: &mut Vec<u8>, value: i32) {
         let mut v = value as u32;

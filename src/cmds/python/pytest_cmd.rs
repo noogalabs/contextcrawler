@@ -2,7 +2,7 @@
 
 use crate::core::runner;
 use crate::core::utils::{
-    check_forbidden_pytest_args, secure_python_command, tool_exists, truncate,
+    check_forbidden_pytest_args, secure_python_command, strip_ansi, tool_exists, truncate,
 };
 use anyhow::Result;
 
@@ -61,6 +61,14 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub(crate) fn filter_pytest_output(output: &str) -> String {
+    // Strip ANSI escapes up-front: pytest emits coloured output when it
+    // detects a TTY (or when forced), and colour codes wrapping the
+    // `=== ... ===` section markers / `FAILED`/`passed` summary tokens
+    // would evade the `starts_with`/`contains` state machine below,
+    // silently hiding failures (G6 #100).
+    let output = strip_ansi(output);
+    let output = output.as_str();
+
     let mut state = ParseState::Header;
     let mut test_files: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -307,6 +315,38 @@ FAILED tests/test_foo.py::test_something - assert False
         assert!(result.contains("4 passed, 1 failed"));
         assert!(result.contains("test_something"));
         assert!(result.contains("assert False"));
+    }
+
+    /// G6 #100: pytest colourises output on a TTY. ANSI escapes
+    /// wrapping the `=== ... ===` section markers and the summary line
+    /// must be stripped before the state machine runs, or failures are
+    /// silently hidden.
+    #[test]
+    fn test_filter_pytest_ansi_wrapped_failures_still_detected() {
+        // `\x1b[31m` (red) / `\x1b[0m` (reset) wrapping the markers.
+        let output = "=== test session starts ===\n\
+collected 5 items\n\n\
+tests/test_foo.py ..F..\n\n\
+\x1b[31m=== FAILURES ===\x1b[0m\n\
+___ test_something ___\n\
+\x1b[31mE       assert False\x1b[0m\n\
+=== short test summary info ===\n\
+\x1b[31mFAILED tests/test_foo.py::test_something - assert False\x1b[0m\n\
+\x1b[31m=== 4 passed, 1 failed in 0.50s ===\x1b[0m";
+
+        let result = filter_pytest_output(output);
+        assert!(
+            result.contains("4 passed, 1 failed"),
+            "ANSI-wrapped summary must still be detected, got: {result:?}"
+        );
+        assert!(
+            result.contains("test_something"),
+            "ANSI-wrapped failure must still surface, got: {result:?}"
+        );
+        assert!(
+            !result.contains('\x1b'),
+            "no raw ANSI escapes should survive into the filtered output"
+        );
     }
 
     #[test]
