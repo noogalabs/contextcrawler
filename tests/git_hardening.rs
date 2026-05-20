@@ -284,6 +284,98 @@ fn c_diff_external_arg_is_rejected_with_deny_error() {
     );
 }
 
+// ---- #111 G4: transport-flag denylist on subcommand + passthrough args -----
+//
+// `check_forbidden_git_args` was only wired into the global `--config-override`
+// synthesis in main.rs. The per-subcommand `args` (and the OsString args that
+// flow to `run_passthrough` for unmodelled subcommands like `clone`) reached
+// git unvalidated, so `--upload-pack` / `--receive-pack` / `--exec-path` were
+// forwarded straight through → arbitrary-binary execution (issue #35). These
+// assert each spawn path now rejects the denied flags before git is spawned.
+
+/// Assert a contextcrawler git invocation is rejected with the standard
+/// deny error: non-zero exit and a stderr message naming contextcrawler
+/// and referencing issue #35.
+fn assert_git_args_rejected(cwd: &std::path::Path, args: &[&str]) {
+    let out = ccrawl_in(cwd)
+        .args(args)
+        .output()
+        .expect("contextcrawler git runs");
+    assert!(
+        !out.status.success(),
+        "contextcrawler must reject {:?} with a non-zero exit. stdout={:?} stderr={:?}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("contextcrawler") && stderr.contains("#35"),
+        "stderr for {:?} must explain why and reference issue #35. got={:?}",
+        args,
+        stderr
+    );
+}
+
+#[test]
+fn git_fetch_upload_pack_arg_is_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    assert_git_args_rejected(
+        &repo_path,
+        &["git", "fetch", "--upload-pack=/tmp/evil", "origin"],
+    );
+}
+
+#[test]
+fn git_push_receive_pack_arg_is_rejected() {
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    assert_git_args_rejected(
+        &repo_path,
+        &["git", "push", "--receive-pack=/tmp/evil", "origin", "main"],
+    );
+}
+
+#[test]
+fn git_clone_passthrough_upload_pack_arg_is_rejected() {
+    // `clone` is unmodelled — it routes through `run_passthrough`, which
+    // takes OsString args. Confirm the denylist fires on that path too.
+    let _guard = common::env_lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_git_args_rejected(
+        dir.path(),
+        &[
+            "git",
+            "clone",
+            "--upload-pack=/tmp/evil",
+            "https://example.invalid/repo.git",
+        ],
+    );
+}
+
+#[test]
+fn benign_git_fetch_is_not_rejected_by_denylist() {
+    // `git fetch origin` against a repo with no `origin` remote fails at
+    // git's network/remote layer, NOT at the denylist. The denylist must
+    // not be the thing that stops it: assert stderr does not carry the
+    // contextcrawler deny message.
+    let _guard = common::env_lock();
+    let (_repo, repo_path) = make_repo();
+    let out = ccrawl_in(&repo_path)
+        .args(["git", "fetch", "origin"])
+        .output()
+        .expect("contextcrawler git fetch runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("refusing to forward"),
+        "benign `git fetch origin` must not trip the transport-flag denylist. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+}
+
 #[test]
 fn benign_git_status_still_succeeds() {
     let _guard = common::env_lock();

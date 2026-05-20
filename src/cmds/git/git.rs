@@ -5,7 +5,9 @@ use crate::core::stream::{
 };
 use crate::core::runner;
 use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, exit_code_from_status, secure_git_command};
+use crate::core::utils::{
+    check_forbidden_git_args, exit_code_from_output, exit_code_from_status, secure_git_command,
+};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
@@ -88,6 +90,20 @@ pub fn run(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
+    // Enforce the git transport-flag / config-key denylist on the
+    // user-supplied subcommand args BEFORE they reach any `git` spawn.
+    // `run` is the single dispatch chokepoint every modelled subcommand
+    // (`run_diff`, `run_push`, `run_pull`, `run_fetch`, …) passes through,
+    // so one check here covers them all. Without it, e.g.
+    // `contextcrawler git fetch --upload-pack=/tmp/evil origin` would
+    // forward `--upload-pack` straight to git → arbitrary-binary exec.
+    // The `secure_git_command` env strip does NOT cover argv flags.
+    // See issue #35 (and #111 G4). Rejection matches the `main.rs`
+    // `-c` validation call site: print the message, exit code 2.
+    if let Err(msg) = check_forbidden_git_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
     match cmd {
         GitCommand::Diff => run_diff(args, max_lines, verbose, global_args),
         GitCommand::Log => run_log(args, max_lines, verbose, global_args),
@@ -1990,6 +2006,24 @@ fn filter_worktree_list(output: &str) -> String {
 /// Runs an unsupported git subcommand by passing it through directly
 pub fn run_passthrough(args: &[OsString], global_args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+
+    // Unmodelled subcommands (`clone`, `submodule`, `config`, `apply`, …)
+    // route here and bypass `git::run`'s denylist check, so re-validate
+    // the user args at this spawn boundary too. `--upload-pack` on a
+    // `git clone` is a confirmed RCE vector (issue #35 / #111 G4).
+    //
+    // The args are `OsString`; decode lossily purely for the check. The
+    // denied flags/keys are ASCII, so a lossy decode cannot smuggle one
+    // past the scanner, and a non-UTF8 arg simply won't match a denylist
+    // entry. We keep spawning the original `OsString` args unchanged.
+    let args_for_check: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Err(msg) = check_forbidden_git_args(&args_for_check) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
 
     if verbose > 0 {
         eprintln!("git passthrough: {:?}", args);
