@@ -1,6 +1,7 @@
 //! Filters grep output by grouping matches by file.
 
 use crate::core::config;
+use crate::core::runner;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::{check_forbidden_rg_args, secure_rg_command};
@@ -104,13 +105,20 @@ pub fn run(
         if exit_code == 2 && !result.stderr.trim().is_empty() {
             eprintln!("{}", result.stderr.trim());
         }
+        // No-bloat guard (issue #95): raw grep emits nothing on a no-match.
+        // The "0 matches for '<pattern>'" convenience message is ~13 tokens
+        // of pure overhead — negative savings. `no_bloat` picks the raw
+        // (empty) output here; consistency wins over the convenience line.
         let msg = format!("0 matches for '{}'", pattern);
-        println!("{}", msg);
+        let emitted = runner::no_bloat(&raw_output, &msg);
+        if !emitted.is_empty() {
+            println!("{}", emitted);
+        }
         timer.track(
             &format!("grep -rn '{}' {}", pattern, path),
             "rtk grep",
             &raw_output,
-            &msg,
+            emitted,
         );
         return Ok(exit_code);
     }
@@ -175,12 +183,16 @@ pub fn run(
         rtk_output.push_str(&format!("[+{} more]\n", total_matches - shown));
     }
 
-    print!("{}", rtk_output);
+    // No-bloat guard (issue #95): for small match sets the grouped framing
+    // ("N matches in M files:" + blank line) can exceed the raw rg output.
+    // Emit whichever is smaller so the filter never costs more than it saves.
+    let emitted = runner::no_bloat(&raw_output, &rtk_output);
+    print!("{}", emitted);
     timer.track(
         &format!("grep -rn '{}' {}", pattern, path),
         "rtk grep",
         &raw_output,
-        &rtk_output,
+        emitted,
     );
 
     Ok(exit_code)
@@ -451,6 +463,43 @@ mod tests {
             );
         }
         // If rg is not installed, skip gracefully (test still passes)
+    }
+
+    // Fix #95: a no-match grep emits raw (empty) output, not the
+    // "0 matches for '<pattern>'" convenience message which is pure overhead.
+    #[test]
+    fn test_no_match_emits_raw_not_convenience_message() {
+        let raw_output = String::new();
+        let msg = format!("0 matches for '{}'", "needle");
+        let emitted = runner::no_bloat(&raw_output, &msg);
+        assert_eq!(emitted, "", "no-match grep must emit raw empty output");
+        assert!(emitted.is_empty());
+    }
+
+    // Fix #95: when a small match set's grouped framing would exceed the
+    // raw rg output, the raw output is emitted instead.
+    #[test]
+    fn test_small_result_emits_raw_when_framing_inflates() {
+        let raw_output = "f.rs:1:x\n";
+        // Simulated framed output: header + blank line + match line.
+        let rtk_output = "1 matches in 1 files:\n\nf.rs:1:x\n";
+        assert!(rtk_output.len() > raw_output.len());
+        assert_eq!(runner::no_bloat(raw_output, rtk_output), raw_output);
+    }
+
+    // Fix #95: a genuinely large grep result keeps the compact framed form.
+    #[test]
+    fn test_large_result_keeps_filtered() {
+        let mut raw_output = String::new();
+        for i in 0..200 {
+            raw_output.push_str(&format!(
+                "src/some/deeply/nested/path/module{}.rs:{}:    let value = compute();\n",
+                i, i
+            ));
+        }
+        let rtk_output = "200 matches in 200 files:\n\n[+200 more]\n";
+        assert!(rtk_output.len() < raw_output.len());
+        assert_eq!(runner::no_bloat(&raw_output, rtk_output), rtk_output);
     }
 
     #[test]

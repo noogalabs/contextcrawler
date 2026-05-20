@@ -1501,7 +1501,15 @@ impl TimedExecution {
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let input_tokens = estimate_tokens(input);
-        let output_tokens = estimate_tokens(output);
+        // No-bloat guard (issue #95): never record a filter as costing more
+        // than it saves. When the filtered output is the same size or larger
+        // than the baseline it is tracked against, the wrapper added framing
+        // without saving anything. Buffered/runner filters already swap to
+        // raw *before* printing (see `core::runner::no_bloat`); for streaming
+        // filters the output is already on the terminal and cannot be
+        // un-printed, so this clamps the tracking math to be honest rather
+        // than reporting fictional negative savings.
+        let output_tokens = estimate_tokens(output).min(input_tokens);
 
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(
@@ -1766,6 +1774,36 @@ mod tests {
         assert_eq!(estimate_tokens("abcde"), 2); // 5 chars = ceil(1.25) = 2
         assert_eq!(estimate_tokens("a"), 1); // 1 char = ceil(0.25) = 1
         assert_eq!(estimate_tokens("12345678"), 2); // 8 chars = 2 tokens
+    }
+
+    // 1b. No-bloat clamp (issue #95): the output token count recorded by
+    // `track()` is `estimate_tokens(output).min(input_tokens)`, so a filter
+    // whose output is larger than its baseline can never record negative
+    // savings. This is the final safety net for streaming filters whose
+    // output is already printed and cannot be swapped to raw.
+    #[test]
+    fn test_no_bloat_clamp_output_never_exceeds_input() {
+        // Filtered output much larger than the raw baseline (e.g. `tsc -b`
+        // adding a banner around tiny raw output).
+        let raw = "ok";
+        let inflated = "═══════════════════════════════════════\nTypeScript: 0 errors\n";
+        let input_tokens = estimate_tokens(raw);
+        let recorded_output = estimate_tokens(inflated).min(input_tokens);
+        assert!(estimate_tokens(inflated) > input_tokens, "precondition: filter inflated");
+        assert_eq!(recorded_output, input_tokens, "clamp pins output to input");
+        assert!(recorded_output <= input_tokens, "savings can never go negative");
+    }
+
+    // The clamp must NOT touch a genuine saving — a filter that shrinks
+    // output keeps its real (smaller) token count.
+    #[test]
+    fn test_no_bloat_clamp_preserves_real_savings() {
+        let raw = "line one\nline two\nline three\nline four\nline five\nline six\n";
+        let filtered = "6 lines";
+        let input_tokens = estimate_tokens(raw);
+        let recorded_output = estimate_tokens(filtered).min(input_tokens);
+        assert_eq!(recorded_output, estimate_tokens(filtered), "real saving untouched");
+        assert!(recorded_output < input_tokens);
     }
 
     // 2. args_display — format OsString vec
