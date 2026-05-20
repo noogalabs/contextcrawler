@@ -220,6 +220,15 @@ pub struct StreamResult {
     pub raw_stdout: String,
     pub raw_stderr: String,
     pub filtered: String,
+    /// True if the in-memory `filtered` accumulator hit `FILTERED_CAP` and
+    /// subsequent filtered text was dropped. When set, `filtered` holds an
+    /// incomplete prefix and a visible `[contextcrawler: output truncated
+    /// at N bytes]` marker was emitted to the output sink (and appended to
+    /// `filtered` itself) so the agent/user knows the output is incomplete.
+    /// Part of the public `StreamResult` contract for callers parsing
+    /// `filtered`; consumed by tests today.
+    #[allow(dead_code)]
+    pub truncated_filtered: bool,
 }
 
 impl StreamResult {
@@ -308,6 +317,7 @@ pub fn run_streaming(
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         });
     }
 
@@ -367,6 +377,7 @@ pub fn run_streaming(
     let mut raw_stdout = String::new();
     let mut raw_stderr = String::new();
     let mut filtered = String::new();
+    let mut truncated_filtered = false;
     let mut capped_out = false;
     let mut capped_err = false;
     let mut saved_filter: Option<Box<dyn StreamFilter + '_>> = None;
@@ -400,12 +411,40 @@ pub fn run_streaming(
             });
         });
 
-        if let FilterMode::Streaming(mut filter) = stdout_mode {
+        // Sink message: a chunk of filtered text destined for stdout/stderr.
+        enum SinkMsg {
+            Out(String),
+            Err(String),
+        }
+
+        // Decouple draining from sink writes. The consumer loop below drains
+        // the bounded child channel (`rx`) AND must never block on a slow
+        // terminal — if it did, the reader threads would fill `rx` and the
+        // child's own writes would stall. So sink writes are handed to a
+        // dedicated writer thread over an *unbounded* channel: the consumer
+        // always makes progress draining the child, and back-pressure from a
+        // blocked terminal is absorbed here in memory rather than upstream.
+        let (sink_tx, sink_rx) = mpsc::channel::<SinkMsg>();
+        let sink_thread = std::thread::spawn(move || {
             let stdout_handle = io::stdout();
             let mut out = stdout_handle.lock();
             let stderr_handle = io::stderr();
             let mut err_out = stderr_handle.lock();
+            for msg in sink_rx {
+                let (text, dest): (String, &mut dyn Write) = match msg {
+                    SinkMsg::Out(t) => (t, &mut out),
+                    SinkMsg::Err(t) => (t, &mut err_out),
+                };
+                // Broken pipe / IO error on the sink: stop writing but keep
+                // draining the channel so senders never block. The child
+                // drain is unaffected.
+                let _ = write!(dest, "{}", text);
+            }
+            let _ = out.flush();
+            let _ = err_out.flush();
+        });
 
+        if let FilterMode::Streaming(mut filter) = stdout_mode {
             for msg in rx {
                 let (line, is_stderr) = match msg {
                     StreamLine::Stderr(l) => (l, true),
@@ -439,31 +478,63 @@ pub fn run_streaming(
                 if let Some(output) = filter.feed_line(&clean) {
                     if filtered.len() < FILTERED_CAP {
                         filtered.push_str(&output);
+                    } else if !truncated_filtered {
+                        truncated_filtered = true;
+                        let marker = format!(
+                            "\n[contextcrawler: output truncated at {} bytes]\n",
+                            FILTERED_CAP
+                        );
+                        filtered.push_str(&marker);
+                        // Surface the marker on the same fd the filter is
+                        // writing to. Sink send cannot block the drain.
+                        let mm = if is_stderr {
+                            SinkMsg::Err(marker)
+                        } else {
+                            SinkMsg::Out(marker)
+                        };
+                        let _ = sink_tx.send(mm);
                     }
-                    let dest: &mut dyn Write = if is_stderr { &mut err_out } else { &mut out };
-                    match write!(dest, "{}", output) {
-                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-                        Err(e) => return Err(e.into()),
-                        Ok(_) => {}
+                    let m = if is_stderr {
+                        SinkMsg::Err(output)
+                    } else {
+                        SinkMsg::Out(output)
+                    };
+                    // Unbounded send to the writer thread: never blocks the
+                    // child drain even if the terminal is wedged.
+                    if sink_tx.send(m).is_err() {
+                        break; // writer thread gone
                     }
                 }
             }
             let tail = filter.flush();
             if filtered.len() < FILTERED_CAP {
                 filtered.push_str(&tail);
+            } else if !truncated_filtered && !tail.is_empty() {
+                truncated_filtered = true;
+                let marker = format!(
+                    "\n[contextcrawler: output truncated at {} bytes]\n",
+                    FILTERED_CAP
+                );
+                filtered.push_str(&marker);
+                let mm = if filter_fd_is_stderr {
+                    SinkMsg::Err(marker)
+                } else {
+                    SinkMsg::Out(marker)
+                };
+                let _ = sink_tx.send(mm);
             }
-            let flush_dest: &mut dyn Write = if filter_fd_is_stderr {
-                &mut err_out
+            let tail_msg = if filter_fd_is_stderr {
+                SinkMsg::Err(tail)
             } else {
-                &mut out
+                SinkMsg::Out(tail)
             };
-            match write!(flush_dest, "{}", tail) {
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-                Err(e) => return Err(e.into()),
-                Ok(_) => {}
-            }
+            let _ = sink_tx.send(tail_msg);
             saved_filter = Some(filter);
         }
+        // Drop our sender so the writer thread sees the channel close and
+        // exits once it has flushed every queued chunk.
+        drop(sink_tx);
+        sink_thread.join().ok();
 
         stdout_thread.join().ok();
         stderr_thread.join().ok();
@@ -567,6 +638,7 @@ pub fn run_streaming(
         raw_stdout,
         raw_stderr,
         filtered,
+        truncated_filtered,
     })
 }
 
@@ -843,6 +915,7 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         };
         assert!(r.success());
     }
@@ -855,6 +928,7 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         };
         assert!(!r.success());
     }
@@ -867,6 +941,7 @@ pub(crate) mod tests {
             raw_stdout: String::new(),
             raw_stderr: String::new(),
             filtered: String::new(),
+            truncated_filtered: false,
         };
         assert!(!r.success());
     }
@@ -1653,6 +1728,100 @@ pub(crate) mod tests {
         let mut got = Vec::new();
         for_each_line(io::Cursor::new(&input[..]), |l| got.push(l));
         assert_eq!(got, vec!["only-line"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Codex-review follow-up (G3 / #100): stream-path deadlock decoupling
+    // and FILTERED_CAP truncation marker.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_filtered_cap_sets_truncation_flag_and_marker() {
+        // Drive a streaming filter whose output exceeds FILTERED_CAP. The
+        // filter expands each input line; the child only needs to emit
+        // enough lines for the accumulator to trip the cap.
+        //
+        // Each input line is expanded to a ~64 KiB output chunk, so ~200
+        // lines clears the 10 MiB FILTERED_CAP without the child itself
+        // producing 10 MiB (keeps raw_stdout under RAW_CAP).
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 200); do echo x; done"]);
+        let chunk = "A".repeat(64 * 1024);
+        let filter = LineFilter::new(move |_l| Some(format!("{}\n", chunk)));
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+        assert!(
+            result.truncated_filtered,
+            "filtered accumulator exceeded FILTERED_CAP, flag must be set"
+        );
+        assert!(
+            result.filtered.contains("[contextcrawler: output truncated at"),
+            "filtered buffer must carry the visible truncation marker"
+        );
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn test_filtered_cap_flag_clear_for_small_output() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("hello\nworld\n");
+        let filter = LineFilter::new(|l| Some(format!("{}\n", l)));
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+        assert!(
+            !result.truncated_filtered,
+            "small output is well under FILTERED_CAP"
+        );
+        assert!(!result.filtered.contains("output truncated"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_slow_sink_does_not_deadlock_child_drain() {
+        // Regression for the sync_channel(4096) deadlock: the consumer loop
+        // drains the bounded child channel AND used to write to the sink
+        // inline. A slow/blocked terminal would stall the consumer, fill the
+        // child channel, and back-pressure the child itself.
+        //
+        // The structural guarantee under test: the child drain runs to
+        // completion and the call returns even when the child floods stdout
+        // far past STREAM_CHANNEL_CAP (4096 lines) faster than a real
+        // terminal could consume. The sink writer thread absorbs sink
+        // back-pressure off the drain path. A deadlock here would hang the
+        // test runner.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 50000); do echo line $i; done"]);
+        let filter = LineFilter::new(|l| Some(format!("{}\n", l)));
+        let start = std::time::Instant::now();
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        // 50k lines >> 4096 channel cap. If the drain were coupled to a
+        // stalled sink this would deadlock; instead it completes promptly.
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.raw_stdout.contains("line 50000"),
+            "child must fully drain — last line present"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "drain must not stall, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
