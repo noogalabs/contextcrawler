@@ -8,7 +8,7 @@
 //! This module provides:
 //! - SHA-256 hash computation and storage at install time
 //! - Runtime verification before command execution
-//! - Manual verification via `rtk verify`
+//! - Manual verification via `contextcrawler verify`
 //!
 //! Reference: SA-2025-RTK-001 (Finding F-01)
 
@@ -19,6 +19,67 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Result of validating the baseline (hash sidecar) file's ownership and
+/// permissions. The baseline lives in the same directory as the hook it
+/// protects, so an attacker who can write that directory could swap both
+/// the hook and its baseline. We can't relocate the store cheaply, but we
+/// can refuse to trust a baseline that is a symlink or that is writable by
+/// anyone other than the current user.
+#[derive(Debug, PartialEq)]
+enum BaselineTrust {
+    /// Baseline is a regular file, owned by us, not group/world-writable.
+    Ok,
+    /// Baseline is a symlink — an attacker may have redirected it.
+    Symlink,
+    /// Baseline is group- or world-writable, or owned by another user.
+    Unsafe(String),
+}
+
+/// Validate that the baseline sidecar at `path` is safe to trust.
+///
+/// On Unix: rejects symlinks, rejects files not owned by the current uid,
+/// and rejects files that are group- or world-writable. On non-Unix we can
+/// only reject symlinks (no portable owner/mode check).
+fn check_baseline_trust(path: &Path) -> BaselineTrust {
+    // symlink_metadata does NOT follow links — so a symlinked baseline is
+    // caught here rather than being silently resolved.
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        // If we can't stat it, treat as unsafe rather than trusting blindly.
+        Err(e) => return BaselineTrust::Unsafe(format!("cannot stat baseline: {}", e)),
+    };
+
+    if meta.file_type().is_symlink() {
+        return BaselineTrust::Symlink;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode();
+        // 0o022 = group-write | other-write.
+        if mode & 0o022 != 0 {
+            return BaselineTrust::Unsafe(format!(
+                "baseline is group/world-writable (mode {:o})",
+                mode & 0o777
+            ));
+        }
+        // Reject ownership by anyone other than the running user. We use
+        // the real uid (geteuid would be subtler under setuid, but the
+        // CLI is never setuid).
+        let our_uid = unsafe { libc::geteuid() };
+        if meta.uid() != our_uid {
+            return BaselineTrust::Unsafe(format!(
+                "baseline is owned by uid {} (expected {})",
+                meta.uid(),
+                our_uid
+            ));
+        }
+    }
+
+    BaselineTrust::Ok
+}
 
 /// Filename for the stored hash (dotfile alongside hook)
 const HASH_FILENAME: &str = ".rtk-hook.sha256";
@@ -143,6 +204,29 @@ pub fn verify_hook_at(hook_path: &Path) -> Result<IntegrityStatus> {
         (false, true) => Ok(IntegrityStatus::OrphanedHash),
         (true, false) => Ok(IntegrityStatus::NoBaseline),
         (true, true) => {
+            // Before trusting the baseline, confirm it has not been swapped
+            // for a symlink and is not writable by anyone but us. A baseline
+            // an attacker controls is no baseline at all.
+            match check_baseline_trust(&hash_file) {
+                BaselineTrust::Ok => {}
+                BaselineTrust::Symlink => {
+                    anyhow::bail!(
+                        "Baseline hash file is a symlink ({}). Refusing to trust it — \
+                         an attacker may have redirected it. Re-baseline with \
+                         `contextcrawler init -g --auto-patch`.",
+                        hash_file.display()
+                    );
+                }
+                BaselineTrust::Unsafe(why) => {
+                    anyhow::bail!(
+                        "Baseline hash file {} is not safe to trust: {}. \
+                         Re-baseline with `contextcrawler init -g --auto-patch`.",
+                        hash_file.display(),
+                        why
+                    );
+                }
+            }
+
             let stored = read_stored_hash(&hash_file)?;
             let actual = compute_hash(hook_path)?;
 
@@ -283,7 +367,10 @@ pub fn run_verify(verbose: u8) -> Result<()> {
 /// Runtime integrity gate. Called at startup for operational commands.
 ///
 /// Behavior:
-/// - `Verified` / `NotInstalled` / `NoBaseline`: silent, continue
+/// - `Verified` / `NotInstalled`: silent, continue
+/// - `NoBaseline`: fail CLOSED — return an error. A hook file with no
+///   baseline cannot be verified, and deleting the baseline is itself a
+///   plausible tamper step, so we refuse rather than run blind.
 /// - `Tampered`: print warning to stderr, exit 1
 /// - `OrphanedHash`: warn to stderr, continue
 ///
@@ -306,8 +393,19 @@ pub fn runtime_check() -> Result<()> {
             // All good, proceed
         }
         IntegrityStatus::NoBaseline => {
-            // Installed before integrity checks — don't block
-            // Silently skip to avoid noise for users who haven't re-run init
+            // Fail CLOSED. A hook file exists but its baseline hash is
+            // missing, so we cannot tell a legitimate hook from a tampered
+            // one. Deleting `.rtk-hook.sha256` is a plausible way for an
+            // attacker to disable this very check, so we refuse to run
+            // rather than continue blind.
+            anyhow::bail!(
+                "contextcrawler: hook integrity baseline missing.\n  \
+                 A hook exists at ~/.claude/hooks/rtk-rewrite.sh but its baseline \
+                 hash (.rtk-hook.sha256) is gone.\n  \
+                 ContextCrawler cannot verify the hook has not been tampered with, \
+                 so it will not run.\n  \
+                 To re-establish the baseline:  contextcrawler init -g --auto-patch"
+            );
         }
         IntegrityStatus::Tampered { expected, actual } => {
             eprintln!("contextcrawler: hook integrity check FAILED");
@@ -321,10 +419,10 @@ pub fn runtime_check() -> Result<()> {
             );
             eprintln!();
             eprintln!("  The hook at ~/.claude/hooks/rtk-rewrite.sh has been modified.");
-            eprintln!("  This may indicate tampering. RTK will not execute.");
+            eprintln!("  This may indicate tampering. ContextCrawler will not execute.");
             eprintln!();
-            eprintln!("  To restore:  rtk init -g --auto-patch");
-            eprintln!("  To inspect:  rtk verify");
+            eprintln!("  To restore:  contextcrawler init -g --auto-patch");
+            eprintln!("  To inspect:  contextcrawler verify");
             std::process::exit(1);
         }
         IntegrityStatus::OrphanedHash => {
@@ -572,6 +670,83 @@ mod tests {
 
         let result = verify_hook_at(&hook);
         assert!(result.is_err(), "Should reject single-space separator");
+    }
+
+    #[test]
+    fn test_runtime_check_no_baseline_fails_closed() {
+        // A hook file with no baseline must NOT be silently accepted.
+        // We exercise verify_hook_at directly (runtime_check resolves the
+        // real ~/.claude path), and assert the NoBaseline status — the
+        // status runtime_check now bails on.
+        let temp = TempDir::new().unwrap();
+        let hook = temp.path().join("rtk-rewrite.sh");
+        fs::write(&hook, "#!/bin/bash\necho test\n").unwrap();
+
+        let status = verify_hook_at(&hook).unwrap();
+        assert_eq!(
+            status,
+            IntegrityStatus::NoBaseline,
+            "hook with missing baseline must surface NoBaseline"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_baseline_trust_rejects_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let hook = temp.path().join("rtk-rewrite.sh");
+        fs::write(&hook, "#!/bin/bash\necho test\n").unwrap();
+        store_hash(&hook).unwrap();
+
+        let hash_file = temp.path().join(".rtk-hook.sha256");
+        // Make the baseline group/world-writable.
+        fs::set_permissions(&hash_file, fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(
+            matches!(check_baseline_trust(&hash_file), BaselineTrust::Unsafe(_)),
+            "world-writable baseline must be rejected"
+        );
+        // verify_hook_at must now error rather than trust it.
+        assert!(
+            verify_hook_at(&hook).is_err(),
+            "verify_hook_at must reject an unsafe baseline"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_baseline_trust_rejects_symlink() {
+        let temp = TempDir::new().unwrap();
+        let hook = temp.path().join("rtk-rewrite.sh");
+        fs::write(&hook, "#!/bin/bash\necho test\n").unwrap();
+
+        // Write the real hash content somewhere else, then symlink the
+        // baseline path at it.
+        let real = temp.path().join("real-hash");
+        let hash = compute_hash(&hook).unwrap();
+        fs::write(&real, format!("{}  rtk-rewrite.sh\n", hash)).unwrap();
+        let hash_file = temp.path().join(".rtk-hook.sha256");
+        std::os::unix::fs::symlink(&real, &hash_file).unwrap();
+
+        assert_eq!(check_baseline_trust(&hash_file), BaselineTrust::Symlink);
+        assert!(
+            verify_hook_at(&hook).is_err(),
+            "verify_hook_at must reject a symlinked baseline"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_baseline_trust_accepts_normal_readonly_baseline() {
+        let temp = TempDir::new().unwrap();
+        let hook = temp.path().join("rtk-rewrite.sh");
+        fs::write(&hook, "#!/bin/bash\necho test\n").unwrap();
+        store_hash(&hook).unwrap();
+
+        let hash_file = temp.path().join(".rtk-hook.sha256");
+        assert_eq!(check_baseline_trust(&hash_file), BaselineTrust::Ok);
+        assert_eq!(verify_hook_at(&hook).unwrap(), IntegrityStatus::Verified);
     }
 
     #[test]
