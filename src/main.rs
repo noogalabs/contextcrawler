@@ -3546,14 +3546,14 @@ fn run_cli() -> Result<i32> {
             // argv[1..] its arguments — so a binary path containing
             // whitespace can never be word-split into the wrong program.
             //
-            // `--shell` is the explicit opt-in for callers that genuinely
+            // `--via-shell` is the explicit opt-in for callers that genuinely
             // need shell word-splitting of a single quoted argument
             // (formerly #388). It is gated, never a heuristic on a
             // positional arg.
             let (cmd_name, cmd_args): (OsString, Vec<OsString>) = if shell {
                 if args.len() != 1 {
                     anyhow::bail!(
-                        "proxy --shell expects exactly one quoted command-line argument"
+                        "proxy --via-shell expects exactly one quoted command-line argument"
                     );
                 }
                 let full = args[0].to_string_lossy();
