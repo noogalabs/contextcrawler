@@ -87,6 +87,15 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
                         let _ = std::io::stdout().flush();
                         std::process::exit(3);
                     }
+                    supply_chain_gate::Verdict::Ask(_) => {
+                        // Install verb detected but its package set is
+                        // unvettable (lockfile / requirements file). Fail
+                        // closed: downgrade the auto-allow to Ask.
+                        eprintln!("{}", supply_chain_gate::render(&sc_verdict));
+                        print!("{}", rewritten);
+                        let _ = std::io::stdout().flush();
+                        std::process::exit(3);
+                    }
                     supply_chain_gate::Verdict::Skip | supply_chain_gate::Verdict::Allow => {}
                 }
                 // ===== contextzip-downstream: end supply-chain gate =====
@@ -245,11 +254,13 @@ mod tests {
         /// once the upstream permission verdict is Allow.
         ///   Skip / Allow   → 0 (proceed, auto-allow)
         ///   Block          → 3 (ask — gate failed)
+        ///   Ask            → 3 (ask — install set unvettable, fail closed)
         ///   Unavailable    → 3 (ask — gate could not verify, fail closed)
         fn supply_chain_exit_code(v: &Verdict) -> i32 {
             match v {
                 Verdict::Skip | Verdict::Allow => 0,
                 Verdict::Block(_) => 3,
+                Verdict::Ask(_) => 3,
                 Verdict::Unavailable(_) => 3,
             }
         }
@@ -268,6 +279,18 @@ mod tests {
         fn block_still_downgrades_to_ask() {
             let v = Verdict::Block(vec![]);
             assert_eq!(supply_chain_exit_code(&v), 3);
+        }
+
+        #[test]
+        fn ask_downgrades_to_ask_not_allow() {
+            // An unvettable install (lockfile / requirements file) must
+            // downgrade the auto-allow to Ask, never silently proceed.
+            let v = Verdict::Ask(vec![]);
+            assert_eq!(
+                supply_chain_exit_code(&v),
+                3,
+                "Ask MUST downgrade to Ask (3), never silently allow (0)"
+            );
         }
 
         #[test]
