@@ -264,23 +264,23 @@ impl Ecosystem {
 
 lazy_static! {
     static ref NPM_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)npm\s+(?:i|install|add)\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)npm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
     static ref PNPM_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pnpm\s+(?:i|install|add)\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pnpm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
     static ref YARN_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)yarn\s+add\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)yarn\s+add\s+([^|;&<>]+)").unwrap();
     static ref PIP_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)(?:pip|pip3)\s+install\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)(?:pip|pip3)\s+install\s+([^|;&<>]+)").unwrap();
     static ref UV_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)uv\s+(?:pip\s+)?(?:install|add)\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)uv\s+(?:pip\s+)?(?:install|add)\s+([^|;&<>]+)").unwrap();
     static ref POETRY_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)poetry\s+add\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)poetry\s+add\s+([^|;&<>]+)").unwrap();
     static ref PIPX_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pipx\s+install\s+([^|;&>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pipx\s+install\s+([^|;&<>]+)").unwrap();
 }
 
 /// Tokenise a shell command into (offset, token) pairs, treating the shell
-/// operators `&&`, `||`, `;`, `|`, `>`, `>>` as standalone delimiter tokens.
+/// operators `&&`, `||`, `;`, `|`, `>`, `>>`, `<`, `<<` as standalone tokens.
 /// This is deliberately simple — it does not honour quoting — but it is
 /// enough to classify install verbs and tell a flag from a package name.
 fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
@@ -294,10 +294,10 @@ fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
             continue;
         }
         // Shell operators become their own tokens.
-        if c == ';' || c == '|' || c == '&' || c == '>' {
+        if c == ';' || c == '|' || c == '&' || c == '>' || c == '<' {
             let start = i;
             let mut j = i + 1;
-            // Group repeated operator chars (`&&`, `||`, `>>`).
+            // Group repeated operator chars (`&&`, `||`, `>>`, `<<`).
             while j < bytes.len() && (bytes[j] as char) == c {
                 j += 1;
             }
@@ -310,7 +310,13 @@ fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
         let mut j = i;
         while j < bytes.len() {
             let cj = bytes[j] as char;
-            if cj.is_whitespace() || cj == ';' || cj == '|' || cj == '&' || cj == '>' {
+            if cj.is_whitespace()
+                || cj == ';'
+                || cj == '|'
+                || cj == '&'
+                || cj == '>'
+                || cj == '<'
+            {
                 break;
             }
             j += 1;
@@ -323,7 +329,10 @@ fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
 
 /// True if a token is a shell operator delimiter (not a package name).
 fn is_shell_operator(tok: &str) -> bool {
-    matches!(tok, ";" | "|" | "||" | "&" | "&&" | ">" | ">>")
+    matches!(
+        tok,
+        ";" | "|" | "||" | "&" | "&&" | ">" | ">>" | "<" | "<<"
+    )
 }
 
 fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
@@ -462,7 +471,13 @@ fn detect_bare_lockfile_installs(
         if !has_package {
             // Skip if a higher-priority pattern already claimed this span.
             if !claimed.iter().any(|(s, e)| *start >= *s && *start < *e) {
-                claimed.push((*start, *start + tokens[idx].1.len()));
+                // Claim the full verb span (head token through the verb
+                // token), not just the head — the end is read by no later
+                // pass today, but a short span would silently break dedup
+                // if another detector is added after this one.
+                let verb_end = tokens[verb_span_end_idx].0
+                    + tokens[verb_span_end_idx].1.len();
+                claimed.push((*start, verb_end));
                 out.push(ParsedInstall {
                     ecosystem: Ecosystem::Npm,
                     packages: Vec::new(),
@@ -1303,6 +1318,32 @@ mod tests {
         for cmd in ["npm ci", "pnpm install", "pnpm i", "yarn install", "yarn"] {
             let v = detect_installs(cmd);
             assert_eq!(v.len(), 1, "`{}` should yield one install", cmd);
+            assert!(
+                v[0].unvettable.is_some(),
+                "`{}` must be flagged unvettable",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_redirect_does_not_look_like_package_name() {
+        // `npm install < f.txt` is a bare lockfile install with stdin
+        // redirected (npm ignores it). The `<` must tokenise as a shell
+        // operator, not be mistaken for a package name — otherwise the
+        // bare-install guard misses it (Codex/Claude re-review, #111 G1).
+        for cmd in [
+            "npm install < packages.txt",
+            "npm ci <<EOF",
+            "yarn install < f",
+        ] {
+            let v = detect_installs(cmd);
+            assert_eq!(v.len(), 1, "`{}` should yield one install", cmd);
+            assert!(
+                v[0].packages.is_empty(),
+                "`{}` must not name a package",
+                cmd
+            );
             assert!(
                 v[0].unvettable.is_some(),
                 "`{}` must be flagged unvettable",
