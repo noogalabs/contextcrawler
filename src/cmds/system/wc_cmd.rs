@@ -21,13 +21,29 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let mode = detect_mode(args);
+
+    // No file operands → wc reads from stdin. Forward contextcrawler's stdin to
+    // the child so `cat file | contextcrawler wc` counts the piped data instead
+    // of reporting zero.
+    let opts = if reads_stdin(args) {
+        RunOptions::stdout_only().inherit_stdin()
+    } else {
+        RunOptions::stdout_only()
+    };
+
     runner::run_filtered(
         cmd,
         "wc",
         &args.join(" "),
         |stdout| filter_wc_output(stdout, &mode),
-        RunOptions::stdout_only(),
+        opts,
     )
+}
+
+/// `wc` reads from stdin when no positional file operand is given (every arg is
+/// a flag).
+fn reads_stdin(args: &[String]) -> bool {
+    !args.iter().any(|a| !a.starts_with('-'))
 }
 
 /// Which columns the user requested
@@ -374,5 +390,22 @@ mod tests {
         let raw = "";
         let result = filter_wc_output(raw, &WcMode::Full);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_reads_stdin_no_operands() {
+        // No args at all → wc reads stdin.
+        assert!(reads_stdin(&[]));
+        // Only flags → still reads stdin.
+        let flags: Vec<String> = vec!["-l".into(), "-w".into()];
+        assert!(reads_stdin(&flags));
+    }
+
+    #[test]
+    fn test_reads_stdin_with_file_operand() {
+        let args: Vec<String> = vec!["-l".into(), "file.py".into()];
+        assert!(!reads_stdin(&args));
+        let args2: Vec<String> = vec!["file.py".into()];
+        assert!(!reads_stdin(&args2));
     }
 }

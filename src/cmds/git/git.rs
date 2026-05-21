@@ -909,6 +909,20 @@ fn extract_state_header(raw: &str) -> Option<String> {
     None
 }
 
+/// Extract the explicit "HEAD detached at/from <ref>" line from plain
+/// `git status` output.
+///
+/// Porcelain `-b` collapses a detached HEAD to the opaque `## HEAD (no branch)`,
+/// which an agent (or a distracted human) can misread as a branch literally
+/// named `HEAD`. The plain-status output keeps the explicit SHA/ref, so we
+/// surface that instead. Returns `None` when HEAD is on a branch.
+fn extract_detached_head(raw: &str) -> Option<String> {
+    raw.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("HEAD detached "))
+        .map(str::to_string)
+}
+
 /// Minimal filtering for git status with user-provided args
 fn filter_status_with_args(output: &str) -> String {
     let mut result = Vec::new();
@@ -1034,7 +1048,13 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         return Ok(result.exit_code);
     }
 
-    let formatted = format_status_output(&result.stdout);
+    let mut formatted = format_status_output(&result.stdout);
+
+    // Porcelain `-b` reduces a detached HEAD to "## HEAD (no branch)"; restore
+    // the explicit "HEAD detached at <sha>" from the plain status we captured.
+    if let Some(detached) = extract_detached_head(&raw_output) {
+        formatted = formatted.replacen("* HEAD (no branch)", &format!("* {detached}"), 1);
+    }
 
     // Surface in-progress state (rebase/merge/cherry-pick/bisect/am) from the
     // plain-status output we already captured for tracking. Porcelain omits it
@@ -2635,6 +2655,37 @@ mod tests {
         let porcelain = "## main...origin/main\n";
         let result = format_status_output(porcelain);
         assert_eq!(result, "* main...origin/main\nclean — nothing to commit");
+    }
+
+    #[test]
+    fn test_extract_detached_head_returns_sha() {
+        let raw = "HEAD detached at 1a2b3c4\nnothing to commit, working tree clean\n";
+        let out = extract_detached_head(raw).expect("detached head expected");
+        assert_eq!(out, "HEAD detached at 1a2b3c4");
+    }
+
+    #[test]
+    fn test_extract_detached_head_on_branch_returns_none() {
+        let raw = "On branch main\nnothing to commit, working tree clean\n";
+        assert_eq!(extract_detached_head(raw), None);
+    }
+
+    #[test]
+    fn test_detached_head_sha_replaces_opaque_porcelain_line() {
+        // Porcelain `-b` for a detached HEAD yields "## HEAD (no branch)";
+        // format_status_output turns that into "* HEAD (no branch)". The plain
+        // status carries the real SHA, which must survive into the output.
+        let porcelain = "## HEAD (no branch)\n M src/main.rs\n";
+        let raw = "HEAD detached at 1a2b3c4\nChanges not staged for commit:\n\tmodified:   src/main.rs\n";
+        let mut formatted = format_status_output(porcelain);
+        if let Some(detached) = extract_detached_head(raw) {
+            formatted = formatted.replacen("* HEAD (no branch)", &format!("* {detached}"), 1);
+        }
+        assert!(
+            formatted.contains("HEAD detached at 1a2b3c4"),
+            "detached SHA lost: {formatted}"
+        );
+        assert!(!formatted.contains("(no branch)"), "opaque line survived");
     }
 
     #[test]
