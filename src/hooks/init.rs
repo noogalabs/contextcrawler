@@ -1587,72 +1587,25 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
         eprintln!("Writing contextcrawler instructions to: {}", path.display());
     }
 
-    if path.exists() {
-        let existing = fs::read_to_string(&path)?;
-        // upsert_rtk_block handles all 4 cases: add, update, unchanged, malformed
-        let (new_content, action) = upsert_rtk_block(&existing, RTK_INSTRUCTIONS);
-
-        match action {
-            RtkBlockUpsert::Added => {
-                if dry_run {
-                    println!("[dry-run] would add contextcrawler instructions to {}", path.display());
-                } else {
-                    fs::write(&path, new_content)?;
-                    println!("[ok] Added contextcrawler instructions to existing {}", path.display());
-                }
-            }
-            RtkBlockUpsert::Updated => {
-                if dry_run {
-                    println!(
-                        "[dry-run] would update contextcrawler instructions in {}",
-                        path.display()
-                    );
-                } else {
-                    fs::write(&path, new_content)?;
-                    println!("[ok] Updated contextcrawler instructions in {}", path.display());
-                }
-            }
-            RtkBlockUpsert::Unchanged => {
-                if !dry_run {
-                    println!(
-                        "[ok] {} already contains up-to-date contextcrawler instructions",
-                        path.display()
-                    );
-                }
-                return Ok(());
-            }
-            RtkBlockUpsert::Malformed => {
-                eprintln!(
-                    "[warn] Warning: Found '{}' without closing marker in {}",
-                    RTK_BLOCK_START,
-                    path.display()
-                );
-
-                if let Some((line_num, _)) = existing
-                    .lines()
-                    .enumerate()
-                    .find(|(_, line)| line.contains(RTK_BLOCK_START))
-                {
-                    eprintln!("    Location: line {}", line_num + 1);
-                }
-
-                eprintln!("    Action: Manually remove the incomplete block, then re-run:");
-                if global {
-                    eprintln!("            contextcrawler init -g --claude-md");
-                } else {
-                    eprintln!("            contextcrawler init --claude-md");
-                }
-                return Ok(());
-            }
-        }
-    } else if dry_run {
-        println!(
-            "[dry-run] would create {} with contextcrawler instructions",
-            path.display()
-        );
+    let recovery_cmd = if global {
+        "contextcrawler init -g --claude-md"
     } else {
-        fs::write(&path, RTK_INSTRUCTIONS)?;
-        println!("[ok] Created {} with contextcrawler instructions", path.display());
+        "contextcrawler init --claude-md"
+    };
+
+    // write_rtk_block handles all 4 cases: add, update, unchanged, malformed.
+    // A malformed CLAUDE.md bails with a diagnostic instead of silently
+    // exiting 0 and skipping the OpenCode plugin step below.
+    let action = write_rtk_block(
+        &path,
+        RTK_INSTRUCTIONS,
+        "contextcrawler instructions",
+        recovery_cmd,
+        ctx,
+    )?;
+
+    if matches!(action, RtkBlockUpsert::Unchanged) {
+        return Ok(());
     }
 
     if global {
@@ -4250,6 +4203,20 @@ mod tests {
     }
 
     #[test]
+    fn test_copilot_instructions_has_markers() {
+        // Without both markers, `upsert_rtk_block` cannot detect an existing
+        // block and would append a duplicate on every re-init.
+        assert!(
+            COPILOT_INSTRUCTIONS.contains(RTK_BLOCK_START),
+            "COPILOT_INSTRUCTIONS must contain RTK_BLOCK_START marker"
+        );
+        assert!(
+            COPILOT_INSTRUCTIONS.contains(RTK_BLOCK_END),
+            "COPILOT_INSTRUCTIONS must contain RTK_BLOCK_END marker"
+        );
+    }
+
+    #[test]
     fn test_migration_removes_old_block() {
         let input = format!(
             "# My Config\n\n{} v2 -->\nOLD RTK STUFF\n{}\n\nMore content",
@@ -6679,5 +6646,32 @@ mod tests {
             "Hook config must not be written when the upsert aborts: {}",
             hook_path.display()
         );
+    }
+
+    #[test]
+    fn test_claude_md_mode_refuses_malformed_block() {
+        // Mirrors `test_copilot_init_refuses_malformed_block`: a malformed
+        // CLAUDE.md previously emitted a warning and exited 0, silently
+        // skipping the OpenCode plugin step. The shared `write_rtk_block`
+        // dispatcher now bails for both paths.
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let claude_md = claude_dir.join(CLAUDE_MD);
+            let malformed = format!(
+                "# Existing notes\n\n{}\nincomplete RTK block\n",
+                RTK_BLOCK_START
+            );
+            fs::write(&claude_md, &malformed).unwrap();
+
+            let result = run_claude_md_mode(true, false, InitContext::default());
+
+            assert!(
+                result.is_err(),
+                "Malformed CLAUDE.md must cause a hard error, not silent skip"
+            );
+
+            let after = fs::read_to_string(&claude_md).unwrap();
+            assert_eq!(after, malformed, "File must not be modified when malformed");
+        });
     }
 }
