@@ -1587,72 +1587,25 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
         eprintln!("Writing contextcrawler instructions to: {}", path.display());
     }
 
-    if path.exists() {
-        let existing = fs::read_to_string(&path)?;
-        // upsert_rtk_block handles all 4 cases: add, update, unchanged, malformed
-        let (new_content, action) = upsert_rtk_block(&existing, RTK_INSTRUCTIONS);
-
-        match action {
-            RtkBlockUpsert::Added => {
-                if dry_run {
-                    println!("[dry-run] would add contextcrawler instructions to {}", path.display());
-                } else {
-                    fs::write(&path, new_content)?;
-                    println!("[ok] Added contextcrawler instructions to existing {}", path.display());
-                }
-            }
-            RtkBlockUpsert::Updated => {
-                if dry_run {
-                    println!(
-                        "[dry-run] would update contextcrawler instructions in {}",
-                        path.display()
-                    );
-                } else {
-                    fs::write(&path, new_content)?;
-                    println!("[ok] Updated contextcrawler instructions in {}", path.display());
-                }
-            }
-            RtkBlockUpsert::Unchanged => {
-                if !dry_run {
-                    println!(
-                        "[ok] {} already contains up-to-date contextcrawler instructions",
-                        path.display()
-                    );
-                }
-                return Ok(());
-            }
-            RtkBlockUpsert::Malformed => {
-                eprintln!(
-                    "[warn] Warning: Found '{}' without closing marker in {}",
-                    RTK_BLOCK_START,
-                    path.display()
-                );
-
-                if let Some((line_num, _)) = existing
-                    .lines()
-                    .enumerate()
-                    .find(|(_, line)| line.contains(RTK_BLOCK_START))
-                {
-                    eprintln!("    Location: line {}", line_num + 1);
-                }
-
-                eprintln!("    Action: Manually remove the incomplete block, then re-run:");
-                if global {
-                    eprintln!("            contextcrawler init -g --claude-md");
-                } else {
-                    eprintln!("            contextcrawler init --claude-md");
-                }
-                return Ok(());
-            }
-        }
-    } else if dry_run {
-        println!(
-            "[dry-run] would create {} with contextcrawler instructions",
-            path.display()
-        );
+    let recovery_cmd = if global {
+        "contextcrawler init -g --claude-md"
     } else {
-        fs::write(&path, RTK_INSTRUCTIONS)?;
-        println!("[ok] Created {} with contextcrawler instructions", path.display());
+        "contextcrawler init --claude-md"
+    };
+
+    // write_rtk_block handles all 4 cases: add, update, unchanged, malformed.
+    // A malformed CLAUDE.md bails with a diagnostic instead of silently
+    // exiting 0 and skipping the OpenCode plugin step below.
+    let action = write_rtk_block(
+        &path,
+        RTK_INSTRUCTIONS,
+        "contextcrawler instructions",
+        recovery_cmd,
+        ctx,
+    )?;
+
+    if matches!(action, RtkBlockUpsert::Unchanged) {
+        return Ok(());
     }
 
     if global {
@@ -2533,6 +2486,81 @@ fn upsert_rtk_block(content: &str, block: &str) -> (String, RtkBlockUpsert) {
             RtkBlockUpsert::Added,
         )
     }
+}
+
+/// Idempotently write a ContextCrawler-owned marker block into `path`,
+/// preserving user content.
+///
+/// Reads the file (if any), passes it through [`upsert_rtk_block`], and writes
+/// the result back via [`atomic_write`]. Refuses to modify files containing an
+/// opening marker without a matching closing marker (bails with a diagnostic
+/// and the exact `recovery_cmd` to re-run after manual cleanup).
+///
+/// Returns the [`RtkBlockUpsert`] action so callers can branch on whether
+/// anything was actually changed.
+///
+/// `label` is shown in user-facing messages (e.g. `"Copilot instructions"`).
+fn write_rtk_block(
+    path: &Path,
+    block: &str,
+    label: &str,
+    recovery_cmd: &str,
+    ctx: InitContext,
+) -> Result<RtkBlockUpsert> {
+    let InitContext { dry_run, .. } = ctx;
+
+    let existing = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let (new_content, action) = upsert_rtk_block(&existing, block);
+
+    match action {
+        RtkBlockUpsert::Added => {
+            if dry_run {
+                println!("[dry-run] would add {} to {}", label, path.display());
+            } else {
+                atomic_write(path, &new_content)
+                    .with_context(|| format!("Failed to write {}", path.display()))?;
+                println!("[ok] Added {} to {}", label, path.display());
+            }
+        }
+        RtkBlockUpsert::Updated => {
+            if dry_run {
+                println!("[dry-run] would update {} in {}", label, path.display());
+            } else {
+                atomic_write(path, &new_content)
+                    .with_context(|| format!("Failed to write {}", path.display()))?;
+                println!("[ok] Updated {} in {}", label, path.display());
+            }
+        }
+        RtkBlockUpsert::Unchanged => {
+            if !dry_run {
+                println!("[ok] {} already up to date in {}", label, path.display());
+            }
+        }
+        RtkBlockUpsert::Malformed => {
+            eprintln!(
+                "[warn] Found '{}' without closing marker in {}",
+                RTK_BLOCK_START,
+                path.display()
+            );
+            if let Some((line_num, _)) = existing
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(RTK_BLOCK_START))
+            {
+                eprintln!("    Location: line {}", line_num + 1);
+            }
+            eprintln!("    Action: Manually remove the incomplete block, then re-run:");
+            eprintln!("            {recovery_cmd}");
+            anyhow::bail!("Refusing to modify malformed {} at {}", label, path.display());
+        }
+    }
+
+    Ok(action)
 }
 
 /// Patch CLAUDE.md: add @CONTEXTCRAWLER.md, migrate if old block exists
@@ -4051,7 +4079,8 @@ const COPILOT_HOOK_JSON: &str = r#"{
 }
 "#;
 
-const COPILOT_INSTRUCTIONS: &str = r#"# ContextCrawler — Token-Optimized CLI
+const COPILOT_INSTRUCTIONS: &str = r#"<!-- rtk-instructions v3 -->
+# ContextCrawler — Token-Optimized CLI
 
 **contextcrawler** is a CLI proxy that filters and compresses command outputs, saving 60-90% tokens.
 
@@ -4076,31 +4105,45 @@ contextcrawler gain --history    # Per-command savings history
 contextcrawler discover          # Find missed contextcrawler opportunities
 contextcrawler proxy <cmd>       # Run raw (no filtering) but track usage
 ```
+<!-- /rtk-instructions -->
 "#;
 
-/// Entry point for `rtk init --copilot`
+/// Entry point for `contextcrawler init --copilot`.
+///
+/// Installs in the current working directory's `.github/` subdirectory.
 pub fn run_copilot(ctx: InitContext) -> Result<()> {
+    run_copilot_at(Path::new("."), ctx)
+}
+
+/// Same as [`run_copilot`] but operates relative to an explicit base path.
+///
+/// Used by tests to avoid mutating process-global `cwd` (which is racy under
+/// `cargo test`'s default parallel execution).
+fn run_copilot_at(base: &Path, ctx: InitContext) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
-    // Install in current project's .github/ directory
-    let github_dir = Path::new(".github");
+    let github_dir = base.join(".github");
     let hooks_dir = github_dir.join("hooks");
 
     if !dry_run {
-        fs::create_dir_all(&hooks_dir).context("Failed to create .github/hooks/ directory")?;
+        fs::create_dir_all(&hooks_dir)
+            .with_context(|| format!("Failed to create {} directory", hooks_dir.display()))?;
     }
 
-    // 1. Write hook config
-    let hook_path = hooks_dir.join("rtk-rewrite.json");
-    write_if_changed(&hook_path, COPILOT_HOOK_JSON, "Copilot hook config", ctx)?;
-
-    // 2. Write instructions
+    // 1. Upsert RTK marker block in copilot-instructions.md (preserves user content).
+    //    Done BEFORE writing the hook config so a malformed file aborts the install
+    //    without leaving a stale hook on disk.
     let instructions_path = github_dir.join("copilot-instructions.md");
-    write_if_changed(
+    write_rtk_block(
         &instructions_path,
         COPILOT_INSTRUCTIONS,
         "Copilot instructions",
+        "contextcrawler init --copilot",
         ctx,
     )?;
+
+    // 2. Write hook config (only reached if the upsert above succeeded).
+    let hook_path = hooks_dir.join("rtk-rewrite.json");
+    write_if_changed(&hook_path, COPILOT_HOOK_JSON, "Copilot hook config", ctx)?;
 
     if dry_run {
         print_dry_run_footer();
@@ -4156,6 +4199,20 @@ mod tests {
         assert!(
             RTK_INSTRUCTIONS.contains(RTK_BLOCK_END),
             "RTK_INSTRUCTIONS must end with RTK_BLOCK_END marker"
+        );
+    }
+
+    #[test]
+    fn test_copilot_instructions_has_markers() {
+        // Without both markers, `upsert_rtk_block` cannot detect an existing
+        // block and would append a duplicate on every re-init.
+        assert!(
+            COPILOT_INSTRUCTIONS.contains(RTK_BLOCK_START),
+            "COPILOT_INSTRUCTIONS must contain RTK_BLOCK_START marker"
+        );
+        assert!(
+            COPILOT_INSTRUCTIONS.contains(RTK_BLOCK_END),
+            "COPILOT_INSTRUCTIONS must contain RTK_BLOCK_END marker"
         );
     }
 
@@ -6411,5 +6468,210 @@ mod tests {
             !cleaned.contains(RTK_BLOCK_END),
             "RTK end marker must be removed"
         );
+    }
+
+    // --- copilot-instructions.md preservation (port of upstream d108165) ---
+
+    #[test]
+    fn test_copilot_init_preserves_existing_instructions() {
+        // Regression: run_copilot previously truncated a pre-existing
+        // user-authored copilot-instructions.md via write_if_changed.
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        let instructions_path = github_dir.join("copilot-instructions.md");
+        let user_content = "# My Copilot Instructions\n\n\
+            Always respond in Spanish.\n\
+            Never suggest npm; prefer pnpm.\n";
+        fs::write(&instructions_path, user_content).unwrap();
+
+        run_copilot_at(temp.path(), InitContext::default()).unwrap();
+
+        let final_content = fs::read_to_string(&instructions_path).unwrap();
+
+        assert!(
+            final_content.contains("Always respond in Spanish."),
+            "User custom rule was destroyed. Got: {final_content}"
+        );
+        assert!(
+            final_content.contains("Never suggest npm; prefer pnpm."),
+            "User custom rule was destroyed. Got: {final_content}"
+        );
+        assert!(
+            final_content.contains(RTK_BLOCK_START),
+            "RTK block start marker missing"
+        );
+        assert!(
+            final_content.contains(RTK_BLOCK_END),
+            "RTK block end marker missing"
+        );
+    }
+
+    #[test]
+    fn test_copilot_init_idempotent_repeats() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        run_copilot_at(temp.path(), InitContext::default()).unwrap();
+        let after_first = fs::read_to_string(github_dir.join("copilot-instructions.md")).unwrap();
+
+        run_copilot_at(temp.path(), InitContext::default()).unwrap();
+        let after_second = fs::read_to_string(github_dir.join("copilot-instructions.md")).unwrap();
+
+        assert_eq!(
+            after_first, after_second,
+            "Second init must be a no-op (idempotent)"
+        );
+
+        let count_start = after_first.matches(RTK_BLOCK_START).count();
+        let count_end = after_first.matches(RTK_BLOCK_END).count();
+        assert_eq!(
+            count_start, 1,
+            "RTK_BLOCK_START must appear once, got {count_start}"
+        );
+        assert_eq!(count_end, 1, "RTK_BLOCK_END must appear once, got {count_end}");
+    }
+
+    #[test]
+    fn test_copilot_init_updates_stale_block() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        let instructions_path = github_dir.join("copilot-instructions.md");
+        let stale = format!(
+            "# Project rules\n\nUse rg.\n\n{} v2 -->\n# OLD RTK CONTENT\nrtk foo\n{}\n",
+            RTK_BLOCK_START, RTK_BLOCK_END
+        );
+        fs::write(&instructions_path, &stale).unwrap();
+
+        run_copilot_at(temp.path(), InitContext::default()).unwrap();
+
+        let updated = fs::read_to_string(&instructions_path).unwrap();
+
+        assert!(
+            updated.contains("Use rg."),
+            "User content outside the block must be preserved"
+        );
+        assert!(
+            !updated.contains("# OLD RTK CONTENT"),
+            "Stale RTK block content must be removed"
+        );
+        assert!(
+            updated.contains("contextcrawler gain"),
+            "Fresh COPILOT_INSTRUCTIONS content must be present"
+        );
+    }
+
+    #[test]
+    fn test_copilot_init_dry_run_no_write() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        let instructions_path = github_dir.join("copilot-instructions.md");
+        assert!(!instructions_path.exists());
+
+        let ctx = InitContext {
+            dry_run: true,
+            ..InitContext::default()
+        };
+        run_copilot_at(temp.path(), ctx).unwrap();
+
+        assert!(
+            !instructions_path.exists(),
+            "Dry-run must not create copilot-instructions.md"
+        );
+    }
+
+    #[test]
+    fn test_copilot_init_fresh_install_creates_file() {
+        let temp = TempDir::new().unwrap();
+        let instructions_path = temp.path().join(".github").join("copilot-instructions.md");
+        assert!(!instructions_path.exists());
+
+        run_copilot_at(temp.path(), InitContext::default()).unwrap();
+
+        assert!(
+            instructions_path.exists(),
+            "Fresh install must create copilot-instructions.md"
+        );
+        let content = fs::read_to_string(&instructions_path).unwrap();
+        assert!(content.contains(RTK_BLOCK_START), "marker block missing");
+        assert!(content.contains(RTK_BLOCK_END), "end marker missing");
+    }
+
+    #[test]
+    fn test_copilot_init_refuses_malformed_block() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        let instructions_path = github_dir.join("copilot-instructions.md");
+        let malformed = format!("# My rules\n\n{}\nincomplete RTK block\n", RTK_BLOCK_START);
+        fs::write(&instructions_path, &malformed).unwrap();
+
+        let result = run_copilot_at(temp.path(), InitContext::default());
+
+        assert!(
+            result.is_err(),
+            "Malformed file must cause a hard error, not a silent rewrite"
+        );
+        let after = fs::read_to_string(&instructions_path).unwrap();
+        assert_eq!(after, malformed, "Malformed file must not be modified");
+    }
+
+    #[test]
+    fn test_copilot_init_malformed_leaves_no_hook_on_disk() {
+        // The upsert runs before the hook config is written, so a malformed
+        // copilot-instructions.md must abort the install before any hook
+        // config lands on disk.
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        let instructions_path = github_dir.join("copilot-instructions.md");
+        let malformed = format!("# My rules\n\n{}\nincomplete RTK block\n", RTK_BLOCK_START);
+        fs::write(&instructions_path, &malformed).unwrap();
+
+        let hook_path = github_dir.join("hooks").join("rtk-rewrite.json");
+
+        let result = run_copilot_at(temp.path(), InitContext::default());
+
+        assert!(result.is_err(), "Malformed file must cause a hard error");
+        assert!(
+            !hook_path.exists(),
+            "Hook config must not be written when the upsert aborts: {}",
+            hook_path.display()
+        );
+    }
+
+    #[test]
+    fn test_claude_md_mode_refuses_malformed_block() {
+        // Mirrors `test_copilot_init_refuses_malformed_block`: a malformed
+        // CLAUDE.md previously emitted a warning and exited 0, silently
+        // skipping the OpenCode plugin step. The shared `write_rtk_block`
+        // dispatcher now bails for both paths.
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let claude_md = claude_dir.join(CLAUDE_MD);
+            let malformed = format!(
+                "# Existing notes\n\n{}\nincomplete RTK block\n",
+                RTK_BLOCK_START
+            );
+            fs::write(&claude_md, &malformed).unwrap();
+
+            let result = run_claude_md_mode(true, false, InitContext::default());
+
+            assert!(
+                result.is_err(),
+                "Malformed CLAUDE.md must cause a hard error, not silent skip"
+            );
+
+            let after = fs::read_to_string(&claude_md).unwrap();
+            assert_eq!(after, malformed, "File must not be modified when malformed");
+        });
     }
 }
