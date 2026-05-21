@@ -81,17 +81,27 @@ fn analyze_logs(content: &str) -> String {
         let normalized =
             normalize_log_line(line, &TIMESTAMP_RE, &UUID_RE, &HEX_RE, &NUM_RE, &PATH_RE);
 
-        // Categorize
+        // Categorize. The error bucket also covers severity labels above ERROR
+        // (CRITICAL, FATAL, ALERT, EMERGENCY, SEVERE, PANIC) — these are the
+        // most important lines in a log and were previously dropped as noise
+        // when they didn't literally contain "error".
         if line_lower.contains("error")
             || line_lower.contains("fatal")
             || line_lower.contains("panic")
+            || line_lower.contains("critical")
+            // `alert` is a substring match — it will also catch `alertmanager`,
+            // `alerting`, etc. This is an accepted trade-off: missing a CRITICAL
+            // line is worse than inflating the error count with a false positive.
+            || line_lower.contains("alert")
+            || line_lower.contains("emerg")
+            || line_lower.contains("severe")
         {
             let count = error_counts.entry(normalized.clone()).or_insert(0);
             if *count == 0 {
                 unique_errors.push(line.to_string());
             }
             *count += 1;
-        } else if line_lower.contains("warn") {
+        } else if line_lower.contains("warn") || line_lower.contains("notice") {
             let count = warn_counts.entry(normalized.clone()).or_insert(0);
             if *count == 0 {
                 unique_warnings.push(line.to_string());
@@ -237,6 +247,36 @@ mod tests {
         let result = analyze_logs(logs);
         assert!(result.contains("×3"));
         assert!(result.contains("ERRORS"));
+    }
+
+    #[test]
+    fn test_high_severity_labels_survive() {
+        // CRITICAL/FATAL/ALERT/EMERGENCY/SEVERE/PANIC lines were previously
+        // dropped because they don't literally contain "error". They are the
+        // most important lines in a log and must survive filtering.
+        let logs = "\
+2024-01-01 10:00:00 CRITICAL: database unreachable
+2024-01-01 10:00:01 FATAL: out of memory
+2024-01-01 10:00:02 SEVERE: disk corruption detected
+2024-01-01 10:00:03 ALERT: intrusion attempt
+2024-01-01 10:00:04 EMERGENCY: system shutdown
+2024-01-01 10:00:05 NOTICE: config reloaded
+2024-01-01 10:00:06 INFO: routine heartbeat
+";
+        let result = analyze_logs(logs);
+        assert!(result.contains("CRITICAL"), "CRITICAL line dropped");
+        assert!(result.contains("FATAL"), "FATAL line dropped");
+        assert!(result.contains("SEVERE"), "SEVERE line dropped");
+        assert!(result.contains("ALERT"), "ALERT line dropped");
+        assert!(result.contains("EMERGENCY"), "EMERGENCY line dropped");
+        // NOTICE is routed to the warning bucket.
+        assert!(result.contains("NOTICE"), "NOTICE line dropped");
+        // All five high-severity lines land in the error bucket. Accept either
+        // count rendering so the assertion is not tied to one format string.
+        assert!(
+            result.contains("5 errors") || result.contains("[error] 5"),
+            "expected error count of 5, got: {result}"
+        );
     }
 
     #[test]

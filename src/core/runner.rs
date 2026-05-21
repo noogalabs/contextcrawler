@@ -52,6 +52,10 @@ pub struct RunOptions<'a> {
     pub filter_stdout_only: bool,
     pub skip_filter_on_failure: bool,
     pub no_trailing_newline: bool,
+    /// Forward contextcrawler's own stdin to the child process. Needed for
+    /// commands that can read from a pipe (e.g. `cat file | contextcrawler wc`);
+    /// without it the child gets an empty stdin and reports zero.
+    pub inherit_stdin: bool,
 }
 
 impl<'a> RunOptions<'a> {
@@ -83,6 +87,11 @@ impl<'a> RunOptions<'a> {
         self.no_trailing_newline = true;
         self
     }
+
+    pub fn inherit_stdin(mut self) -> Self {
+        self.inherit_stdin = true;
+        self
+    }
 }
 
 pub enum RunMode<'a> {
@@ -103,7 +112,12 @@ pub fn run(
 
     match mode {
         RunMode::Filtered(filter_fn) => {
-            let result = stream::run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly)
+            let stdin_mode = if opts.inherit_stdin {
+                StdinMode::Inherit
+            } else {
+                StdinMode::Null
+            };
+            let result = stream::run_streaming(&mut cmd, stdin_mode, FilterMode::CaptureOnly)
                 .with_context(|| format!("Failed to run {}", tool_name))?;
 
             let exit_code = result.exit_code;
@@ -157,8 +171,13 @@ pub fn run(
             Ok(exit_code)
         }
         RunMode::Streamed(filter) => {
+            let stdin_mode = if opts.inherit_stdin {
+                StdinMode::Inherit
+            } else {
+                StdinMode::Null
+            };
             let result =
-                stream::run_streaming(&mut cmd, StdinMode::Null, FilterMode::Streaming(filter))
+                stream::run_streaming(&mut cmd, stdin_mode, FilterMode::Streaming(filter))
                     .with_context(|| format!("Failed to run {}", tool_name))?;
 
             if let Some(label) = opts.tee_label {

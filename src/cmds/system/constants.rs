@@ -14,8 +14,9 @@ pub const NOISE_DIRS: &[&str] = &[
     ".tox",
     ".venv",
     "venv",
+    // `.env` is intentionally NOT noise: agents need to see it exists. `env`
+    // below (a Python virtualenv dir) stays hidden.
     "env",
-    ".env",
     "coverage",
     ".nyc_output",
     ".DS_Store",

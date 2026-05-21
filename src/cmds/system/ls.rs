@@ -317,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_shows_dotenv_file_but_hides_env_dir() {
+        // `.env` is intentionally visible to agents; `env/` (Python venv) stays
+        // hidden as noise even without -a.
+        let input = "total 8\n\
+                     drwxr-xr-x  2 user  staff  64 Jan  1 12:00 env\n\
+                     -rw-r--r--  1 user  staff  100 Jan  1 12:00 .env\n\
+                     -rw-r--r--  1 user  staff  100 Jan  1 12:00 main.rs\n";
+        let (entries, _summary, _) = compact_ls(input, false);
+        assert!(entries.contains(".env"), "`.env` should be visible");
+        assert!(!entries.contains("env/"), "`env/` dir should stay hidden");
+        assert!(entries.contains("main.rs"));
+    }
+
+    #[test]
     fn test_compact_show_all() {
         let input = "total 8\n\
                      drwxr-xr-x  2 user  staff  64 Jan  1 12:00 .git\n\
