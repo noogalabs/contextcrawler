@@ -1443,10 +1443,13 @@ fn lexically_normalize(path: &std::path::Path) -> PathBuf {
 /// Confine a config-supplied DB path to the user's home directory.
 ///
 /// The DB file itself may not exist yet, so we canonicalise the deepest
-/// existing ancestor and append the remainder. `..`/`.` components are
-/// resolved lexically first so a traversal segment in the non-existent tail
-/// cannot escape the containment check. If the resolved path escapes `$HOME`
-/// the path is rejected.
+/// existing ancestor and append the non-existent tail. Canonicalisation runs
+/// FIRST — before any lexical `..` resolution — so a symlink in the existing
+/// prefix is resolved to its real destination *before* a trailing `..` is
+/// allowed to act on it. Resolving `..` lexically up front would textually
+/// cancel a `symlink/..` pair and hide the escape from `canonicalize()`. Only
+/// after the walk has resolved symlinks do we lexically collapse whatever
+/// `..`/`.` survive in the tail, then run the `$HOME` containment check.
 fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
     let home = match dirs::home_dir().and_then(|h| h.canonicalize().ok()) {
         Some(h) => h,
@@ -1458,17 +1461,9 @@ fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
         }
     };
 
-    // Lexically resolve `.`/`..` segments BEFORE walking the filesystem.
-    // The ancestor walk below drops `..` components (`Path::file_name()`
-    // returns `None` for them), so a traversal segment in the non-existent
-    // tail — e.g. `$HOME/sub/../../evil.db` — would otherwise be silently
-    // discarded and the escape would slip past the containment check.
-    // Normalising first leaves a path with no `..`/`.` segments to lose.
-    let db_path = lexically_normalize(&db_path);
-
     // Canonicalise the deepest existing ancestor, re-attaching the tail.
-    // This still resolves symlinks in the existing prefix, preserving the
-    // symlink-escape protection.
+    // This resolves every symlink in the existing prefix to its real path
+    // before a trailing `..` can act on it.
     let mut existing = db_path.as_path();
     let mut tail = PathBuf::new();
     let resolved = loop {
@@ -1477,8 +1472,12 @@ fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
         }
         match existing.parent() {
             Some(p) => {
-                if let Some(name) = existing.file_name() {
-                    tail = PathBuf::from(name).join(&tail);
+                // Capture the trailing component via `Components`, not
+                // `file_name()` — the latter returns `None` for `..`/`.`,
+                // which would silently drop a traversal segment from the
+                // non-existent tail and defeat the containment check.
+                if let Some(comp) = existing.components().next_back() {
+                    tail = PathBuf::from(comp.as_os_str()).join(&tail);
                 }
                 existing = p;
             }
@@ -1486,8 +1485,9 @@ fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
         }
     };
 
-    // Re-normalise: canonicalising the ancestor may have introduced a
-    // symlink target containing `..` (defence in depth).
+    // Now — and only now, with symlinks already resolved — lexically collapse
+    // any `..`/`.` that survived in the non-existent tail (or arrived via a
+    // canonicalised symlink target).
     let resolved = lexically_normalize(&resolved);
 
     if !resolved.starts_with(&home) {
@@ -2284,6 +2284,43 @@ mod tests {
             Some(v) => env::set_var("RTK_DB_PATH", v),
             None => env::remove_var("RTK_DB_PATH"),
         }
+    }
+
+    // #111 G3 Codex re-review: a symlink inside $HOME pointing OUT of $HOME,
+    // followed by `..`, must not slip past containment. The earlier follow-up
+    // resolved `..` lexically *before* canonicalisation — that textually
+    // cancelled the `symlink/..` pair and hid the escape. Canonicalisation now
+    // runs first, so the symlink is resolved to its real (outside) target
+    // before the trailing `..` acts on it.
+    #[cfg(unix)]
+    #[test]
+    fn test_rtk_db_path_symlink_escape_is_rejected() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var("RTK_DB_PATH").ok();
+        let home = dirs::home_dir().expect("home dir");
+
+        // A symlink inside $HOME whose target is outside $HOME.
+        let link = home.join(format!("cc-symtest-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/tmp", &link).expect("create symlink");
+
+        // `$HOME/<link>/../x.db` — the OS resolves <link> to /tmp, then `..`
+        // to / , landing at /x.db OUTSIDE $HOME.
+        let escape = link.join("..").join("x.db");
+        env::set_var("RTK_DB_PATH", &escape);
+        let result = get_db_path();
+
+        let _ = std::fs::remove_file(&link);
+        match prior {
+            Some(v) => env::set_var("RTK_DB_PATH", v),
+            None => env::remove_var("RTK_DB_PATH"),
+        }
+
+        assert!(
+            result.is_err(),
+            "RTK_DB_PATH escaping $HOME via a symlink + `..` must be rejected, got: {result:?}"
+        );
     }
 
     // 9. project_filter_params uses GLOB pattern with * wildcard // added
