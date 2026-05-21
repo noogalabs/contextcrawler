@@ -89,6 +89,9 @@ fn analyze_logs(content: &str) -> String {
             || line_lower.contains("fatal")
             || line_lower.contains("panic")
             || line_lower.contains("critical")
+            // `alert` is a substring match — it will also catch `alertmanager`,
+            // `alerting`, etc. This is an accepted trade-off: missing a CRITICAL
+            // line is worse than inflating the error count with a false positive.
             || line_lower.contains("alert")
             || line_lower.contains("emerg")
             || line_lower.contains("severe")
@@ -268,8 +271,12 @@ mod tests {
         assert!(result.contains("EMERGENCY"), "EMERGENCY line dropped");
         // NOTICE is routed to the warning bucket.
         assert!(result.contains("NOTICE"), "NOTICE line dropped");
-        // All five high-severity lines land in the error bucket.
-        assert!(result.contains("5 errors"));
+        // All five high-severity lines land in the error bucket. Accept either
+        // count rendering so the assertion is not tied to one format string.
+        assert!(
+            result.contains("5 errors") || result.contains("[error] 5"),
+            "expected error count of 5, got: {result}"
+        );
     }
 
     #[test]

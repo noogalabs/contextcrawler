@@ -2689,6 +2689,25 @@ mod tests {
     }
 
     #[test]
+    fn test_detached_head_clean_tree_keeps_sha() {
+        // Detached HEAD with a CLEAN working tree: porcelain `-b` still emits
+        // the opaque "## HEAD (no branch)" and no file lines. The explicit
+        // "HEAD detached at <sha>" from the plain status must still survive,
+        // so a clean detached checkout never regresses to the opaque line.
+        let porcelain = "## HEAD (no branch)\n";
+        let raw = "HEAD detached at 9f8e7d6\nnothing to commit, working tree clean\n";
+        let mut formatted = format_status_output(porcelain);
+        if let Some(detached) = extract_detached_head(raw) {
+            formatted = formatted.replacen("* HEAD (no branch)", &format!("* {detached}"), 1);
+        }
+        assert!(
+            formatted.contains("HEAD detached at 9f8e7d6"),
+            "detached SHA lost on clean tree: {formatted}"
+        );
+        assert!(!formatted.contains("(no branch)"), "opaque line survived");
+    }
+
+    #[test]
     fn test_extract_state_header_clean_returns_none() {
         let raw = "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n";
         assert_eq!(extract_state_header(raw), None);

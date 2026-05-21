@@ -43,6 +43,9 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 /// `wc` reads from stdin when no positional file operand is given (every arg is
 /// a flag).
 fn reads_stdin(args: &[String]) -> bool {
+    // TODO: `wc -` and `wc --files-from=-` are explicit stdin indicators that
+    // are not detected here — `-` is treated as a flag and `--files-from=-`
+    // names stdin as the operand source. Faithful to upstream's gap; flagged.
     !args.iter().any(|a| !a.starts_with('-'))
 }
 

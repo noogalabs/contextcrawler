@@ -171,8 +171,13 @@ pub fn run(
             Ok(exit_code)
         }
         RunMode::Streamed(filter) => {
+            let stdin_mode = if opts.inherit_stdin {
+                StdinMode::Inherit
+            } else {
+                StdinMode::Null
+            };
             let result =
-                stream::run_streaming(&mut cmd, StdinMode::Null, FilterMode::Streaming(filter))
+                stream::run_streaming(&mut cmd, stdin_mode, FilterMode::Streaming(filter))
                     .with_context(|| format!("Failed to run {}", tool_name))?;
 
             if let Some(label) = opts.tee_label {
