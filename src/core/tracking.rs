@@ -1377,8 +1377,12 @@ fn categorize_command(rtk_cmd: &str) -> String {
 fn get_db_path() -> Result<PathBuf> {
     // Priority 1: Environment variable RTK_DB_PATH (also acts as the explicit
     // opt-in for `cargo test` runs that want to exercise real writes).
+    //
+    // The env value is attacker-influenceable (a hostile project `.envrc` /
+    // direnv can set process env), so it is confined to $HOME just like the
+    // config-supplied path — and consistent with `RTK_TEE_DIR` (tee.rs).
     if let Ok(custom_path) = std::env::var("RTK_DB_PATH") {
-        return Ok(PathBuf::from(custom_path));
+        return confine_db_path_to_home(PathBuf::from(custom_path));
     }
 
     // Issue #91: when running under `cargo test`, redirect to a per-process
@@ -1407,11 +1411,45 @@ fn get_db_path() -> Result<PathBuf> {
     Ok(data_dir.join(RTK_DATA_DIR).join(HISTORY_DB))
 }
 
+/// Lexically resolve `.` and `..` components in a path without touching the
+/// filesystem. `..` pops the last normal segment; `.` is dropped; the root /
+/// prefix is preserved. This closes a traversal bypass where a `..` lands in
+/// the non-existent tail of a candidate path and so survives canonicalisation
+/// of the deepest *existing* ancestor.
+fn lexically_normalize(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match out.last() {
+                    // Pop a preceding normal segment.
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    // Cannot ascend past a root/prefix — drop the `..`.
+                    Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                    // Leading `..` on a relative path: keep it.
+                    _ => out.push(comp),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out.iter().map(|c| c.as_os_str()).collect()
+}
+
 /// Confine a config-supplied DB path to the user's home directory.
 ///
 /// The DB file itself may not exist yet, so we canonicalise the deepest
-/// existing ancestor and append the remainder. If the resolved path escapes
-/// `$HOME` the path is rejected.
+/// existing ancestor and append the non-existent tail. Canonicalisation runs
+/// FIRST — before any lexical `..` resolution — so a symlink in the existing
+/// prefix is resolved to its real destination *before* a trailing `..` is
+/// allowed to act on it. Resolving `..` lexically up front would textually
+/// cancel a `symlink/..` pair and hide the escape from `canonicalize()`. Only
+/// after the walk has resolved symlinks do we lexically collapse whatever
+/// `..`/`.` survive in the tail, then run the `$HOME` containment check.
 fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
     let home = match dirs::home_dir().and_then(|h| h.canonicalize().ok()) {
         Some(h) => h,
@@ -1424,6 +1462,8 @@ fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
     };
 
     // Canonicalise the deepest existing ancestor, re-attaching the tail.
+    // This resolves every symlink in the existing prefix to its real path
+    // before a trailing `..` can act on it.
     let mut existing = db_path.as_path();
     let mut tail = PathBuf::new();
     let resolved = loop {
@@ -1432,14 +1472,23 @@ fn confine_db_path_to_home(db_path: PathBuf) -> Result<PathBuf> {
         }
         match existing.parent() {
             Some(p) => {
-                if let Some(name) = existing.file_name() {
-                    tail = PathBuf::from(name).join(&tail);
+                // Capture the trailing component via `Components`, not
+                // `file_name()` — the latter returns `None` for `..`/`.`,
+                // which would silently drop a traversal segment from the
+                // non-existent tail and defeat the containment check.
+                if let Some(comp) = existing.components().next_back() {
+                    tail = PathBuf::from(comp.as_os_str()).join(&tail);
                 }
                 existing = p;
             }
             None => break db_path.clone(),
         }
     };
+
+    // Now — and only now, with symlinks already resolved — lexically collapse
+    // any `..`/`.` that survived in the non-existent tail (or arrived via a
+    // canonicalised symlink target).
+    let resolved = lexically_normalize(&resolved);
 
     if !resolved.starts_with(&home) {
         anyhow::bail!(
@@ -2034,7 +2083,11 @@ mod tests {
     impl PinnedDb {
         fn new(label: &str) -> Self {
             let prior = std::env::var("RTK_DB_PATH").ok();
-            let path = std::env::temp_dir().join(unique_marker(label) + ".db");
+            // RTK_DB_PATH is confined to $HOME (#111 G3), so the pinned
+            // tempfile must live inside $HOME — `temp_dir()` is typically
+            // outside it and would be rejected by `get_db_path()`.
+            let dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+            let path = dir.join(unique_marker(label) + ".db");
             std::env::set_var("RTK_DB_PATH", &path);
             PinnedDb { path, prior }
         }
@@ -2108,7 +2161,11 @@ mod tests {
         use std::env;
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let custom_path = env::temp_dir().join("rtk_test_custom.db");
+        // RTK_DB_PATH is now confined to $HOME (G3 audit #111), so the test
+        // path must live inside $HOME or get_db_path() would reject it.
+        let custom_path = dirs::home_dir()
+            .expect("home dir")
+            .join(format!("rtk_test_custom-{}.db", std::process::id()));
         env::set_var("RTK_DB_PATH", &custom_path);
         let db_path = get_db_path().expect("Failed to get db path");
         assert_eq!(db_path, custom_path);
@@ -2127,6 +2184,142 @@ mod tests {
         assert!(
             !s.ends_with("rtk/history.db"),
             "must not resolve to production history.db under cargo test, got: {s}"
+        );
+    }
+
+    // #111 G3: RTK_DB_PATH is attacker-influenceable (hostile .envrc/direnv),
+    // so a value resolving outside $HOME must be rejected — same confinement
+    // as the config-supplied path and RTK_TEE_DIR.
+    #[test]
+    fn test_rtk_db_path_outside_home_is_rejected() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var("RTK_DB_PATH").ok();
+
+        // An absolute path that exists and is outside $HOME.
+        env::set_var("RTK_DB_PATH", "/tmp/contextcrawler-escape.db");
+        let result = get_db_path();
+        assert!(
+            result.is_err(),
+            "RTK_DB_PATH outside $HOME must be rejected, got: {result:?}"
+        );
+
+        match prior {
+            Some(v) => env::set_var("RTK_DB_PATH", v),
+            None => env::remove_var("RTK_DB_PATH"),
+        }
+    }
+
+    // #111 G3: an RTK_DB_PATH already inside $HOME is preserved unchanged.
+    #[test]
+    fn test_rtk_db_path_inside_home_is_preserved() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var("RTK_DB_PATH").ok();
+
+        let inside = dirs::home_dir()
+            .expect("home dir")
+            .join(format!("contextcrawler-confine-{}.db", std::process::id()));
+        env::set_var("RTK_DB_PATH", &inside);
+        let resolved = get_db_path().expect("RTK_DB_PATH inside $HOME must resolve");
+        assert_eq!(
+            resolved, inside,
+            "a path already inside $HOME must be returned unchanged"
+        );
+
+        match prior {
+            Some(v) => env::set_var("RTK_DB_PATH", v),
+            None => env::remove_var("RTK_DB_PATH"),
+        }
+    }
+
+    // #111 G3 follow-up: a `..` in the non-existent tail must not escape $HOME.
+    #[test]
+    fn test_rtk_db_path_dotdot_escape_is_rejected() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var("RTK_DB_PATH").ok();
+        let home = dirs::home_dir().expect("home dir");
+
+        for escape in [
+            home.join("sub").join("..").join("..").join("evil.db"),
+            home.join("..").join("evil.db"),
+            home.join("a").join("b").join("..").join("..").join("..").join("x"),
+        ] {
+            env::set_var("RTK_DB_PATH", &escape);
+            let result = get_db_path();
+            assert!(
+                result.is_err(),
+                "RTK_DB_PATH escaping $HOME via `..` must be rejected, got: {result:?} for {}",
+                escape.display()
+            );
+        }
+
+        match prior {
+            Some(v) => env::set_var("RTK_DB_PATH", v),
+            None => env::remove_var("RTK_DB_PATH"),
+        }
+    }
+
+    // #111 G3 follow-up: a `..` that stays inside $HOME resolves and is allowed.
+    #[test]
+    fn test_rtk_db_path_dotdot_inside_home_is_resolved() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var("RTK_DB_PATH").ok();
+        let home = dirs::home_dir().expect("home dir");
+
+        let name = format!("contextcrawler-dotdot-{}.db", std::process::id());
+        let with_dotdot = home.join("sub").join("..").join(&name);
+        env::set_var("RTK_DB_PATH", &with_dotdot);
+        let resolved =
+            get_db_path().expect("a `..` staying inside $HOME must resolve");
+        assert_eq!(
+            resolved,
+            home.join(&name),
+            "`$HOME/sub/../{name}` must resolve to `$HOME/{name}`"
+        );
+
+        match prior {
+            Some(v) => env::set_var("RTK_DB_PATH", v),
+            None => env::remove_var("RTK_DB_PATH"),
+        }
+    }
+
+    // #111 G3 Codex re-review: a symlink inside $HOME pointing OUT of $HOME,
+    // followed by `..`, must not slip past containment. The earlier follow-up
+    // resolved `..` lexically *before* canonicalisation — that textually
+    // cancelled the `symlink/..` pair and hid the escape. Canonicalisation now
+    // runs first, so the symlink is resolved to its real (outside) target
+    // before the trailing `..` acts on it.
+    #[cfg(unix)]
+    #[test]
+    fn test_rtk_db_path_symlink_escape_is_rejected() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var("RTK_DB_PATH").ok();
+        let home = dirs::home_dir().expect("home dir");
+
+        // A symlink inside $HOME whose target is outside $HOME.
+        let link = home.join(format!("cc-symtest-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/tmp", &link).expect("create symlink");
+
+        // `$HOME/<link>/../x.db` — the OS resolves <link> to /tmp, then `..`
+        // to / , landing at /x.db OUTSIDE $HOME.
+        let escape = link.join("..").join("x.db");
+        env::set_var("RTK_DB_PATH", &escape);
+        let result = get_db_path();
+
+        let _ = std::fs::remove_file(&link);
+        match prior {
+            Some(v) => env::set_var("RTK_DB_PATH", v),
+            None => env::remove_var("RTK_DB_PATH"),
+        }
+
+        assert!(
+            result.is_err(),
+            "RTK_DB_PATH escaping $HOME via a symlink + `..` must be rejected, got: {result:?}"
         );
     }
 
@@ -2283,7 +2476,9 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RTK_DB_PATH").ok();
 
-        let tmp = std::env::temp_dir().join(format!(
+        // RTK_DB_PATH is confined to $HOME (G3 audit #111) — keep the opt-in
+        // DB inside $HOME so get_db_path() resolves it unchanged.
+        let tmp = dirs::home_dir().expect("home dir").join(format!(
             "contextcrawler-optin-{}.db",
             std::process::id()
         ));

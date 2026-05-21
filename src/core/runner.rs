@@ -17,10 +17,15 @@ pub fn print_with_hint(filtered: &str, raw: &str, tee_label: &str, exit_code: i3
 /// No-bloat guard: a filter must never cost more than it saves.
 ///
 /// Given the `baseline` a filter is tracked against and the `filtered`
-/// output the filter produced, return whichever is smaller (by byte length).
+/// output the filter produced, return whichever costs fewer *tokens*.
 /// When the filtered form is the same size or larger than the baseline,
 /// the wrapper has added framing/summary without saving anything — in that
 /// case the raw baseline is returned so the caller emits *and* tracks it.
+///
+/// The comparison uses [`tracking::estimate_tokens`], the same unit
+/// `TimedExecution::track` records savings in (#111 G3). Comparing by byte
+/// length here while tracking measured tokens could let the emitted text and
+/// the recorded savings disagree on direction — this keeps them consistent.
 ///
 /// Callers MUST emit exactly the returned string and pass that same value
 /// to `timer.track(..)` as the output, so what the user sees and what the
@@ -31,9 +36,10 @@ pub fn print_with_hint(filtered: &str, raw: &str, tee_label: &str, exit_code: i3
 /// synthetic baseline (e.g. `git add` tracks against `git diff --cached
 /// --stat`, issue #89) it is that synthetic string. The guard compares the
 /// filtered output against that same baseline, so an intentional compact
-/// summary that is smaller than its synthetic baseline survives untouched.
+/// summary that costs fewer tokens than its synthetic baseline survives
+/// untouched.
 pub fn no_bloat<'a>(baseline: &'a str, filtered: &'a str) -> &'a str {
-    if filtered.len() >= baseline.len() {
+    if tracking::estimate_tokens(filtered) >= tracking::estimate_tokens(baseline) {
         baseline
     } else {
         filtered
@@ -306,5 +312,39 @@ mod tests {
         let compact = "ok 3 files changed, 64 insertions(+), 8 deletions(-)";
         assert!(compact.len() < synthetic_baseline.len());
         assert_eq!(no_bloat(synthetic_baseline, compact), compact);
+    }
+
+    #[test]
+    fn no_bloat_picks_lower_token_output_when_bytes_disagree() {
+        // #111 G3: `no_bloat` must compare the same unit `track()` records
+        // (estimated tokens), not raw bytes. Here `filtered` is fewer bytes
+        // than `baseline` but the byte saving rounds away — both estimate to
+        // the SAME token count. A byte comparison would (wrongly) claim the
+        // filter saved something and emit `filtered`; the token comparison
+        // sees no real saving and emits `baseline`, matching what tracking
+        // would record (0 tokens saved).
+        let baseline = "abcdefgh"; // 8 bytes  -> 2 tokens
+        let filtered = "abcde"; //    5 bytes  -> 2 tokens
+        // Bytes and tokens disagree on direction:
+        assert!(filtered.len() < baseline.len(), "filtered is fewer bytes");
+        assert_eq!(
+            tracking::estimate_tokens(filtered),
+            tracking::estimate_tokens(baseline),
+            "but both estimate to the same token count"
+        );
+        // Byte-based comparison would have returned `filtered`; the
+        // token-based guard returns `baseline` so emit and tracking agree.
+        assert_eq!(no_bloat(baseline, filtered), baseline);
+    }
+
+    #[test]
+    fn no_bloat_keeps_filtered_when_it_saves_tokens() {
+        // Sanity: a genuine token saving still keeps the filtered output.
+        let baseline = "this is a long noisy line of command output";
+        let filtered = "3 lines";
+        assert!(
+            tracking::estimate_tokens(filtered) < tracking::estimate_tokens(baseline)
+        );
+        assert_eq!(no_bloat(baseline, filtered), filtered);
     }
 }
