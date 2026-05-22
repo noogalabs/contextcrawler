@@ -259,6 +259,51 @@ pub struct GainSummary {
     pub by_day: Vec<(String, usize)>,
 }
 
+/// One tool's token-leak profile for `gain --weak-filters`.
+///
+/// "Leaked" tokens are input that reached the model unfiltered
+/// (`input - saved`). A high leak paired with a low [`savings_pct`] marks a
+/// filter worth improving — or a command with no filter worth building.
+///
+/// [`savings_pct`]: WeakFilter::savings_pct
+#[derive(Debug, Clone, Serialize)]
+pub struct WeakFilter {
+    /// Tool key (e.g. "read", "git log").
+    pub tool: String,
+    /// Number of recorded runs for this tool.
+    pub runs: usize,
+    /// Total input tokens seen by this tool.
+    pub input_tokens: usize,
+    /// Tokens that reached the model unfiltered (`input - saved`).
+    pub leaked_tokens: usize,
+    /// Volume-weighted savings percentage (`saved / input * 100`).
+    pub savings_pct: f64,
+}
+
+/// Collapse a tracked command into a "tool" key for weak-filter ranking.
+///
+/// Strips the `contextcrawler `/`rtk ` prefix, then keeps the base command
+/// plus its subcommand when the second token looks like one (`git log`,
+/// `cargo test`) rather than a flag or a path (`read src/main.rs` → `read`).
+fn weak_filter_tool_key(rtk_cmd: &str) -> String {
+    let cmd = rtk_cmd
+        .strip_prefix("contextcrawler ")
+        .or_else(|| rtk_cmd.strip_prefix("rtk "))
+        .unwrap_or(rtk_cmd);
+    let mut words = cmd.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    match words.next() {
+        Some(second)
+            if !second.starts_with('-') && !second.contains('/') && !second.contains('.') =>
+        {
+            format!("{first} {second}")
+        }
+        _ => first.to_string(),
+    }
+}
+
 /// Daily statistics for token savings and execution metrics.
 ///
 /// Serializable to JSON for export via `rtk gain --daily --format json`.
@@ -849,6 +894,60 @@ impl Tracker {
         })?;
 
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Rank tools by leaked tokens for `gain --weak-filters`.
+    ///
+    /// Aggregates recorded commands into tool buckets (see
+    /// [`weak_filter_tool_key`]), computes how many input tokens reached the
+    /// model unfiltered, and sorts highest-leak first. Passthrough rows
+    /// (0 input) contribute nothing and drop out — so a command that is
+    /// always passthrough never appears.
+    pub fn get_weak_filters(&self, project_path: Option<&str>) -> Result<Vec<WeakFilter>> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+        let mut stmt = self.conn.prepare(
+            "SELECT rtk_cmd, COUNT(*), SUM(input_tokens), SUM(saved_tokens)
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY rtk_cmd",
+        )?;
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as usize,
+            ))
+        })?;
+
+        // Re-aggregate the per-command-string rows into tool buckets.
+        let mut tools: std::collections::HashMap<String, (usize, usize, usize)> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (rtk_cmd, runs, input, saved) = row?;
+            let key = weak_filter_tool_key(&rtk_cmd);
+            if key.is_empty() {
+                continue;
+            }
+            let entry = tools.entry(key).or_insert((0, 0, 0));
+            entry.0 += runs;
+            entry.1 += input;
+            entry.2 += saved;
+        }
+
+        let mut result: Vec<WeakFilter> = tools
+            .into_iter()
+            .filter(|(_, (_, input, _))| *input > 0)
+            .map(|(tool, (runs, input, saved))| WeakFilter {
+                tool,
+                runs,
+                input_tokens: input,
+                leaked_tokens: input.saturating_sub(saved),
+                savings_pct: saved as f64 * 100.0 / input as f64,
+            })
+            .collect();
+        result.sort_by_key(|w| std::cmp::Reverse(w.leaked_tokens));
+        Ok(result)
     }
 
     fn get_by_day(
@@ -2644,5 +2743,69 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
             .expect("Failed to count");
         assert_eq!(total, 1, "old row should be pruned, fresh row retained");
+    }
+
+    #[test]
+    fn test_weak_filter_tool_key() {
+        assert_eq!(
+            weak_filter_tool_key("contextcrawler git log --oneline -5"),
+            "git log"
+        );
+        assert_eq!(weak_filter_tool_key("rtk cargo test"), "cargo test");
+        // Second token is a path → just the base command.
+        assert_eq!(
+            weak_filter_tool_key("contextcrawler read src/main.rs"),
+            "read"
+        );
+        // Second token is a flag → just the base command.
+        assert_eq!(weak_filter_tool_key("contextcrawler grep -r foo"), "grep");
+        assert_eq!(weak_filter_tool_key("contextcrawler ls"), "ls");
+        assert_eq!(weak_filter_tool_key(""), "");
+    }
+
+    #[test]
+    fn test_get_weak_filters_ranks_by_leak() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+
+        // `read`: high input, low savings → the biggest leaker.
+        for _ in 0..3 {
+            tracker
+                .record("read f.rs", "contextcrawler read f.rs", 1000, 900, 1)
+                .expect("record read");
+        }
+        // `cargo test`: lower input, high savings → a small leak.
+        tracker
+            .record("cargo test", "contextcrawler cargo test", 500, 50, 1)
+            .expect("record cargo");
+        // `git log --oneline`: passthrough (0/0) → must not appear at all.
+        tracker
+            .record(
+                "git log --oneline",
+                "contextcrawler git log --oneline",
+                0,
+                0,
+                1,
+            )
+            .expect("record passthrough");
+
+        let weak = tracker
+            .get_weak_filters(None)
+            .expect("Failed to load weak filters");
+
+        // read leaks 3 × (1000 input − 100 saved) = 2700; cargo leaks 50.
+        assert_eq!(weak[0].tool, "read", "biggest leaker must rank first");
+        assert_eq!(weak[0].runs, 3);
+        assert_eq!(weak[0].input_tokens, 3000);
+        assert_eq!(weak[0].leaked_tokens, 2700);
+        assert!((weak[0].savings_pct - 10.0).abs() < 0.01);
+
+        assert!(
+            weak.iter().any(|w| w.tool == "cargo test"),
+            "cargo test should still be listed (it leaks a little)"
+        );
+        assert!(
+            !weak.iter().any(|w| w.tool.starts_with("git")),
+            "a passthrough-only tool (0 input) must be excluded"
+        );
     }
 }

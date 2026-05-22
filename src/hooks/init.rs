@@ -232,6 +232,7 @@ contextcrawler web <url>           # Defuddle-extracted readable HTML
 ```bash
 contextcrawler gain                # View token savings statistics
 contextcrawler gain --history      # View command history with savings
+contextcrawler gain --weak-filters # Rank tools by leaked tokens (where filters underperform)
 contextcrawler discover            # Analyze Claude Code sessions for missed opportunities
 contextcrawler proxy <cmd>         # Run command without filtering (for debugging)
 contextcrawler init                # Add ContextCrawler instructions to CLAUDE.md
@@ -4102,6 +4103,7 @@ kubectl get pods           contextcrawler kubectl pods
 ```bash
 contextcrawler gain              # Token savings dashboard
 contextcrawler gain --history    # Per-command savings history
+contextcrawler gain --weak-filters # Rank tools by leaked tokens (where filters underperform)
 contextcrawler discover          # Find missed contextcrawler opportunities
 contextcrawler proxy <cmd>       # Run raw (no filtering) but track usage
 ```

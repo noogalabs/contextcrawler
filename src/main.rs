@@ -452,6 +452,9 @@ enum Commands {
         /// Show parse failure log (commands that fell back to raw execution)
         #[arg(short = 'F', long)]
         failures: bool,
+        /// Rank tools by leaked tokens — where a better filter would help most
+        #[arg(short = 'W', long = "weak-filters")]
+        weak_filters: bool,
         /// Reset all token savings stats to zero
         #[arg(long)]
         reset: bool,
@@ -3560,6 +3563,7 @@ fn run_cli() -> Result<i32> {
             all,
             format,
             failures,
+            weak_filters,
             reset,
             yes,
         } => {
@@ -3575,6 +3579,7 @@ fn run_cli() -> Result<i32> {
                 all,
                 &format,
                 failures,
+                weak_filters,
                 reset,
                 yes,
                 cli.verbose,
