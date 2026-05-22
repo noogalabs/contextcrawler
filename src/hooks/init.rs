@@ -23,9 +23,169 @@ use super::integrity;
 // Embedded OpenCode plugin (auto-rewrite)
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 
-// Embedded slim RTK awareness instructions
-const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
-const RTK_SLIM_CODEX: &str = include_str!("../../hooks/codex/rtk-awareness.md");
+// ─── Unified guidance ──────────────────────────────────────────────────────
+//
+// CANONICAL agent guidance rendered from a single source file.
+// `agent_guidance(key)` prepends a per-harness title + "How commands are
+// rewritten" section to the shared body and strips the maintainer comment.
+// Do NOT add per-harness copies — edit `hooks/shared/guidance.md` instead.
+
+const GUIDANCE_CORE: &str = include_str!("../../hooks/shared/guidance.md");
+
+/// Supported harness identifiers for `agent_guidance`.
+///
+/// Keys that do not map to `AgentTarget` (Gemini, OpenCode, Codex, Copilot)
+/// are handled by name so callers outside AgentTarget can still use this function.
+const AGENT_CLAUDE: &str = "claude";
+const AGENT_CODEX: &str = "codex";
+const AGENT_CURSOR: &str = "cursor";
+const AGENT_WINDSURF: &str = "windsurf";
+const AGENT_CLINE: &str = "cline";
+const AGENT_KILOCODE: &str = "kilocode";
+const AGENT_ANTIGRAVITY: &str = "antigravity";
+const AGENT_HERMES: &str = "hermes";
+const AGENT_GEMINI: &str = "gemini";
+const AGENT_COPILOT: &str = "copilot";
+const AGENT_OPENCODE: &str = "opencode";
+
+/// Return the per-harness ContextCrawler guidance document.
+///
+/// Output format:
+///   `# ContextCrawler ({title})\n\n{mechanism}\n\n{guidance_core_body}`
+///
+/// The HTML maintainer comment at the top of `GUIDANCE_CORE` is stripped so
+/// agents do not see it. The rendered output starts at the
+/// `**Token-optimised CLI proxy.**` line.
+///
+/// Valid `agent` keys: "claude", "codex", "cursor", "windsurf", "cline",
+/// "kilocode", "antigravity", "hermes", "gemini", "copilot", "opencode".
+///
+/// # Errors
+/// Returns an error on an unrecognised key — callers must use one of the
+/// eleven `AGENT_*` constants above; passing a typo is a programming error
+/// surfaced as a `Result` rather than a panic (RTK no-panic-in-production rule).
+fn agent_guidance(agent: &str) -> Result<String> {
+    let title = match agent {
+        AGENT_CLAUDE     => "Claude Code",
+        AGENT_CODEX      => "Codex CLI",
+        AGENT_CURSOR     => "Cursor",
+        AGENT_WINDSURF   => "Windsurf",
+        AGENT_CLINE      => "Cline",
+        AGENT_KILOCODE   => "Kilo Code",
+        AGENT_ANTIGRAVITY => "Google Antigravity",
+        AGENT_HERMES     => "Hermes",
+        AGENT_GEMINI     => "Gemini CLI",
+        AGENT_COPILOT    => "GitHub Copilot",
+        AGENT_OPENCODE   => "OpenCode",
+        other => anyhow::bail!("agent_guidance: unknown agent key '{other}'"),
+    };
+
+    // Mechanism section differs by integration type.
+    let mechanism = match agent {
+        // CODEX: no hook, must self-prefix. Carry the imperative content from
+        // the former hooks/codex/rtk-awareness.md (issue #53 regression guard).
+        AGENT_CODEX => concat!(
+            "## How commands are rewritten\n",
+            "\n",
+            "Codex has no automatic hook — **you must prefix every shell command** ",
+            "with `contextcrawler `. This is mandatory, not advisory.\n",
+            "\n",
+            "| WRONG | RIGHT |\n",
+            "|-------|-------|\n",
+            "| `git status` | `contextcrawler git status` |\n",
+            "| `git log -3 --oneline` | `contextcrawler git log -3 --oneline` |\n",
+            "| `git -C /path/to/repo status` | `contextcrawler git -C /path/to/repo status` |\n",
+            "| `grep -r foo src/` | `contextcrawler grep -r foo src/` |\n",
+            "| `rg -n foo src/` | `contextcrawler rg -n foo src/` |\n",
+            "| `cat README.md` | `contextcrawler read README.md` |\n",
+            "| `nl -ba src/main.rs` | `contextcrawler read -n src/main.rs` |\n",
+            "| `ls -la` | `contextcrawler ls -la` |\n",
+            "| `find . -name '*.ts'` | `contextcrawler find . -name '*.ts'` |\n",
+            "\n",
+            "The `git -C <dir>`, `rg -n`, and `nl … | sed -n` patterns are common gaps — ",
+            "they look \"different enough\" that you might not register them as wrappable. ",
+            "They are. All three accept the `contextcrawler ` prefix.\n",
+            "\n",
+            "Applies to: git, gh, glab, grep, find, ls, tree, cat (use `contextcrawler read`), ",
+            "head, tail, cargo, npm, pnpm, pytest, jest, vitest, tsc, docker, kubectl, aws, ",
+            "psql, dotnet, wget, wc, diff, log — every shell command.\n",
+            "\n",
+            "Escape hatch only when contextcrawler genuinely cannot handle the command: ",
+            "`contextcrawler proxy <raw-command>`. Do not fall back to bare commands.\n",
+            "\n",
+            "Before issuing any shell call, check: does it start with `contextcrawler `? ",
+            "If no, rewrite it.",
+        ),
+
+        // PLUGIN agents: OpenCode and Hermes use a plugin, not a shell hook.
+        AGENT_OPENCODE | AGENT_HERMES => concat!(
+            "## How commands are rewritten\n",
+            "\n",
+            "A ContextCrawler plugin rewrites shell commands automatically — ",
+            "`git status` becomes `contextcrawler git status` transparently. ",
+            "Use the meta commands below directly; everything else is wrapped for you.",
+        ),
+
+        // HOOKED agents: all others have a PreToolUse / BeforeTool hook.
+        _ => {
+            let agent_name = match agent {
+                AGENT_CLAUDE     => "Claude Code",
+                AGENT_CURSOR     => "Cursor",
+                AGENT_WINDSURF   => "Windsurf",
+                AGENT_CLINE      => "Cline",
+                AGENT_KILOCODE   => "Kilo Code",
+                AGENT_ANTIGRAVITY => "Google Antigravity",
+                AGENT_GEMINI     => "Gemini CLI",
+                AGENT_COPILOT    => "GitHub Copilot",
+                _                => title,
+            };
+            // Build owned string for hooked agents — returned from match arm.
+            return Ok(format!(
+                "# ContextCrawler ({title})\n\n\
+                 ## How commands are rewritten\n\n\
+                 The {agent_name} hook rewrites shell commands automatically — \
+                 `git status` becomes `contextcrawler git status` transparently, \
+                 with zero token overhead. Use the meta commands below directly; \
+                 everything else is wrapped for you.\n\n\
+                 {body}",
+                body = guidance_core_body(),
+            ));
+        }
+    };
+
+    Ok(format!(
+        "# ContextCrawler ({title})\n\n{mechanism}\n\n{body}",
+        body = guidance_core_body(),
+    ))
+}
+
+/// Wrap `agent_guidance(agent)` output in an RTK marker block so it can be
+/// upserted into a shared instructions file (AGENTS.md) via
+/// [`write_rtk_block`] / [`upsert_rtk_block`] without clobbering user content.
+///
+/// The markers (`RTK_BLOCK_START` … `RTK_BLOCK_END`) are the same ones the
+/// Claude CLAUDE.md and Copilot copilot-instructions.md flows use.
+fn agent_guidance_block(agent: &str) -> Result<String> {
+    Ok(format!(
+        "<!-- rtk-instructions v3 -->\n{}\n<!-- /rtk-instructions -->\n",
+        agent_guidance(agent)?
+    ))
+}
+
+/// Return the body of `GUIDANCE_CORE` with the maintainer HTML comment stripped.
+///
+/// The comment block runs from the first `<!--` to the first `-->` (inclusive)
+/// and is followed by a newline. Everything after is the renderable content.
+fn guidance_core_body() -> &'static str {
+    // The comment ends with "-->\n". Find the position just after that.
+    if let Some(end) = GUIDANCE_CORE.find("-->") {
+        let after = &GUIDANCE_CORE[end + "-->".len()..];
+        after.trim_start_matches('\n')
+    } else {
+        // No comment found — return whole file (future-proof).
+        GUIDANCE_CORE
+    }
+}
 
 /// Template written by `contextcrawler init` when no filters.toml exists yet.
 const FILTERS_TEMPLATE: &str = r#"# Project-local ContextCrawler filters — commit this file with your repo.
@@ -1222,7 +1382,7 @@ fn run_default_mode(
     migrate_old_hook_script(ctx);
 
     // 2. Write CONTEXTCRAWLER.md
-    write_if_changed(&rtk_md_path, RTK_SLIM, RTK_MD, ctx)?;
+    write_if_changed(&rtk_md_path, &agent_guidance(AGENT_CLAUDE)?, RTK_MD, ctx)?;
 
     let opencode_plugin_path = if install_opencode {
         let path = prepare_opencode_plugin_path()?;
@@ -1631,12 +1791,6 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
 
 // ─── Windsurf support ─────────────────────────────────────────
 
-/// Embedded Windsurf RTK rules
-const WINDSURF_RULES: &str = include_str!("../../hooks/windsurf/rules.md");
-
-/// Embedded Cline RTK rules
-const CLINE_RULES: &str = include_str!("../../hooks/cline/rules.md");
-
 // ─── Cline / Roo Code support ─────────────────────────────────
 
 fn run_cline_mode(ctx: InitContext) -> Result<()> {
@@ -1651,10 +1805,11 @@ fn run_cline_mode(ctx: InitContext) -> Result<()> {
             println!("  Rules: .clinerules (already present)");
         }
     } else {
+        let cline_guidance = agent_guidance(AGENT_CLINE)?;
         let new_content = if existing.trim().is_empty() {
-            CLINE_RULES.to_string()
+            cline_guidance
         } else {
-            format!("{}\n\n{}", existing.trim(), CLINE_RULES)
+            format!("{}\n\n{}", existing.trim(), cline_guidance)
         };
         if dry_run {
             println!(
@@ -1696,10 +1851,11 @@ fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
             println!("  Rules: .windsurfrules (already present)");
         }
     } else {
+        let windsurf_guidance = agent_guidance(AGENT_WINDSURF)?;
         let new_content = if existing.trim().is_empty() {
-            WINDSURF_RULES.to_string()
+            windsurf_guidance
         } else {
-            format!("{}\n\n{}", existing.trim(), WINDSURF_RULES)
+            format!("{}\n\n{}", existing.trim(), windsurf_guidance)
         };
         if dry_run {
             println!(
@@ -1730,8 +1886,6 @@ fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
 
 // ─── Kilo Code support ────────────────────────────────────────
 
-const KILOCODE_RULES: &str = include_str!("../../hooks/kilocode/rules.md");
-
 pub fn run_kilocode_mode(ctx: InitContext) -> Result<()> {
     run_kilocode_mode_at(&std::env::current_dir()?, ctx)
 }
@@ -1749,10 +1903,11 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
             println!("  Rules: .kilocode/rules/rtk-rules.md (already present)");
         }
     } else {
+        let kilocode_guidance = agent_guidance(AGENT_KILOCODE)?;
         let new_content = if existing.trim().is_empty() {
-            KILOCODE_RULES.to_string()
+            kilocode_guidance
         } else {
-            format!("{}\n\n{}", existing.trim(), KILOCODE_RULES)
+            format!("{}\n\n{}", existing.trim(), kilocode_guidance)
         };
         if dry_run {
             println!(
@@ -1788,8 +1943,6 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
 
 // ─── Google Antigravity support ───────────────────────────────
 
-const ANTIGRAVITY_RULES: &str = include_str!("../../hooks/antigravity/rules.md");
-
 pub fn run_antigravity_mode(ctx: InitContext) -> Result<()> {
     run_antigravity_mode_at(&std::env::current_dir()?, ctx)
 }
@@ -1807,10 +1960,11 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
             println!("  Rules: .agents/rules/antigravity-rtk-rules.md (already present)");
         }
     } else {
+        let antigravity_guidance = agent_guidance(AGENT_ANTIGRAVITY)?;
         let new_content = if existing.trim().is_empty() {
-            ANTIGRAVITY_RULES.to_string()
+            antigravity_guidance
         } else {
-            format!("{}\n\n{}", existing.trim(), ANTIGRAVITY_RULES)
+            format!("{}\n\n{}", existing.trim(), antigravity_guidance)
         };
         if dry_run {
             println!(
@@ -1891,12 +2045,26 @@ fn run_hermes_mode_at(hermes_home: &Path, ctx: InitContext) -> Result<()> {
     let patched_config = patch_hermes_config(&existing_config);
     write_if_changed(&config_path, &patched_config, "Hermes config", ctx)?;
 
+    // Upsert guidance as a marked block into ~/.hermes/AGENTS.md.
+    // Hermes auto-loads AGENTS.md at session start; it does not read a
+    // standalone CONTEXTCRAWLER.md. Only the marked block is touched —
+    // user content in AGENTS.md is preserved.
+    let agents_md_path = hermes_home.join(AGENTS_MD);
+    write_rtk_block(
+        &agents_md_path,
+        &agent_guidance_block(AGENT_HERMES)?,
+        "Hermes guidance",
+        "contextcrawler init --agent hermes",
+        ctx,
+    )?;
+
     if dry_run {
         print_dry_run_footer();
     } else {
         println!("\nContextCrawler configured for Hermes.\n");
-        println!("  Plugin: {}", plugin_dir.display());
-        println!("  Config: {}", config_path.display());
+        println!("  Plugin:   {}", plugin_dir.display());
+        println!("  Config:   {}", config_path.display());
+        println!("  Guidance: {}", agents_md_path.display());
         println!("  Hermes will now rewrite terminal commands through contextcrawler.");
         println!("  Restart Hermes. Test with: git status\n");
     }
@@ -1981,6 +2149,13 @@ fn uninstall_hermes_at(hermes_home: &Path, ctx: InitContext) -> Result<Vec<Strin
             }
             removed.push("Hermes config: removed RTK plugin entry".to_string());
         }
+    }
+
+    // Strip the RTK guidance block from ~/.hermes/AGENTS.md.
+    // Only the marked block is removed — user content in AGENTS.md is kept.
+    let agents_md_path = hermes_home.join(AGENTS_MD);
+    if let Some(desc) = strip_rtk_block_from_file(&agents_md_path, "Hermes guidance", ctx)? {
+        removed.push(desc);
     }
 
     Ok(removed)
@@ -2384,7 +2559,7 @@ fn run_codex_mode_with_paths(
         RTK_MD_REF.to_string()
     };
 
-    write_if_changed(&rtk_md_path, RTK_SLIM_CODEX, RTK_MD, ctx)?;
+    write_if_changed(&rtk_md_path, &agent_guidance(AGENT_CODEX)?, RTK_MD, ctx)?;
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, ctx)?;
 
     // Clean up legacy filenames (e.g. RTK.md left behind by the regressed // branding-lint: allow legacy
@@ -2805,6 +2980,74 @@ fn remove_rtk_block(content: &str) -> (String, bool) {
     }
 }
 
+/// Strip the RTK guidance marker block from a shared instructions file
+/// (e.g. AGENTS.md), preserving any surrounding user content. If removing the
+/// block empties the file, the file itself is deleted. No-op if the file is
+/// missing or contains no block.
+///
+/// Returns `Some(description)` when something was removed (for uninstall
+/// reporting), `None` otherwise.
+fn strip_rtk_block_from_file(
+    path: &Path,
+    label: &str,
+    ctx: InitContext,
+) -> Result<Option<String>> {
+    let InitContext { verbose, dry_run } = ctx;
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}: {}", label, path.display()))?;
+
+    if !content.contains(RTK_BLOCK_START) {
+        return Ok(None);
+    }
+
+    let (stripped, removed) = remove_rtk_block(&content);
+    if !removed {
+        // Malformed block (opening marker, no closing marker) — remove_rtk_block
+        // already warned. Leave the file untouched.
+        return Ok(None);
+    }
+
+    if dry_run {
+        if stripped.trim().is_empty() {
+            println!(
+                "[dry-run] would remove {} (now empty): {}",
+                label,
+                path.display()
+            );
+        } else {
+            println!(
+                "[dry-run] would remove RTK guidance block from {}: {}",
+                label,
+                path.display()
+            );
+        }
+        return Ok(Some(format!("{}: {}", label, path.display())));
+    }
+
+    if stripped.trim().is_empty() {
+        // nosemgrep: filesystem-deletion -- only deletes a file we created and
+        // that now holds nothing but our removed block.
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove {}: {}", label, path.display()))?;
+        if verbose > 0 {
+            eprintln!("Removed {} (now empty): {}", label, path.display());
+        }
+    } else {
+        atomic_write(path, &stripped)
+            .with_context(|| format!("Failed to write {}: {}", label, path.display()))?;
+        if verbose > 0 {
+            eprintln!("Removed RTK guidance block from {}: {}", label, path.display());
+        }
+    }
+
+    Ok(Some(format!("{}: {}", label, path.display())))
+}
+
 fn resolve_home_subdir(subdir: &str) -> Result<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join(subdir))
@@ -3079,7 +3322,7 @@ fn ensure_opencode_plugin_installed(path: &Path, ctx: InitContext) -> Result<boo
     write_if_changed(path, OPENCODE_PLUGIN, "OpenCode plugin", ctx)
 }
 
-/// Remove OpenCode plugin file
+/// Remove OpenCode plugin file and strip the guidance block from AGENTS.md
 fn remove_opencode_plugin(ctx: InitContext) -> Result<Vec<PathBuf>> {
     let InitContext { verbose, dry_run } = ctx;
     let opencode_dir = resolve_opencode_dir()?;
@@ -3099,6 +3342,13 @@ fn remove_opencode_plugin(ctx: InitContext) -> Result<Vec<PathBuf>> {
         removed.push(path);
     }
 
+    // Strip the RTK guidance block from ~/.config/opencode/AGENTS.md.
+    // Only the marked block is removed — user content in AGENTS.md is kept.
+    let agents_md_path = opencode_agents_md_path(&opencode_dir);
+    if strip_rtk_block_from_file(&agents_md_path, "OpenCode guidance", ctx)?.is_some() {
+        removed.push(agents_md_path);
+    }
+
     Ok(removed)
 }
 
@@ -3108,7 +3358,80 @@ fn resolve_cursor_dir() -> Result<PathBuf> {
     resolve_home_subdir(CURSOR_DIR)
 }
 
-/// Install Cursor hooks: register binary command in hooks.json
+/// Cursor project-rules path components (.mdc format).
+///
+/// Cursor reads `<project>/.cursor/rules/*.mdc` files as Project Rules.
+/// This directory is PROJECT-scoped (relative to the project root), not
+/// `~/.cursor/`. Cursor has no file-based global rule store — global rules
+/// live only in Cursor Settings → Rules. The `alwaysApply: true` frontmatter
+/// makes the rule load for every session in that project.
+const CURSOR_RULES_REL_DIR: &str = ".cursor/rules";
+const CURSOR_GUIDANCE_FILE: &str = "contextcrawler.mdc";
+
+/// YAML frontmatter required by Cursor's `.mdc` rule format.
+const CURSOR_MDC_FRONTMATTER: &str = "\
+---\n\
+description: ContextCrawler token-optimised CLI proxy\n\
+alwaysApply: true\n\
+---\n\
+\n";
+
+/// Render the full `.cursor/rules/contextcrawler.mdc` body: YAML frontmatter
+/// followed by the unified agent guidance.
+fn cursor_mdc_content() -> Result<String> {
+    Ok(format!(
+        "{}{}",
+        CURSOR_MDC_FRONTMATTER,
+        agent_guidance(AGENT_CURSOR)?
+    ))
+}
+
+/// Write Cursor's project-scoped guidance file at
+/// `<project_root>/.cursor/rules/contextcrawler.mdc`.
+fn write_cursor_guidance(project_root: &Path, ctx: InitContext) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    let rules_dir = project_root.join(CURSOR_RULES_REL_DIR);
+    let guidance_path = rules_dir.join(CURSOR_GUIDANCE_FILE);
+    if !dry_run {
+        fs::create_dir_all(&rules_dir).with_context(|| {
+            format!(
+                "Failed to create Cursor rules directory: {}",
+                rules_dir.display()
+            )
+        })?;
+    }
+    write_if_changed(
+        &guidance_path,
+        &cursor_mdc_content()?,
+        CURSOR_GUIDANCE_FILE,
+        ctx,
+    )?;
+    if !dry_run {
+        println!("  Guidance:   {}", guidance_path.display());
+    }
+    Ok(())
+}
+
+/// `true` if `dir` looks like a project root (has a `.git` directory or a
+/// recognised project manifest). Used to decide whether to write Cursor's
+/// project-scoped `.cursor/rules` file or fall back to a manual-setup note.
+fn looks_like_project_root(dir: &Path) -> bool {
+    if dir.join(".git").exists() {
+        return true;
+    }
+    const MANIFESTS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        ".cursor",
+    ];
+    MANIFESTS.iter().any(|m| dir.join(m).exists())
+}
+
+/// Install Cursor hooks: register binary command in hooks.json + write guidance
 fn install_cursor_hooks(ctx: InitContext) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
     let cursor_dir = resolve_cursor_dir()?;
@@ -3143,6 +3466,17 @@ fn install_cursor_hooks(ctx: InitContext) -> Result<()> {
     let hooks_json_path = cursor_dir.join(HOOKS_JSON);
     let patched = patch_cursor_hooks_json(&hooks_json_path, ctx)?;
 
+    // Guidance file is PROJECT-scoped (.cursor/rules/ lives at the project
+    // root, not in ~/.cursor/). This is a global install, so only write the
+    // .mdc file when the current directory is actually a project root —
+    // otherwise print a manual-setup note. Cursor has no file-based global
+    // rule store.
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    let have_project = looks_like_project_root(&cwd);
+    if have_project {
+        write_cursor_guidance(&cwd, ctx)?;
+    }
+
     // Report (skip in dry-run)
     if !dry_run {
         println!("\nCursor hook registered (global).\n");
@@ -3153,6 +3487,18 @@ fn install_cursor_hooks(ctx: InitContext) -> Result<()> {
             println!("  hooks.json: ContextCrawler preToolUse entry added");
         } else {
             println!("  hooks.json: ContextCrawler preToolUse entry already present");
+        }
+
+        if !have_project {
+            println!(
+                "\n  Cursor guidance is project-scoped — no project detected in {}.",
+                cwd.display()
+            );
+            println!(
+                "  Add it manually via Cursor Settings → Rules, or re-run\n  \
+                 `contextcrawler init -g --agent cursor` from a project root to write\n  \
+                 .cursor/rules/contextcrawler.mdc."
+            );
         }
 
         println!("  Cursor reloads hooks.json automatically. Test with: git status\n");
@@ -3764,13 +4110,44 @@ fn show_codex_config() -> Result<()> {
     Ok(())
 }
 
+/// Path to the OpenCode-loaded instructions file: `~/.config/opencode/AGENTS.md`.
+///
+/// OpenCode auto-loads `AGENTS.md` from its config directory at session start.
+/// It does NOT load a standalone `CONTEXTCRAWLER.md`, so the guidance is
+/// upserted as a marked block into AGENTS.md instead.
+fn opencode_agents_md_path(opencode_dir: &Path) -> PathBuf {
+    opencode_dir.join(AGENTS_MD)
+}
+
 fn run_opencode_only_mode(ctx: InitContext) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     let opencode_plugin_path = prepare_opencode_plugin_path()?;
     ensure_opencode_plugin_installed(&opencode_plugin_path, ctx)?;
+
+    // Upsert guidance as a marked block into ~/.config/opencode/AGENTS.md
+    // (OpenCode auto-loads AGENTS.md; it does not read a standalone file).
+    let opencode_dir = resolve_opencode_dir()?;
+    if !dry_run {
+        fs::create_dir_all(&opencode_dir).with_context(|| {
+            format!(
+                "Failed to create OpenCode config directory: {}",
+                opencode_dir.display()
+            )
+        })?;
+    }
+    let agents_md_path = opencode_agents_md_path(&opencode_dir);
+    write_rtk_block(
+        &agents_md_path,
+        &agent_guidance_block(AGENT_OPENCODE)?,
+        "OpenCode guidance",
+        "contextcrawler init -g --opencode",
+        ctx,
+    )?;
+
     if !dry_run {
         println!("\nOpenCode plugin installed (global).\n");
         println!("  OpenCode: {}", opencode_plugin_path.display());
+        println!("  Guidance: {}", agents_md_path.display());
         println!("  Restart OpenCode. Test with: git status\n");
     }
     Ok(())
@@ -3837,8 +4214,7 @@ pub fn run_gemini(
     // 2. Install GEMINI.md (RTK awareness for Gemini)
     if !hook_only {
         let gemini_md_path = gemini_dir.join(GEMINI_MD);
-        // Reuse the same slim RTK awareness content
-        write_if_changed(&gemini_md_path, RTK_SLIM, GEMINI_MD, ctx)?;
+        write_if_changed(&gemini_md_path, &agent_guidance(AGENT_GEMINI)?, GEMINI_MD, ctx)?;
     }
 
     // 3. Patch ~/.gemini/settings.json
@@ -4164,6 +4540,226 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ─── Drift-guard: agent_guidance() for every harness ────────────────────
+    //
+    // These tests are the regression guard for the guidance-unification
+    // refactor. With a single source (`hooks/shared/guidance.md`), content
+    // cannot drift between harnesses. Each assertion below verifies:
+    //   1. Non-empty output
+    //   2. Correct title line
+    //   3. Core markers present (meta commands, security gate, gain command)
+    //   4. Maintainer HTML comment NOT in the rendered output
+    //
+    // Adding a new harness requires:
+    //   a. A new AGENT_* const
+    //   b. A match arm in agent_guidance()
+    //   c. A test case here
+    //
+    // Do NOT delete these tests to "fix" a failing build — fix the source.
+
+    fn assert_guidance_invariants(agent: &str, guidance: &str) {
+        // Non-empty
+        assert!(
+            !guidance.is_empty(),
+            "agent_guidance({agent}): returned empty string"
+        );
+        // Title line — derived from agent_guidance()'s own first line rather
+        // than a parallel match. The title format itself is asserted: it must
+        // be a `# ContextCrawler (...)` heading.
+        let first_line = guidance.lines().next().unwrap_or("<empty>");
+        assert!(
+            first_line.starts_with("# ContextCrawler (") && first_line.ends_with(')'),
+            "agent_guidance({agent}): expected '# ContextCrawler (<title>)' heading, got: {first_line}"
+        );
+        // Core markers
+        for marker in &["## Meta commands", "## Security gate", "contextcrawler gain"] {
+            assert!(
+                guidance.contains(marker),
+                "agent_guidance({agent}): missing core marker '{marker}'"
+            );
+        }
+        // Maintainer comment must NOT appear in rendered output
+        assert!(
+            !guidance.contains("CANONICAL ContextCrawler agent guidance"),
+            "agent_guidance({agent}): maintainer HTML comment leaked into rendered output"
+        );
+        assert!(
+            !guidance.contains("<!-- "),
+            "agent_guidance({agent}): HTML comment leaked into rendered output"
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_claude() {
+        assert_guidance_invariants(
+            AGENT_CLAUDE,
+            &agent_guidance(AGENT_CLAUDE).expect("claude guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_codex() {
+        let g = agent_guidance(AGENT_CODEX).expect("codex guidance");
+        assert_guidance_invariants(AGENT_CODEX, &g);
+        // Codex must include the mandatory self-prefix imperative content.
+        assert!(
+            g.contains("you must prefix every shell command"),
+            "Codex guidance missing mandatory self-prefix rule"
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_cursor() {
+        assert_guidance_invariants(
+            AGENT_CURSOR,
+            &agent_guidance(AGENT_CURSOR).expect("cursor guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_windsurf() {
+        assert_guidance_invariants(
+            AGENT_WINDSURF,
+            &agent_guidance(AGENT_WINDSURF).expect("windsurf guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_cline() {
+        assert_guidance_invariants(
+            AGENT_CLINE,
+            &agent_guidance(AGENT_CLINE).expect("cline guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_kilocode() {
+        assert_guidance_invariants(
+            AGENT_KILOCODE,
+            &agent_guidance(AGENT_KILOCODE).expect("kilocode guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_antigravity() {
+        assert_guidance_invariants(
+            AGENT_ANTIGRAVITY,
+            &agent_guidance(AGENT_ANTIGRAVITY).expect("antigravity guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_hermes() {
+        assert_guidance_invariants(
+            AGENT_HERMES,
+            &agent_guidance(AGENT_HERMES).expect("hermes guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_gemini() {
+        assert_guidance_invariants(
+            AGENT_GEMINI,
+            &agent_guidance(AGENT_GEMINI).expect("gemini guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_copilot() {
+        assert_guidance_invariants(
+            AGENT_COPILOT,
+            &agent_guidance(AGENT_COPILOT).expect("copilot guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_drift_guard_opencode() {
+        assert_guidance_invariants(
+            AGENT_OPENCODE,
+            &agent_guidance(AGENT_OPENCODE).expect("opencode guidance"),
+        );
+    }
+
+    #[test]
+    fn test_guidance_unknown_agent_returns_error() {
+        // RTK no-panic rule: an unknown key surfaces as Err, not a panic.
+        let err = agent_guidance("not-a-real-agent").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown agent key"),
+            "expected 'unknown agent key' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_guidance_all_harnesses_unique_titles() {
+        // Every harness must have a distinct title line.
+        let agents = [
+            AGENT_CLAUDE, AGENT_CODEX, AGENT_CURSOR, AGENT_WINDSURF, AGENT_CLINE,
+            AGENT_KILOCODE, AGENT_ANTIGRAVITY, AGENT_HERMES, AGENT_GEMINI,
+            AGENT_COPILOT, AGENT_OPENCODE,
+        ];
+        let titles: Vec<String> = agents
+            .iter()
+            .map(|a| {
+                agent_guidance(a)
+                    .expect("guidance")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        let unique: std::collections::HashSet<_> = titles.iter().collect();
+        assert_eq!(
+            unique.len(),
+            agents.len(),
+            "Duplicate title line detected among harnesses: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn test_guidance_cursor_mdc_frontmatter_format() {
+        // Cursor .mdc guidance must have the YAML frontmatter prepended.
+        let mdc_content = cursor_mdc_content().expect("cursor mdc content");
+        assert!(
+            mdc_content.starts_with("---\n"),
+            "Cursor .mdc content must start with YAML frontmatter"
+        );
+        assert!(
+            mdc_content.contains("alwaysApply: true"),
+            "Cursor .mdc frontmatter must contain alwaysApply: true"
+        );
+        // The guidance body must follow the frontmatter intact.
+        assert!(
+            mdc_content.contains("# ContextCrawler (Cursor)"),
+            "Cursor .mdc must contain the guidance heading after frontmatter"
+        );
+    }
+
+    #[test]
+    fn test_agent_guidance_block_has_markers() {
+        // The marked-block wrapper must produce both upsert markers so
+        // upsert_rtk_block can detect and replace it idempotently.
+        let block = agent_guidance_block(AGENT_OPENCODE).expect("opencode block");
+        assert!(
+            block.contains(RTK_BLOCK_START),
+            "agent_guidance_block must contain RTK_BLOCK_START marker"
+        );
+        assert!(
+            block.contains(RTK_BLOCK_END),
+            "agent_guidance_block must contain RTK_BLOCK_END marker"
+        );
+        // Round-trip: upsert into empty, then strip, returns to empty.
+        let (with_block, action) = upsert_rtk_block("", &block);
+        assert_eq!(action, RtkBlockUpsert::Added);
+        let (stripped, removed) = remove_rtk_block(&with_block);
+        assert!(removed, "block must be strippable");
+        assert!(
+            stripped.trim().is_empty(),
+            "stripping the only block should leave the file empty"
+        );
+    }
+
     #[test]
     fn test_init_mentions_all_top_level_commands() {
         for cmd in [
@@ -4267,6 +4863,114 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_guidance_upserts_block_into_agents_md() {
+        // OpenCode auto-loads AGENTS.md, not a standalone CONTEXTCRAWLER.md.
+        // Verify the upsert preserves user content and is idempotent, and the
+        // uninstall stripping leaves user content intact.
+        let temp = TempDir::new().unwrap();
+        let opencode_dir = temp.path().join("opencode");
+        fs::create_dir_all(&opencode_dir).unwrap();
+        let agents_md = opencode_agents_md_path(&opencode_dir);
+        fs::write(&agents_md, "# Project notes\n\nUser text.\n").unwrap();
+
+        let block = agent_guidance_block(AGENT_OPENCODE).expect("opencode block");
+
+        // Install: upsert.
+        write_rtk_block(&agents_md, &block, "OpenCode guidance", "x", InitContext::default())
+            .unwrap();
+        let first = fs::read_to_string(&agents_md).unwrap();
+        // Re-install: idempotent.
+        write_rtk_block(&agents_md, &block, "OpenCode guidance", "x", InitContext::default())
+            .unwrap();
+        let second = fs::read_to_string(&agents_md).unwrap();
+        assert_eq!(first, second, "OpenCode AGENTS.md upsert must be idempotent");
+        assert!(first.contains("# Project notes"));
+        assert!(first.contains("User text."));
+        assert!(first.contains("# ContextCrawler (OpenCode)"));
+        assert_eq!(first.matches(RTK_BLOCK_START).count(), 1);
+
+        // Uninstall stripping must keep user content.
+        let desc = strip_rtk_block_from_file(&agents_md, "OpenCode guidance", InitContext::default())
+            .unwrap();
+        assert!(desc.is_some(), "strip must report removal");
+        let after = fs::read_to_string(&agents_md).unwrap();
+        assert!(after.contains("# Project notes"));
+        assert!(after.contains("User text."));
+        assert!(!after.contains(RTK_BLOCK_START));
+    }
+
+    #[test]
+    fn test_strip_rtk_block_deletes_file_when_only_our_block() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        let block = agent_guidance_block(AGENT_OPENCODE).expect("opencode block");
+        fs::write(&agents_md, &block).unwrap();
+
+        let desc = strip_rtk_block_from_file(&agents_md, "OpenCode guidance", InitContext::default())
+            .unwrap();
+        assert!(desc.is_some());
+        assert!(
+            !agents_md.exists(),
+            "file holding only our block should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_strip_rtk_block_noop_when_no_block() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        fs::write(&agents_md, "# Just user content\n").unwrap();
+
+        let desc = strip_rtk_block_from_file(&agents_md, "guidance", InitContext::default())
+            .unwrap();
+        assert!(desc.is_none(), "no block present — strip is a no-op");
+        assert_eq!(
+            fs::read_to_string(&agents_md).unwrap(),
+            "# Just user content\n",
+            "file must be untouched"
+        );
+    }
+
+    #[test]
+    fn test_strip_rtk_block_missing_file_is_noop() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("AGENTS.md");
+        let desc = strip_rtk_block_from_file(&missing, "guidance", InitContext::default())
+            .unwrap();
+        assert!(desc.is_none());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn test_cursor_guidance_written_to_project_root() {
+        // .cursor/rules/ is project-scoped — guidance must land at the project
+        // root, not in ~/.cursor/.
+        let temp = TempDir::new().unwrap();
+        write_cursor_guidance(temp.path(), InitContext::default()).unwrap();
+
+        let mdc = temp.path().join(".cursor/rules/contextcrawler.mdc");
+        assert!(mdc.exists(), "Cursor .mdc must be written under project root");
+        let content = fs::read_to_string(&mdc).unwrap();
+        assert!(content.starts_with("---\n"), "must have YAML frontmatter");
+        assert!(content.contains("alwaysApply: true"));
+        assert!(content.contains("# ContextCrawler (Cursor)"));
+    }
+
+    #[test]
+    fn test_looks_like_project_root_detection() {
+        let temp = TempDir::new().unwrap();
+        assert!(
+            !looks_like_project_root(temp.path()),
+            "empty dir is not a project root"
+        );
+        fs::write(temp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(
+            looks_like_project_root(temp.path()),
+            "dir with Cargo.toml is a project root"
+        );
+    }
+
+    #[test]
     fn test_migration_warns_on_missing_end_marker() {
         let input = format!("{} v2 -->\nOLD STUFF\nNo end marker", RTK_BLOCK_START);
         let (result, migrated) = remove_rtk_block(&input);
@@ -4279,11 +4983,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let rtk_md_path = temp.path().join("CONTEXTCRAWLER.md");
 
-        fs::write(&rtk_md_path, RTK_SLIM).unwrap();
+        let claude_guidance = agent_guidance(AGENT_CLAUDE).expect("claude guidance");
+        fs::write(&rtk_md_path, &claude_guidance).unwrap();
         assert!(rtk_md_path.exists());
 
         let content = fs::read_to_string(&rtk_md_path).unwrap();
-        assert_eq!(content, RTK_SLIM);
+        assert_eq!(content, claude_guidance);
     }
 
     #[test]
@@ -4526,6 +5231,83 @@ mod tests {
         assert!(config.contains("plugins:\n"));
         assert!(config.contains("  enabled:\n"));
         assert_eq!(config.matches("rtk-rewrite").count(), 1);
+
+        // Guidance must be upserted as a MARKED BLOCK into AGENTS.md
+        // (Hermes auto-loads AGENTS.md, not a standalone CONTEXTCRAWLER.md).
+        let agents_md = temp.path().join("AGENTS.md");
+        assert!(agents_md.exists(), "Hermes guidance AGENTS.md should be created");
+        let agents = fs::read_to_string(&agents_md).unwrap();
+        assert!(agents.contains(RTK_BLOCK_START), "AGENTS.md must hold the RTK block start marker");
+        assert!(agents.contains(RTK_BLOCK_END), "AGENTS.md must hold the RTK block end marker");
+        assert!(agents.contains("# ContextCrawler (Hermes)"), "AGENTS.md must hold Hermes guidance");
+        // No standalone CONTEXTCRAWLER.md should be written.
+        assert!(
+            !temp.path().join(RTK_MD).exists(),
+            "Hermes must NOT write a standalone CONTEXTCRAWLER.md"
+        );
+    }
+
+    #[test]
+    fn test_hermes_mode_guidance_block_preserves_user_content_and_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        fs::write(&agents_md, "# Team rules\n\nDo the thing.\n").unwrap();
+
+        run_hermes_mode_at(temp.path(), InitContext::default()).unwrap();
+        let first = fs::read_to_string(&agents_md).unwrap();
+        run_hermes_mode_at(temp.path(), InitContext::default()).unwrap();
+        let second = fs::read_to_string(&agents_md).unwrap();
+
+        assert_eq!(first, second, "Hermes AGENTS.md upsert must be idempotent");
+        assert!(first.contains("# Team rules"), "user content must be preserved");
+        assert!(first.contains("Do the thing."), "user content must be preserved");
+        assert!(first.contains("# ContextCrawler (Hermes)"));
+        assert_eq!(
+            first.matches(RTK_BLOCK_START).count(),
+            1,
+            "exactly one RTK block — no duplicate on re-run"
+        );
+    }
+
+    #[test]
+    fn test_hermes_uninstall_strips_guidance_block_preserving_user_content() {
+        let temp = TempDir::new().unwrap();
+        let hermes_home = temp.path();
+        let agents_md = hermes_home.join("AGENTS.md");
+        fs::write(&agents_md, "# Team rules\n\nKeep me.\n").unwrap();
+
+        run_hermes_mode_at(hermes_home, InitContext::default()).unwrap();
+        assert!(fs::read_to_string(&agents_md).unwrap().contains("# ContextCrawler (Hermes)"));
+
+        let removed = uninstall_hermes_at(hermes_home, InitContext::default()).unwrap();
+        assert!(
+            removed.iter().any(|r| r.contains("Hermes guidance")),
+            "uninstall must report stripping the guidance block, got: {removed:?}"
+        );
+
+        // AGENTS.md must survive with user content intact, block gone.
+        let after = fs::read_to_string(&agents_md).unwrap();
+        assert!(after.contains("# Team rules"), "user content must survive uninstall");
+        assert!(after.contains("Keep me."), "user content must survive uninstall");
+        assert!(!after.contains(RTK_BLOCK_START), "RTK block must be removed");
+        assert!(!after.contains("# ContextCrawler (Hermes)"), "guidance must be removed");
+    }
+
+    #[test]
+    fn test_hermes_uninstall_deletes_agents_md_when_only_our_block() {
+        let temp = TempDir::new().unwrap();
+        let hermes_home = temp.path();
+        let agents_md = hermes_home.join("AGENTS.md");
+
+        // No pre-existing AGENTS.md — install creates one holding only our block.
+        run_hermes_mode_at(hermes_home, InitContext::default()).unwrap();
+        assert!(agents_md.exists());
+
+        uninstall_hermes_at(hermes_home, InitContext::default()).unwrap();
+        assert!(
+            !agents_md.exists(),
+            "AGENTS.md holding only our block should be deleted on uninstall"
+        );
     }
 
     #[test]
@@ -4607,7 +5389,10 @@ mod tests {
         let removed_first = uninstall_hermes_at(hermes_home, InitContext::default()).unwrap();
         let removed_second = uninstall_hermes_at(hermes_home, InitContext::default()).unwrap();
 
-        assert_eq!(removed_first.len(), 2);
+        // 3 artifacts: plugin dir, config entry, and the AGENTS.md guidance
+        // block (run_hermes_mode_at now upserts guidance into AGENTS.md).
+        assert_eq!(removed_first.len(), 3);
+        assert!(removed_first.iter().any(|r| r.contains("Hermes guidance")));
         assert!(removed_second.is_empty());
         assert!(!plugin_dir.exists());
         assert!(other_plugin_dir.exists());
@@ -5003,7 +5788,10 @@ mod tests {
         .unwrap();
 
         assert!(rtk_md.exists());
-        assert_eq!(fs::read_to_string(&rtk_md).unwrap(), RTK_SLIM_CODEX);
+        assert_eq!(
+            fs::read_to_string(&rtk_md).unwrap(),
+            agent_guidance(AGENT_CODEX).expect("codex guidance")
+        );
         assert_eq!(
             fs::read_to_string(&agents_md).unwrap(),
             format!("{}\n", codex_rtk_md_ref(temp.path()))
@@ -5042,9 +5830,10 @@ mod tests {
         // If you're editing the template, KEEP these patterns — removing them
         // regresses the codex compliance lift driven by #53. Read the issue
         // before changing this assertion.
+        let codex_guidance = agent_guidance(AGENT_CODEX).expect("codex guidance");
         for needle in &["git -C ", "rg -n ", "nl -ba "] {
             assert!(
-                RTK_SLIM_CODEX.contains(needle),
+                codex_guidance.contains(needle),
                 "codex template missing gap pattern '{}' — see issue #53",
                 needle
             );
