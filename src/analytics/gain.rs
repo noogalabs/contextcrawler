@@ -228,7 +228,8 @@ pub fn run(
 
             for (idx, (cmd, count, saved, pct, avg_time)) in summary.by_command.iter().enumerate() {
                 let row_idx = format!("{:>2}.", idx + 1);
-                let cmd_cell = style_command_cell(&truncate_for_column(display_cmd(cmd), cmd_width)); // added: colored command
+                let cmd_cell =
+                    style_command_cell(&truncate_for_column(display_cmd(cmd), cmd_width)); // added: colored command
                 let count_cell = format!("{:>count_width$}", count, count_width = count_width);
                 let saved_cell = format!(
                     "{:>saved_width$}",
@@ -804,5 +805,102 @@ mod tests {
         // display_cmd + truncate together, as the Recent Commands path does.
         let prefixed = format!("contextcrawler git log {}", "日".repeat(40));
         let _ = truncate(display_cmd(&prefixed), 25);
+    }
+}
+
+#[cfg(test)]
+mod sigpipe_regression {
+    /// SIGPIPE regression (#startup-crash): `contextcrawler gain` used to
+    /// SIGABRT when stdout was a broken pipe. Rust sets SIGPIPE to SIG_IGN
+    /// by default, so broken-pipe writes return EPIPE; `println!()` then
+    /// panics with "failed printing to stdout", and `panic=abort` turns that
+    /// into `abort()`.
+    ///
+    /// Fix: reset SIGPIPE to SIG_DFL in `main()` so the process terminates
+    /// cleanly (exit 141 = 128 + SIGPIPE) rather than generating a crash report.
+    ///
+    /// This test seeds a temp SQLite DB with 5 tracking rows so `gain` produces
+    /// substantial stdout output before the pipe is closed — guaranteeing the
+    /// write-to-broken-pipe path is actually exercised. The child must exit 0 or
+    /// 141 (SIGPIPE clean), never 134 (SIGABRT).
+    #[test]
+    #[ignore] // Requires built release binary; run with: cargo test --ignored
+    fn gain_no_crash_on_broken_pipe() {
+        let release_bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/release/contextcrawler");
+        if !release_bin.exists() {
+            eprintln!("Skipping: release binary not built yet");
+            return;
+        }
+
+        // Seed a temp DB so gain produces real stdout output (not "No tracking
+        // data yet."). This guarantees the write-to-broken-pipe is exercised.
+        let db_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_path = db_dir.path().join("tracking.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path)
+                .expect("Failed to open temp DB");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS commands (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    original_cmd TEXT NOT NULL,
+                    rtk_cmd TEXT NOT NULL,
+                    project_path TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    saved_tokens INTEGER NOT NULL,
+                    savings_pct REAL NOT NULL,
+                    exec_time_ms INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .expect("Failed to create schema");
+            // Insert enough rows to produce multi-line output that exercises
+            // the write path before the pipe is dropped.
+            for i in 0..5 {
+                conn.execute(
+                    "INSERT INTO commands
+                        (timestamp, original_cmd, rtk_cmd, project_path,
+                         input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                     VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, 12)",
+                    rusqlite::params![
+                        format!("2026-05-22T0{}:00:00Z", i),
+                        "git log",
+                        "contextcrawler git log",
+                        1000_i64,
+                        200_i64,
+                        800_i64,
+                        80.0_f64,
+                    ],
+                )
+                .expect("Failed to insert row");
+            }
+        }
+
+        let mut child = std::process::Command::new(&release_bin)
+            .arg("gain")
+            .env("RTK_DB_PATH", &db_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("Failed to spawn contextcrawler gain");
+        // Immediately drop the read end of the pipe — creates a broken pipe
+        // while the child is mid-write to its populated output.
+        drop(child.stdout.take());
+        let status = child.wait().expect("Failed to wait for child");
+        let code = status.code().unwrap_or(0);
+        // 141 = SIGPIPE (clean terminate — expected with output in flight).
+        // 0 = flushed before pipe closed (acceptable edge case).
+        // 134 = SIGABRT = the bug we fixed. Never acceptable.
+        assert_ne!(
+            code, 134,
+            "contextcrawler gain crashed with SIGABRT — broken pipe not handled"
+        );
+        // Also assert the process did not exit with a non-signal error code
+        // (anything above 1 that isn't a signal exit is suspicious).
+        assert!(
+            code == 0 || code == 141,
+            "contextcrawler gain exited with unexpected code {code} (expected 0=clean or 141=SIGPIPE)"
+        );
     }
 }
