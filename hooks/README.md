@@ -164,7 +164,8 @@ The registry (`src/discover/registry.rs`) handles command patterns across these 
 |----------|----------|---------|
 | Test Runners | vitest, pytest, cargo test, go test, playwright | 90-99% |
 | Build Tools | cargo build, npm, pnpm, dotnet, make | 70-90% |
-| VCS | git status/log/diff/show | 70-80% |
+| VCS | git status/diff/show | 70-80% |
+| VCS (log) | git log (plain) | ~35%; `--oneline`/`--format` pass through |
 | Language Servers | tsc, mypy | 80-83% |
 | Linters | eslint, ruff, golangci-lint, biome | 80-85% |
 | Package Managers | pip, cargo install, pnpm list | 75-80% |

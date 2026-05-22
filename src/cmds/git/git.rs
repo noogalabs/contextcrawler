@@ -627,14 +627,38 @@ fn run_log(
     let filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
     println!("{}", filtered);
 
-    timer.track(
-        &format!("git log {}", args.join(" ")),
-        &format!("contextcrawler git log {}", args.join(" ")),
-        &result.stdout,
-        &filtered,
-    );
+    // Honest accounting (GIT-I1): when the user supplies their own format
+    // (`--oneline` / `--pretty` / `--format`), git has already compacted the
+    // output and `filter_log_output` is a near-identity transform. Recording
+    // those runs as filtered drags the `git log` savings average down with
+    // work the filter never had a chance to do. If the filter produced no
+    // structural change, record it as passthrough (0/0 tokens) so `gain`
+    // reports honestly; otherwise track the real savings.
+    let original_cmd = format!("git log {}", args.join(" "));
+    let rtk_cmd = format!("contextcrawler git log {}", args.join(" "));
+    if log_run_is_passthrough(&result.stdout, &filtered) {
+        timer.track_passthrough(&original_cmd, &rtk_cmd);
+    } else {
+        timer.track(&original_cmd, &rtk_cmd, &result.stdout, &filtered);
+    }
 
     Ok(0)
+}
+
+/// Decide whether a `git log` run should be tracked as a real filter run or
+/// as passthrough (GIT-I1).
+///
+/// The filter only earns token savings on plain `git log`, where it injects
+/// the RTK pretty-format and strips commit bodies. When the user supplies
+/// `--oneline` / `--pretty` / `--format`, `filter_log_output` is a
+/// near-identity transform and any difference is at most trailing
+/// whitespace. Comparing trimmed strings classifies those no-op runs as
+/// passthrough so they record 0/0 tokens instead of diluting the `git log`
+/// savings average.
+///
+/// Returns `true` when the filter produced no structural change.
+fn log_run_is_passthrough(raw: &str, filtered: &str) -> bool {
+    raw.trim_end() == filtered.trim_end()
 }
 
 /// Filter git log output: truncate long messages, cap lines
@@ -3140,6 +3164,76 @@ no changes added to commit (use "git add" and/or "git commit -a")
         // user_set_limit=false means cap at limit
         let result = filter_log_output(oneline_output, 3, false, true);
         assert_eq!(result.lines().count(), 3);
+    }
+
+    // GIT-I1 honest accounting: `log_run_is_passthrough` decides whether a
+    // `git log` run gets tracked as a real filter run or as passthrough.
+
+    #[test]
+    fn test_log_passthrough_oneline_is_noop() {
+        // `git log --oneline`: git already compacted the output, so
+        // filter_log_output is an identity transform → passthrough.
+        let raw = "abc1234 feat: add feature\n\
+                   def5678 fix: typo\n\
+                   ghi9012 chore: bump deps\n";
+        let filtered = filter_log_output(raw, 10, true, true);
+        assert!(
+            log_run_is_passthrough(raw, &filtered),
+            "--oneline run changed nothing; must record as passthrough\nfiltered: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn test_log_passthrough_single_field_format() {
+        // `git log -1 --format=%H`: one hash, irreducible by construction.
+        let raw = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\n";
+        let filtered = filter_log_output(raw, 10, true, true);
+        assert!(log_run_is_passthrough(raw, &filtered));
+    }
+
+    #[test]
+    fn test_log_plain_format_is_tracked() {
+        // Plain `git log`: RTK injects %b + ---END---; the filter strips
+        // commit bodies and trailers. Real work → must be tracked.
+        let raw = "abc1234 feat: add feature (2 days ago) <author>\n\
+                   BREAKING CHANGE: removed old API\n\
+                   Signed-off-by: Author <a@b.com>\n\
+                   ---END---\n\
+                   def5678 fix: typo (1 day ago) <other>\n\n---END---\n";
+        let filtered = filter_log_output(raw, 10, false, false);
+        assert!(
+            !log_run_is_passthrough(raw, &filtered),
+            "plain git log strips bodies/trailers — must be tracked, not passthrough"
+        );
+    }
+
+    #[test]
+    fn test_log_oneline_capped_is_tracked() {
+        // `git log --oneline` with no `-N` over a large range: the filter
+        // caps to `limit`. Dropping lines is a real reduction → tracked.
+        let raw = (0..40)
+            .map(|i| format!("hash{i:04} commit message {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let filtered = filter_log_output(&raw, 10, false, true);
+        assert!(
+            !log_run_is_passthrough(&raw, &filtered),
+            "--oneline capped 40→10 lines is a real reduction"
+        );
+    }
+
+    #[test]
+    fn test_log_passthrough_trailing_whitespace_only() {
+        // A bare trailing-newline difference is not "filtering".
+        assert!(log_run_is_passthrough("abc1234 x\n", "abc1234 x"));
+        assert!(log_run_is_passthrough("abc1234 x", "abc1234 x\n\n"));
+    }
+
+    #[test]
+    fn test_log_passthrough_empty_output() {
+        // Range query that returned no commits.
+        assert!(log_run_is_passthrough("", ""));
+        assert!(log_run_is_passthrough("\n", ""));
     }
 
     /// Regression test: `git branch <name>` must create, not list.

@@ -196,7 +196,7 @@ contextcrawler prisma              # Prisma without ASCII art (88%)
 ### Files & Search (60-75% savings)
 ```bash
 contextcrawler ls <path>           # Tree format, compact (65%)
-contextcrawler read <file>         # Code reading with filtering (60%)
+contextcrawler read <file>         # Full file content; --level minimal/aggressive to filter (opt-in)
 contextcrawler grep <pattern>      # Search grouped by file (75%). Format flags (-c, -l, -L, -o, -Z) run raw.
 contextcrawler find <pattern>      # Find grouped by directory (70%)
 ```
