@@ -302,17 +302,25 @@ pub fn run(
                 _ => (ESTIMATED_PRO_MONTHLY, "Pro ($20/mo)"),
             };
 
-            let quota_pct = (summary.total_saved as f64 / quota_tokens as f64) * 100.0;
+            // Numerator scoped to the last 30 days so it shares a horizon
+            // with the monthly quota — dividing lifetime savings by a monthly
+            // cap mixes horizons and can read >100%.
+            let saved_30d = tracker.tokens_saved_30d()?;
+            let quota_pct = (saved_30d as f64 / quota_tokens as f64) * 100.0;
 
             println!("{}", styled("Monthly Quota Analysis", true)); // added: styled header
             println!("──────────────────────────────────────────────────────────");
             print_kpi("Subscription tier", tier_name.to_string()); // added: KPI style
             print_kpi("Estimated monthly quota", format_tokens(quota_tokens));
             print_kpi(
+                "Tokens saved (last 30 days)",
+                format_tokens(saved_30d.max(0) as usize),
+            );
+            print_kpi(
                 "Tokens saved (lifetime)",
                 format_tokens(summary.total_saved),
             );
-            print_kpi("Quota preserved", format!("{:.1}%", quota_pct));
+            print_kpi("Quota preserved (30-day)", format!("{:.1}%", quota_pct));
             println!();
             println!("Note: Heuristic estimate based on ~44K tokens/5h (Pro baseline)");
             println!("      Actual limits use rolling 5-hour windows, not monthly caps.");

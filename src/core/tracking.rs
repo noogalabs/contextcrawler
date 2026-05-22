@@ -792,8 +792,15 @@ impl Tracker {
         project_path: Option<&str>, // added
     ) -> Result<Vec<CommandStats>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
+        // Avg% is volume-weighted (SUM(saved)/SUM(input)) to match the
+        // summary-level metric — an unweighted AVG(savings_pct) over-counts
+        // low-volume high-percentage invocations. Guard divide-by-zero → 0%.
         let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens),
+                    CASE WHEN SUM(input_tokens) > 0
+                         THEN SUM(saved_tokens) * 100.0 / SUM(input_tokens)
+                         ELSE 0.0 END,
+                    AVG(exec_time_ms)
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
              GROUP BY rtk_cmd
@@ -1207,12 +1214,17 @@ impl Tracker {
     }
 
     /// Count commands with low savings (<30%) — filters that need improvement.
+    /// Savings is volume-weighted (SUM(saved)/SUM(input)) for consistency with
+    /// the by-command Avg% column, so a few high-percentage outliers can't hide
+    /// a filter that performs poorly across most of its invocations.
     pub fn low_savings_commands(&self, limit: usize) -> Result<Vec<(String, f64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, AVG(savings_pct) as avg_sav FROM commands
+            "SELECT rtk_cmd,
+                    SUM(saved_tokens) * 100.0 / SUM(input_tokens) as avg_sav
+             FROM commands
              WHERE input_tokens > 0
              GROUP BY rtk_cmd
-             HAVING avg_sav < 30.0 AND avg_sav > 0.0
+             HAVING SUM(input_tokens) > 0 AND avg_sav < 30.0 AND avg_sav > 0.0
              ORDER BY COUNT(*) DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {

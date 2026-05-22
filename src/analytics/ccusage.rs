@@ -135,10 +135,15 @@ pub fn fetch(granularity: Granularity) -> Result<Option<Vec<CcusagePeriod>>> {
         Granularity::Monthly => "monthly",
     };
 
+    // 90 days back from today, computed at call time — a fixed literal
+    // would let the window grow unbounded as real time advances.
+    let since = (chrono::Utc::now() - chrono::Duration::days(90))
+        .format("%Y%m%d")
+        .to_string();
     cmd.arg(subcommand)
         .arg("--json")
         .arg("--since")
-        .arg("20250101"); // 90 days back approx
+        .arg(&since);
 
     let result = match exec_capture(&mut cmd) {
         Err(e) => {
