@@ -1387,7 +1387,10 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
 
         match status {
             Ok(s) => {
-                timer.track_passthrough(&raw_command, &format!("contextcrawler fallback: {}", raw_command));
+                timer.track_passthrough(
+                    &raw_command,
+                    &format!("contextcrawler fallback: {}", raw_command),
+                );
 
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
 
@@ -1703,9 +1706,8 @@ const META_FLAGS: &[&str] = &["--version", "-V", "--help", "-h"];
 /// `pytest --version` at −75% savings over 90 calls). Route their meta-flag
 /// invocations to clean passthrough too.
 const META_PASSTHROUGH_BINS: &[&str] = &[
-    "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
-    "gh", "glab", "aws", "psql", "prisma", "gt",
-    "pytest", "ruff", "mypy", "rake", "rubocop", "rspec", "pip",
+    "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl", "gh", "glab", "aws", "psql",
+    "prisma", "gt", "pytest", "ruff", "mypy", "rake", "rubocop", "rspec", "pip",
 ];
 
 fn cmd_has_meta_flag(args: &[String]) -> bool {
@@ -1869,8 +1871,7 @@ fn preprocess_grep_args(args: Vec<String>) -> GrepPreprocess {
             let bytes = body.as_bytes();
             let all_alpha = bytes.iter().all(|b| b.is_ascii_alphabetic());
             if all_alpha {
-                let has_strippable =
-                    bytes.iter().any(|b| GREP_STRIPPABLE_SHORTS.contains(b));
+                let has_strippable = bytes.iter().any(|b| GREP_STRIPPABLE_SHORTS.contains(b));
                 if has_strippable {
                     let kept: String = body
                         .bytes()
@@ -1905,7 +1906,10 @@ fn has_grep_context_flag(args: &[String]) -> bool {
 
     for arg in args {
         // Long forms — match exact and `--flag=value`.
-        if LONG_FLAGS.iter().any(|f| arg == f || arg.starts_with(&format!("{}=", f))) {
+        if LONG_FLAGS
+            .iter()
+            .any(|f| arg == f || arg.starts_with(&format!("{}=", f)))
+        {
             return true;
         }
         if arg.starts_with("--") || !arg.starts_with('-') || arg.len() < 2 {
@@ -1925,7 +1929,10 @@ fn has_grep_context_flag(args: &[String]) -> bool {
         for i in 0..bytes.len() {
             let c = bytes[i];
             if (c == b'A' || c == b'B' || c == b'C')
-                && bytes.get(i + 1).map(|n| n.is_ascii_digit()).unwrap_or(false)
+                && bytes
+                    .get(i + 1)
+                    .map(|n| n.is_ascii_digit())
+                    .unwrap_or(false)
             {
                 return true;
             }
@@ -1978,7 +1985,11 @@ fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
 
     // Prefer rg so mixed invocations like `grep -c --glob '*.rs' pat` keep
     // working. If rg isn't on PATH, fall through to system grep.
-    let preferred = if which::which("rg").is_ok() { "rg" } else { "grep" };
+    let preferred = if which::which("rg").is_ok() {
+        "rg"
+    } else {
+        "grep"
+    };
 
     // `secure_rg_command` strips RIPGREP_CONFIG_PATH/_FILE from the inherited
     // env so a tainted parent process can't hijack this rg invocation via
@@ -2008,6 +2019,24 @@ fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
 }
 
 fn main() {
+    // SIGPIPE fix (#startup-crash): Rust sets SIGPIPE to SIG_IGN by default,
+    // so a broken pipe on stdout returns EPIPE instead of terminating the
+    // process. When println!() gets EPIPE it panics with
+    // "failed printing to stdout", and with panic=abort that becomes SIGABRT.
+    // Restore SIG_DFL here so a broken-pipe write terminates the process
+    // cleanly (exit 141) instead of aborting with a crash report.
+    //
+    // Uses the same `#[cfg(unix)] unsafe { libc::signal(...) }` idiom as
+    // the proxy path (SIGINT/SIGTERM handler; search PROXY_CHILD_PID). The
+    // unsafe block is the only way to reset signal disposition portably
+    // without an extra crate.
+    //
+    // nosemgrep: unsafe-block
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let code = match run_cli() {
         Ok(code) => code,
         Err(e) => {
@@ -2038,7 +2067,6 @@ where
         uninstall_standard(global, gemini, codex, cursor, ctx)
     }
 }
-
 
 #[cfg(test)]
 mod cli_branding_tests {
@@ -2093,12 +2121,16 @@ mod grep_format_flag_tests {
         assert!(grep_format_flag_present(&args(&["-ci", "pattern", "file"])));
         assert!(grep_format_flag_present(&args(&["-cE", "pattern", "file"])));
         assert!(grep_format_flag_present(&args(&["-cn", "pattern", "file"])));
-        assert!(grep_format_flag_present(&args(&["-iLn", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&[
+            "-iLn", "pattern", "file"
+        ])));
     }
 
     #[test]
     fn long_forms_trigger() {
-        assert!(grep_format_flag_present(&args(&["--count", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&[
+            "--count", "pattern", "file"
+        ])));
         assert!(grep_format_flag_present(&args(&[
             "--files-with-matches",
             "pattern",
@@ -2114,13 +2146,17 @@ mod grep_format_flag_tests {
             "pattern",
             "file"
         ])));
-        assert!(grep_format_flag_present(&args(&["--null", "pattern", "file"])));
+        assert!(grep_format_flag_present(&args(&[
+            "--null", "pattern", "file"
+        ])));
     }
 
     #[test]
     fn dash_l_with_numeric_value_does_not_trigger() {
         // `-l 80` is this app's --max-len; leave it for clap. Issue #97.
-        assert!(!grep_format_flag_present(&args(&["-l", "80", "pattern", "file"])));
+        assert!(!grep_format_flag_present(&args(&[
+            "-l", "80", "pattern", "file"
+        ])));
     }
 
     #[test]
@@ -2147,8 +2183,12 @@ mod grep_format_flag_tests {
 
     #[test]
     fn normal_recursive_grep_does_not_trigger() {
-        assert!(!grep_format_flag_present(&args(&["-rn", "pattern", "src/"])));
-        assert!(!grep_format_flag_present(&args(&["-r", "-n", "pattern", "src/"])));
+        assert!(!grep_format_flag_present(&args(&[
+            "-rn", "pattern", "src/"
+        ])));
+        assert!(!grep_format_flag_present(&args(&[
+            "-r", "-n", "pattern", "src/"
+        ])));
         assert!(!grep_format_flag_present(&args(&["-i", "pattern", "file"])));
     }
 
@@ -2166,7 +2206,10 @@ mod grep_format_flag_tests {
 
     #[test]
     fn double_dash_unrelated_does_not_trigger() {
-        assert!(!grep_format_flag_present(&args(&["--include=*.rs", "pattern"])));
+        assert!(!grep_format_flag_present(&args(&[
+            "--include=*.rs",
+            "pattern"
+        ])));
     }
 }
 
@@ -2223,7 +2266,10 @@ mod grep_preprocess_tests {
     #[test]
     fn test_preprocess_grep_context_flag_short_routes_passthrough() {
         let out = preprocess_grep_args(v(&["-A3", "needle", "file"]));
-        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A3", "needle", "file"])));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-A3", "needle", "file"]))
+        );
     }
 
     #[test]
@@ -2238,7 +2284,10 @@ mod grep_preprocess_tests {
     #[test]
     fn test_preprocess_grep_context_flag_with_space() {
         let out = preprocess_grep_args(v(&["-A", "3", "needle", "file"]));
-        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A", "3", "needle", "file"])));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-A", "3", "needle", "file"]))
+        );
     }
 
     #[test]
@@ -2246,7 +2295,10 @@ mod grep_preprocess_tests {
         // -iA3 contains a context flag bundled with -i. Route to passthrough
         // with original args so rg sees the full intent.
         let out = preprocess_grep_args(v(&["-iA3", "needle", "file"]));
-        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-iA3", "needle", "file"])));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-iA3", "needle", "file"]))
+        );
     }
 
     #[test]
@@ -2255,10 +2307,7 @@ mod grep_preprocess_tests {
         // so the stripper MUST run before passthrough too. rg is recursive
         // by default — dropping `-r` is safe.
         let out = preprocess_grep_args(v(&["-r", "-A3", "needle", "."]));
-        assert_eq!(
-            out,
-            GrepPreprocess::Passthrough(v(&["-A3", "needle", "."]))
-        );
+        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A3", "needle", "."])));
     }
 
     #[test]
@@ -2293,7 +2342,10 @@ mod grep_preprocess_tests {
     #[test]
     fn test_preprocess_grep_dash_B_alone_routes_passthrough() {
         let out = preprocess_grep_args(v(&["-B", "2", "needle", "file"]));
-        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-B", "2", "needle", "file"])));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-B", "2", "needle", "file"]))
+        );
     }
 
     // ---- issue #97: strip -E no-op flag, route -H to passthrough ----
@@ -2311,7 +2363,10 @@ mod grep_preprocess_tests {
         // doing so dropped filename output. It routes to passthrough so rg
         // honours --with-filename. -H is preserved in the args.
         let out = preprocess_grep_args(v(&["-H", "needle", "a.txt"]));
-        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-H", "needle", "a.txt"])));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-H", "needle", "a.txt"]))
+        );
     }
 
     #[test]
@@ -2326,7 +2381,10 @@ mod grep_preprocess_tests {
         // -HnE: E stripped, but the surviving -Hn bundle carries -H so the
         // call routes to passthrough (rg honours -H natively). -n is kept.
         let out = preprocess_grep_args(v(&["-HnE", "needle", "a.txt"]));
-        assert_eq!(out, GrepPreprocess::Passthrough(v(&["-Hn", "needle", "a.txt"])));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-Hn", "needle", "a.txt"]))
+        );
     }
 
     #[test]
@@ -2514,9 +2572,8 @@ mod meta_flag_tests {
     #[test]
     fn test_meta_passthrough_covers_all_subcommand_only_wrappers() {
         let expected = [
-            "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl",
-            "gh", "glab", "aws", "psql", "prisma", "gt",
-            "pytest", "ruff", "mypy", "rake", "rubocop", "rspec", "pip",
+            "cargo", "pnpm", "npm", "npx", "go", "docker", "kubectl", "gh", "glab", "aws", "psql",
+            "prisma", "gt", "pytest", "ruff", "mypy", "rake", "rubocop", "rspec", "pip",
         ];
         for bin in expected {
             assert!(
@@ -2524,7 +2581,8 @@ mod meta_flag_tests {
                 "missing {} from META_PASSTHROUGH_BINS — meta-flag \
                  invocations of `contextcrawler {} --version` will pollute \
                  parse_failures",
-                bin, bin
+                bin,
+                bin
             );
         }
     }
@@ -2896,10 +2954,7 @@ fn run_cli() -> Result<i32> {
                     // passthrough path does NOT surface postinstall / audit /
                     // deprecation warnings, so route those aliases through the
                     // same `filter_pnpm_install` treatment `pnpm install` gets.
-                    let first = args
-                        .first()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string);
+                    let first = args.first().and_then(|s| s.to_str()).map(str::to_string);
                     match first {
                         Some(sub) if pnpm_cmd::is_install_subcommand(&sub) => {
                             // Drop the leading subcommand; the rest are args.
@@ -3832,9 +3887,7 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Security { all, json } => {
-            hooks::tirith_gate::run_security_dashboard(all, json)?
-        }
+        Commands::Security { all, json } => hooks::tirith_gate::run_security_dashboard(all, json)?,
     };
 
     Ok(code)
@@ -4422,10 +4475,7 @@ mod tests {
     fn test_proxy_default_does_not_split_whitespace_path() {
         use std::ffi::OsString;
         // Simulates `contextcrawler proxy "/opt/my tool/bin" arg1`.
-        let args: Vec<OsString> = vec![
-            OsString::from("/opt/my tool/bin"),
-            OsString::from("arg1"),
-        ];
+        let args: Vec<OsString> = vec![OsString::from("/opt/my tool/bin"), OsString::from("arg1")];
         // Default (non-shell) path: argv[0] verbatim, argv[1..] verbatim.
         let (cmd_name, cmd_args) = (args[0].clone(), args[1..].to_vec());
         assert_eq!(cmd_name, OsString::from("/opt/my tool/bin"));
