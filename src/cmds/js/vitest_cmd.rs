@@ -6,7 +6,9 @@ use serde::Deserialize;
 
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{check_forbidden_node_args, package_manager_exec, strip_ansi};
+use crate::core::utils::{
+    check_forbidden_node_args, check_forbidden_node_config_args, package_manager_exec, strip_ansi,
+};
 use crate::parser::{
     emit_degradation_warning, emit_passthrough_warning, extract_json_object, truncate_passthrough,
     FormatMode, OutputParser, ParseResult, TestFailure, TestResult, TokenFormatter,
@@ -209,6 +211,10 @@ pub fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32>
 
     // Issue #37: gate user-forwarded args before they reach vitest/jest.
     check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+    // CMD-I2: deny `--config`/`-c` pointing at an executed JS/TS module
+    // (vitest/jest load the config as a require()d module → planted-file
+    // RCE). Auto-discovery covers the legitimate project-config case.
+    check_forbidden_node_config_args(args).map_err(|m| anyhow!(m))?;
 
     let (framework, mut cmd) = match command {
         Commands::Vitest { .. } => {

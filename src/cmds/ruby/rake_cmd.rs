@@ -5,7 +5,7 @@
 //! Uses `ruby_exec("rake")` to auto-detect `bundle exec`.
 
 use crate::core::runner;
-use crate::core::utils::{ruby_exec, strip_ansi};
+use crate::core::utils::{check_forbidden_rake_args, ruby_exec, strip_ansi};
 use anyhow::Result;
 
 /// Decide whether to use `rake test` or `rails test` based on args.
@@ -47,6 +47,16 @@ fn looks_like_test_path(arg: &str) -> bool {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Reject startup-code-loading flags before the command is built —
+    // `-r`/`--require`, `-R`/`--libdir`, `-I`, `-f`/`--rakefile` all run
+    // arbitrary Ruby (e.g. `rake -f /tmp/evil.rake`). Fail closed. The
+    // same flags are dangerous on the `rails` runner `select_runner` may
+    // route to, so the check sits ahead of `select_runner`. See CMD-I1.
+    if let Err(msg) = check_forbidden_rake_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let (tool, effective_args) = select_runner(args);
     let mut cmd = ruby_exec(tool);
     for arg in &effective_args {

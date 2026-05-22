@@ -1,12 +1,18 @@
 //! Filters Prettier output to show only files that need formatting.
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::{check_forbidden_node_args, package_manager_exec};
+use crate::core::utils::{
+    check_forbidden_node_args, check_forbidden_node_config_args, package_manager_exec,
+};
 use anyhow::{anyhow, Result};
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Issue #37.
     check_forbidden_node_args(args).map_err(|m| anyhow!(m))?;
+    // CMD-I2: deny `--config`/`-c` pointing at an executed JS/TS module
+    // (prettier require()s a .js config → planted-file RCE). Data-only
+    // .json/.yaml configs and auto-discovery remain available.
+    check_forbidden_node_config_args(args).map_err(|m| anyhow!(m))?;
 
     let mut cmd = package_manager_exec("prettier");
 

@@ -2505,6 +2505,99 @@ pub fn check_forbidden_node_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
     Ok(())
 }
 
+/// Heuristic for CMD-I2: is this `--config` value an *executed* JS/TS
+/// module (as opposed to a data-only `.json`/`.yaml` file)?
+///
+/// eslint/vitest/prettier `--config` accept both. A `.js`/`.cjs`/`.mjs`/
+/// `.ts`/`.cts`/`.mts` config is `require()`d and *runs* — a planted file
+/// is RCE. A `.json`/`.yaml`/`.yml` config is parsed as data only.
+///
+/// We also treat a bare extension-less value containing a path separator
+/// as executed-shape: the planted-file attack does not need a leading
+/// `./`, and an extension-less config path is most likely a JS module
+/// resolved by Node's loader. A bare value with no separator and no
+/// extension (e.g. an eslint shareable preset name) is left alone.
+fn config_value_is_executed_module(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    // Data-only config formats: parsed, never executed → allowed.
+    if lower.ends_with(".json")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+    {
+        return false;
+    }
+    // Executed JS/TS module extensions.
+    if lower.ends_with(".js")
+        || lower.ends_with(".cjs")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".cts")
+        || lower.ends_with(".mts")
+    {
+        return true;
+    }
+    // Extension-less but path-shaped (contains a separator): treat as an
+    // executed module path. Node resolves an extension-less config path
+    // to a JS module. A bare name with no separator is not path-shaped.
+    if value.contains('/') || value.contains('\\') {
+        return true;
+    }
+    false
+}
+
+/// CMD-I2: deny `--config <file>` / `-c <file>` for eslint / vitest /
+/// prettier when the value is an executed JS/TS module.
+///
+/// These tools load a `--config` JS/TS file as a `require()`d module —
+/// a planted `evil.js` config is arbitrary code execution. The tool
+/// auto-discovers the project's own config when `--config` is omitted,
+/// so denying an executed-module `--config` does not block normal use.
+/// Data-only configs (`.json`/`.yaml`/`.yml`) are allowed through.
+///
+/// Scoped to eslint/vitest/prettier only (NOT the shared node checker):
+/// `-c` means different things to other Node tools, so a per-tool call
+/// site avoids false positives.
+pub fn check_forbidden_node_config_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let strs: Vec<&str> = args.iter().map(|a| a.as_ref()).collect();
+    let mut i = 0;
+    while i < strs.len() {
+        let a = strs[i];
+
+        // `--config=value` / `-c=value` form.
+        for prefix in ["--config=", "-c="] {
+            if let Some(value) = a.strip_prefix(prefix) {
+                if config_value_is_executed_module(value) {
+                    return Err(node_deny_message(a));
+                }
+            }
+        }
+
+        // `--config value` / `-c value` form (consume next arg).
+        if a == "--config" || a == "-c" {
+            if let Some(next) = strs.get(i + 1) {
+                if config_value_is_executed_module(next) {
+                    return Err(node_deny_message(&format!("{} {}", a, next)));
+                }
+            }
+        }
+
+        // Glued short form `-cvalue` (e.g. `-cevil.js`). Not `-c=` (handled
+        // above), not `--`, and must carry a value after `-c`.
+        if a.starts_with("-c") && !a.starts_with("-c=") && !a.starts_with("--") && a.len() > 2 {
+            let value = &a[2..];
+            if config_value_is_executed_module(value) {
+                return Err(node_deny_message(a));
+            }
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod secure_node_tests {
     use super::*;
@@ -2595,6 +2688,61 @@ mod secure_node_tests {
         let err = check_forbidden_node_args(&["--require", "/x"]).unwrap_err();
         assert!(err.contains("contextcrawler proxy"));
         assert!(err.contains("#37"));
+    }
+
+    // ── --config / -c executed-module deny (CMD-I2) ──────────────────
+
+    #[test]
+    fn config_rejects_executed_js_ts_modules() {
+        // Both spellings, both forms, planted-file (bare) and path forms.
+        assert!(check_forbidden_node_config_args(&["--config", "evil.js"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config=evil.js"]).is_err());
+        assert!(check_forbidden_node_config_args(&["-c", "evil.js"]).is_err());
+        assert!(check_forbidden_node_config_args(&["-c=evil.js"]).is_err());
+        // Glued short form `-cvalue`.
+        assert!(check_forbidden_node_config_args(&["-cevil.js"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config", "/tmp/evil.ts"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config", "./e.cjs"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config", "../e.mjs"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config", "vitest.config.cts"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config", "eslint.config.mts"]).is_err());
+        // Extension-less but path-shaped → executed-module shape.
+        assert!(check_forbidden_node_config_args(&["--config", "/tmp/plantedconfig"]).is_err());
+        assert!(check_forbidden_node_config_args(&["--config", "subdir\\cfg"]).is_err());
+    }
+
+    #[test]
+    fn config_allows_data_only_formats() {
+        // .json / .yaml / .yml are parsed as data, never executed.
+        assert!(check_forbidden_node_config_args(&[".eslintrc.json"]).is_ok());
+        assert!(check_forbidden_node_config_args(&["--config", ".eslintrc.json"]).is_ok());
+        assert!(check_forbidden_node_config_args(&["--config=config/eslint.json"]).is_ok());
+        assert!(check_forbidden_node_config_args(&["--config", "prettier.yaml"]).is_ok());
+        assert!(check_forbidden_node_config_args(&["-c", ".prettierrc.yml"]).is_ok());
+        // Glued short form with a data-only config — must pass.
+        assert!(check_forbidden_node_config_args(&["-cconfig.json"]).is_ok());
+    }
+
+    #[test]
+    fn config_allows_typical_safe_args() {
+        // No --config at all — auto-discovery, the recommended path.
+        assert!(check_forbidden_node_config_args(&["src/", "--fix"]).is_ok());
+        assert!(check_forbidden_node_config_args(&["--ext", ".ts,.tsx"]).is_ok());
+        // Bare extension-less name (eslint shareable preset) — not path-shaped.
+        assert!(check_forbidden_node_config_args(&["--config", "airbnb"]).is_ok());
+        // -c next value is a positional, not a config path.
+        assert!(check_forbidden_node_config_args(&["-c"]).is_ok());
+    }
+
+    #[test]
+    fn config_value_classifier() {
+        assert!(config_value_is_executed_module("foo.js"));
+        assert!(config_value_is_executed_module("FOO.JS"));
+        assert!(config_value_is_executed_module("a/b/c"));
+        assert!(!config_value_is_executed_module("foo.json"));
+        assert!(!config_value_is_executed_module("foo.yaml"));
+        assert!(!config_value_is_executed_module("airbnb"));
+        assert!(!config_value_is_executed_module(""));
     }
 
     #[test]
@@ -3136,6 +3284,82 @@ pub fn check_forbidden_rubocop_args<S: AsRef<str>>(args: &[S]) -> Result<(), Str
                 "rubocop",
                 a,
                 "--require loads arbitrary Ruby code at startup",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// rake (and `rails`, which `select_runner` may route to) exposes several
+/// flags that load arbitrary Ruby at startup:
+///   - `-r` / `--require <lib>`  — `Kernel.require` on attacker input.
+///   - `-R` / `--libdir <dir>`   — prepends a dir to `$LOAD_PATH`, so a
+///     planted library shadows a real one on the next `require`.
+///   - `-I <dir>`                — also a `$LOAD_PATH` prepend (Ruby's own
+///     `-I`, forwarded through).
+///   - `-f` / `--rakefile <path>`— runs an attacker-controlled Rakefile,
+///     which is plain Ruby (`rake -f /tmp/evil.rake` → RCE).
+///
+/// All four are rejected in agent-facing mode. We match the exact flag,
+/// the `--flag=value` form, and the glued short-flag form (`-I/path`,
+/// `-f=...`, `-r=...`). Operators who genuinely need them run
+/// `contextcrawler proxy rake <args>`.
+pub fn check_forbidden_rake_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    for arg in args {
+        let a = arg.as_ref();
+
+        // -r / --require <lib> — exact, glued `-r/path`, `-r=`, `--require=`.
+        // Ruby's OptionParser accepts glued short options, so `-r/tmp/evil.rb`
+        // must be caught too. Guard `!--` so the short-glued branch can't
+        // swallow `--require` (which is handled by its own exact/`=` arms).
+        if a == "-r"
+            || a == "--require"
+            || (a.starts_with("-r") && !a.starts_with("--"))
+            || a.starts_with("--require=")
+        {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "rake",
+                a,
+                "-r / --require loads arbitrary Ruby code at startup",
+                "#37",
+            ));
+        }
+
+        // -R / --libdir <dir> — exact, glued `-R/path`, `-R=`, `--libdir=`.
+        if a == "-R"
+            || a == "--libdir"
+            || (a.starts_with("-R") && !a.starts_with("--"))
+            || a.starts_with("--libdir=")
+        {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "rake",
+                a,
+                "-R / --libdir prepends a dir to $LOAD_PATH (planted library shadows a real one)",
+                "#37",
+            ));
+        }
+
+        // -I <dir> — exact, `-I=`, and glued `-I/path`.
+        if a == "-I" || a.starts_with("-I") {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "rake",
+                a,
+                "-I prepends a dir to $LOAD_PATH (planted library shadows a real one)",
+                "#37",
+            ));
+        }
+
+        // -f / --rakefile <path> — exact, glued `-f/path`, `-f=`, `--rakefile=`.
+        if a == "-f"
+            || a == "--rakefile"
+            || (a.starts_with("-f") && !a.starts_with("--"))
+            || a.starts_with("--rakefile=")
+        {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "rake",
+                a,
+                "-f / --rakefile runs an attacker-controlled Rakefile (arbitrary Ruby)",
+                "#37",
             ));
         }
     }
@@ -3768,6 +3992,60 @@ mod secure_pyrbjvmdotnet_tests {
         // rubocop's short `-r` means --display-only-correctable in some
         // versions; we don't block bare -r here.
         assert!(check_forbidden_rubocop_args(&["-r"]).is_ok());
+    }
+
+    // ── rake deny (CMD-I1) ───────────────────────────────────────────
+
+    #[test]
+    fn rake_rejects_require() {
+        assert!(check_forbidden_rake_args(&["-r", "/tmp/evil.rb"]).is_err());
+        assert!(check_forbidden_rake_args(&["--require", "/tmp/evil.rb"]).is_err());
+        assert!(check_forbidden_rake_args(&["-r=evil"]).is_err());
+        assert!(check_forbidden_rake_args(&["--require=evil"]).is_err());
+        // Glued short form — Ruby's OptionParser accepts `-r/tmp/evil.rb`.
+        assert!(check_forbidden_rake_args(&["-r/tmp/evil.rb"]).is_err());
+    }
+
+    #[test]
+    fn rake_rejects_libdir() {
+        assert!(check_forbidden_rake_args(&["-R", "/tmp/evil"]).is_err());
+        assert!(check_forbidden_rake_args(&["--libdir", "/tmp/evil"]).is_err());
+        assert!(check_forbidden_rake_args(&["-R=/tmp/evil"]).is_err());
+        assert!(check_forbidden_rake_args(&["--libdir=/tmp/evil"]).is_err());
+        // Glued short form.
+        assert!(check_forbidden_rake_args(&["-R/tmp/evil"]).is_err());
+    }
+
+    #[test]
+    fn rake_rejects_include_dir() {
+        // exact, `-I=`, and glued `-I/path` forms.
+        assert!(check_forbidden_rake_args(&["-I", "/tmp/evil"]).is_err());
+        assert!(check_forbidden_rake_args(&["-I=/tmp/evil"]).is_err());
+        assert!(check_forbidden_rake_args(&["-I/tmp/evil"]).is_err());
+    }
+
+    #[test]
+    fn rake_rejects_rakefile() {
+        // The headline attack: rake -f /tmp/evil.rake → arbitrary Ruby.
+        assert!(check_forbidden_rake_args(&["-f", "/tmp/evil.rake"]).is_err());
+        assert!(check_forbidden_rake_args(&["--rakefile", "/tmp/evil.rake"]).is_err());
+        assert!(check_forbidden_rake_args(&["-f=/tmp/evil.rake"]).is_err());
+        assert!(check_forbidden_rake_args(&["--rakefile=/tmp/evil.rake"]).is_err());
+        // Glued short form — the headline RCE bypass.
+        assert!(check_forbidden_rake_args(&["-f/tmp/evil.rake"]).is_err());
+    }
+
+    #[test]
+    fn rake_allows_normal_args() {
+        // Positive controls — common legitimate invocations must pass.
+        assert!(check_forbidden_rake_args(&["test"]).is_ok());
+        assert!(check_forbidden_rake_args(&["-T"]).is_ok());
+        assert!(check_forbidden_rake_args(&["db:migrate"]).is_ok());
+        assert!(check_forbidden_rake_args(&["test", "TEST=test/models/post_test.rb"]).is_ok());
+        assert!(check_forbidden_rake_args(&["--tasks"]).is_ok());
+        assert!(check_forbidden_rake_args(&["--trace"]).is_ok());
+        assert!(check_forbidden_rake_args(&["--verbose"]).is_ok());
+        assert!(check_forbidden_rake_args(&["assets:precompile"]).is_ok());
     }
 
     // ── gradle deny ──────────────────────────────────────────────────
