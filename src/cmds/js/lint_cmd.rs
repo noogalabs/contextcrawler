@@ -4,7 +4,8 @@ use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::{
-    check_forbidden_node_args, package_manager_exec, secure_python_command, truncate,
+    check_forbidden_node_args, check_forbidden_node_config_args, package_manager_exec,
+    secure_python_command, truncate,
 };
 use crate::mypy_cmd;
 use crate::ruff_cmd;
@@ -105,6 +106,9 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         // eslint/biome/etc. Python linters keep their own hardening
         // path; this gate covers Node tools only.
         check_forbidden_node_args(effective_args).map_err(|m| anyhow!(m))?;
+        // CMD-I2: deny `--config`/`-c` pointing at an executed JS/TS
+        // module (eslint require()s the config → planted-file RCE).
+        check_forbidden_node_config_args(effective_args).map_err(|m| anyhow!(m))?;
         package_manager_exec(linter)
     };
 
