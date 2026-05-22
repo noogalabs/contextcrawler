@@ -13,6 +13,9 @@ use walkdir::WalkDir;
 #[derive(Debug)]
 pub struct ExtractedCommand {
     pub command: String,
+    /// Character count of the tool output — a token-estimate proxy
+    /// (callers do `len / 4`), not a byte offset. Char-based so multibyte
+    /// content (CJK, emoji) doesn't inflate the estimate ~3x.
     pub output_len: Option<usize>,
     #[allow(dead_code)]
     pub session_id: String,
@@ -316,7 +319,10 @@ impl SessionProvider for ClaudeProvider {
                                     let content =
                                         block.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
-                                    let output_len = content.len();
+                                    // Char count, not byte length: this feeds
+                                    // a `/4` token estimate, and byte length
+                                    // overstates multibyte content ~3x.
+                                    let output_len = content.chars().count();
                                     let is_error = block
                                         .get("is_error")
                                         .and_then(|e| e.as_bool())
@@ -390,7 +396,30 @@ mod tests {
         assert!(cmds[0].output_len.is_some());
         assert_eq!(
             cmds[0].output_len.unwrap(),
-            "On branch master\nnothing to commit".len()
+            "On branch master\nnothing to commit".chars().count()
+        );
+    }
+
+    #[test]
+    fn test_output_len_is_char_count_not_byte_len() {
+        // Multibyte content: byte length overstates char count ~3x for CJK.
+        let multibyte = "日本語のテスト出力";
+        let jsonl = make_jsonl(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mb","name":"Bash","input":{"command":"echo hi"}}]}}"#,
+            &format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_mb","content":"{}"}}]}}}}"#,
+                multibyte
+            ),
+        ]);
+
+        let provider = ClaudeProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+        assert_eq!(cmds.len(), 1);
+        // Char count, not byte length.
+        assert_eq!(cmds[0].output_len.unwrap(), multibyte.chars().count());
+        assert!(
+            multibyte.len() > multibyte.chars().count(),
+            "fixture must be genuinely multibyte"
         );
     }
 
