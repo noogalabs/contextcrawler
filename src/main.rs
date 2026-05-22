@@ -1807,19 +1807,112 @@ fn grep_format_flag_present(args: &[String]) -> bool {
 
 /// Result of pre-clap grep preprocessing.
 ///
-/// `Stripped` — recursive flags (`-r`/`-R`/`--recursive`) were removed; the
-/// remaining args are safe to hand to clap. rg is recursive by default so
-/// dropping `-r` doesn't change behaviour.
+/// `Stripped` — recursive flags (`-r`/`-R`/`--recursive`) were removed and the
+/// remaining args were reordered so the positional pattern/path come first
+/// and any leading boolean grep flags (`-i`, `-n`, `-w`, …) trail behind them.
+/// clap rejects an unknown short flag that appears *before* the `<PATTERN>`
+/// positional — but the `extra_args` field is `trailing_var_arg` +
+/// `allow_hyphen_values`, so once the positionals are consumed the same flags
+/// parse cleanly. Reordering is what stops standard grep flags producing
+/// `unexpected argument` parse failures (P0: 62% of all parse failures).
 ///
 /// `Passthrough` — call contains context flags (`-A`/`-B`/`-C` or their long
-/// forms) or the print-filename flag (`-H`/`--with-filename`) that the
-/// rtk-backed grep filter can't honour line-by-line; route the whole call to
-/// `run_grep_format_passthrough` (which uses rg natively and understands
+/// forms), the print-filename flag (`-H`/`--with-filename`), a value-taking
+/// flag (`-e`/`-f`/`-m`/…) or a documented format flag; route the whole call
+/// to `run_grep_format_passthrough` (which uses rg natively and understands
 /// recursive flags, context flags, and `-H`).
+///
+/// `Quiet` — call carries `-q`/`--quiet`. grep in quiet mode emits NO stdout
+/// and is used purely for its exit code. Route to a quiet rg/grep run so the
+/// filter never tries (and fails) to parse empty output, and never logs a
+/// parse failure.
 #[derive(Debug, PartialEq, Eq)]
 enum GrepPreprocess {
     Stripped(Vec<String>),
     Passthrough(Vec<String>),
+    Quiet(Vec<String>),
+}
+
+/// Boolean (valueless) standard grep flags that the rtk-backed filter can
+/// forward to rg and still filter the output normally. These are reordered
+/// behind the positional pattern/path so clap parses them as `extra_args`.
+/// `r`/`R`/`E` are NOT here — they are stripped separately (no-ops for rg).
+/// `A`/`B`/`C`/`H` are NOT here — they route to passthrough.
+const GREP_BOOL_SHORTS: &[u8] = &[
+    b'i', b'w', b'x', b'v', b'n', b'h', b's', b'F', b'P', b'G', b'a', b'I',
+];
+
+/// Long-form boolean grep flags forwarded to rg with output still filtered.
+const GREP_BOOL_LONGS: &[&str] = &[
+    "--ignore-case",
+    "--word-regexp",
+    "--line-regexp",
+    "--invert-match",
+    "--line-number",
+    "--no-filename",
+    "--no-messages",
+    "--fixed-strings",
+    "--perl-regexp",
+    "--basic-regexp",
+    "--extended-regexp",
+    "--text",
+];
+
+/// Standard grep value-taking flags (consume the next token, or carry it via
+/// `--flag=value`). Reordering them safely is fragile, so any call carrying
+/// one is routed to passthrough where rg parses the args natively.
+const GREP_VALUE_LONGS: &[&str] = &[
+    "--regexp",
+    "--file",
+    "--max-count",
+    "--color",
+    "--colour",
+    "--label",
+    "--binary-files",
+    "--devices",
+    "--directories",
+    "--include",
+    "--exclude",
+    "--exclude-dir",
+];
+
+/// True if `arg` is a `-q`/`--quiet`/`--silent` quiet flag, bare or bundled.
+fn is_grep_quiet_flag(arg: &str) -> bool {
+    if arg == "--quiet" || arg == "--silent" {
+        return true;
+    }
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() < 2 {
+        return false;
+    }
+    // Bare `-q` or `-q` inside an all-alphabetic short bundle (`-iq`, `-qn`).
+    let body = &arg[1..];
+    body.bytes().all(|b| b.is_ascii_alphabetic()) && body.bytes().any(|b| b == b'q')
+}
+
+/// True if `arg` is a standard grep value-taking flag (`-e`/`-f`/`-m` short,
+/// or a long form in `GREP_VALUE_LONGS`, possibly `--flag=value`).
+fn is_grep_value_flag(arg: &str) -> bool {
+    for long in GREP_VALUE_LONGS {
+        if arg == *long || arg.starts_with(&format!("{}=", long)) {
+            return true;
+        }
+    }
+    // Bare `-e`/`-f`/`-m` only — a bundle like `-ie` would mean something
+    // else; keep this conservative and exact.
+    matches!(arg, "-e" | "-f" | "-m")
+}
+
+/// True if `arg` is a recognised boolean grep flag (bare short, all-alpha
+/// short bundle of bool letters, or a long form).
+fn is_grep_bool_flag(arg: &str) -> bool {
+    if GREP_BOOL_LONGS.contains(&arg) {
+        return true;
+    }
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() < 2 {
+        return false;
+    }
+    let body = &arg[1..];
+    body.bytes().all(|b| GREP_BOOL_SHORTS.contains(&b))
 }
 
 /// Short grep flags that are safe to drop entirely before handing args to
@@ -1888,15 +1981,42 @@ fn preprocess_grep_args(args: Vec<String>) -> GrepPreprocess {
         stripped.push(arg);
     }
 
-    // Pass 2: detect context flags OR the print-filename flag (`-H`)
-    // anywhere in the stripped args. If any present, route stripped args to
-    // passthrough — rg honours `-A`/`-B`/`-C` and `-H` natively, the
-    // rtk-backed line-by-line filter can't.
-    if has_grep_context_flag(&stripped) || has_grep_with_filename_flag(&stripped) {
+    // Pass 2: quiet mode. `-q`/`--quiet` produces no stdout — the call is
+    // used purely for its exit code. Route to a dedicated quiet run so the
+    // filter never logs a parse failure for a flag it can't model.
+    if stripped.iter().any(|a| is_grep_quiet_flag(a)) {
+        return GrepPreprocess::Quiet(stripped);
+    }
+
+    // Pass 3: detect context flags, the print-filename flag (`-H`), or a
+    // value-taking flag (`-e`/`-f`/`-m`/`--include`/…). If any present, route
+    // to passthrough — rg honours `-A`/`-B`/`-C`, `-H` and value flags
+    // natively, the rtk-backed line-by-line filter can't reorder them safely.
+    if has_grep_context_flag(&stripped)
+        || has_grep_with_filename_flag(&stripped)
+        || stripped.iter().any(|a| is_grep_value_flag(a))
+    {
         return GrepPreprocess::Passthrough(stripped);
     }
 
-    GrepPreprocess::Stripped(stripped)
+    // Pass 4: reorder. clap rejects an unknown short flag that appears before
+    // the `<PATTERN>` positional. Move every recognised boolean grep flag
+    // behind the positionals so clap parses them into `extra_args` (which is
+    // `trailing_var_arg` + `allow_hyphen_values`). `grep_cmd::run` forwards
+    // `extra_args` to rg unchanged and still filters the output. Any token
+    // that is not a recognised flag is treated as a positional and keeps its
+    // relative order, so `pattern` and `path` stay correct.
+    let mut positionals: Vec<String> = Vec::with_capacity(stripped.len());
+    let mut bool_flags: Vec<String> = Vec::new();
+    for arg in stripped {
+        if is_grep_bool_flag(&arg) {
+            bool_flags.push(arg);
+        } else {
+            positionals.push(arg);
+        }
+    }
+    positionals.extend(bool_flags);
+    GrepPreprocess::Stripped(positionals)
 }
 
 /// True if any arg is a grep context flag (`-A`/`-B`/`-C` short or long).
@@ -2186,20 +2306,22 @@ mod grep_preprocess_tests {
 
     #[test]
     fn test_preprocess_grep_strips_bundled_rn() {
+        // -rn: r stripped, -n survives but is reordered behind the
+        // positionals (Pass 4) so clap parses it as trailing extra_args.
         let out = preprocess_grep_args(v(&["-rn", "needle", "."]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", ".", "-n"])));
     }
 
     #[test]
     fn test_preprocess_grep_strips_bundled_nr() {
         let out = preprocess_grep_args(v(&["-nr", "needle", "."]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", ".", "-n"])));
     }
 
     #[test]
     fn test_preprocess_grep_strips_capital_R() {
         let out = preprocess_grep_args(v(&["-Rn", "needle", "."]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", ".", "-n"])));
     }
 
     #[test]
@@ -2210,14 +2332,16 @@ mod grep_preprocess_tests {
 
     #[test]
     fn test_preprocess_grep_keeps_other_short_letters() {
+        // -in is a recognised boolean bundle: kept, reordered behind the
+        // positionals so clap parses it as trailing extra_args.
         let out = preprocess_grep_args(v(&["-in", "needle", "file"]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-in", "needle", "file"])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", "file", "-in"])));
     }
 
     #[test]
     fn test_preprocess_grep_strips_rin_to_in() {
         let out = preprocess_grep_args(v(&["-rin", "needle", "."]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-in", "needle", "."])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", ".", "-in"])));
     }
 
     #[test]
@@ -2282,11 +2406,14 @@ mod grep_preprocess_tests {
     }
 
     #[test]
-    fn test_preprocess_grep_no_recursive_no_context_passes_through_unchanged() {
+    fn test_preprocess_grep_reorders_leading_bool_flags_behind_positionals() {
+        // P0 fix: leading boolean grep flags (`-i`, `-w`) are reordered
+        // behind the positionals so clap parses them as `extra_args` instead
+        // of rejecting them as `unexpected argument`.
         let out = preprocess_grep_args(v(&["-i", "-w", "pattern", "path"]));
         assert_eq!(
             out,
-            GrepPreprocess::Stripped(v(&["-i", "-w", "pattern", "path"]))
+            GrepPreprocess::Stripped(v(&["pattern", "path", "-i", "-w"]))
         );
     }
 
@@ -2316,9 +2443,9 @@ mod grep_preprocess_tests {
 
     #[test]
     fn test_preprocess_grep_strips_bundled_rnE() {
-        // -rnE: r + E stripped, -n survives.
+        // -rnE: r + E stripped, -n survives and reorders behind positionals.
         let out = preprocess_grep_args(v(&["-rnE", "needle", "."]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", ".", "-n"])));
     }
 
     #[test]
@@ -2332,8 +2459,9 @@ mod grep_preprocess_tests {
     #[test]
     fn test_preprocess_grep_strips_E_only_bundle_fully() {
         // -E alone in a bundle leaves nothing → token dropped entirely.
+        // The surviving -n reorders behind the positionals.
         let out = preprocess_grep_args(v(&["-E", "-n", "needle", "."]));
-        assert_eq!(out, GrepPreprocess::Stripped(v(&["-n", "needle", "."])));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["needle", ".", "-n"])));
     }
 
     #[test]
@@ -2341,6 +2469,141 @@ mod grep_preprocess_tests {
         // -E + -A3: E stripped, context flag routes to passthrough.
         let out = preprocess_grep_args(v(&["-E", "-A3", "needle", "."]));
         assert_eq!(out, GrepPreprocess::Passthrough(v(&["-A3", "needle", "."])));
+    }
+
+    // ---- P0 fix: standard grep flags must never cause a parse failure ----
+    // 1,255 production parse failures (62% of all) were `grep` invocations
+    // where clap rejected a standard flag appearing before the <PATTERN>
+    // positional. Each case below MUST resolve to a route that parses
+    // cleanly — never `run_fallback` with an `unexpected argument` error.
+
+    #[test]
+    fn test_preprocess_grep_quiet_short_routes_to_quiet() {
+        // `-q` is the single biggest source of parse failures (811 cases).
+        let out = preprocess_grep_args(v(&["-q", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Quiet(v(&["-q", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_quiet_long_routes_to_quiet() {
+        let out = preprocess_grep_args(v(&["--quiet", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Quiet(v(&["--quiet", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_quiet_bundled_routes_to_quiet() {
+        // `-iq` — quiet bundled with ignore-case.
+        let out = preprocess_grep_args(v(&["-iq", "needle", "."]));
+        assert_eq!(out, GrepPreprocess::Quiet(v(&["-iq", "needle", "."])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_recursive_then_pattern() {
+        // `grep -r pattern dir` — r stripped, pattern/dir kept as positionals.
+        let out = preprocess_grep_args(v(&["-r", "pattern", "dir"]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["pattern", "dir"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_E_then_pattern() {
+        // `grep -E 'a|b' file` — E stripped (no-op for rg), positionals kept.
+        let out = preprocess_grep_args(v(&["-E", "a|b", "file"]));
+        assert_eq!(out, GrepPreprocess::Stripped(v(&["a|b", "file"])));
+    }
+
+    #[test]
+    fn test_preprocess_grep_i_n_reorders_behind_pattern() {
+        // `grep -i -n pattern file` — both bool flags reorder behind the
+        // positionals so clap parses them as `extra_args`, not unexpected.
+        let out = preprocess_grep_args(v(&["-i", "-n", "pattern", "file"]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Stripped(v(&["pattern", "file", "-i", "-n"]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_context_AB_routes_passthrough() {
+        // `grep -A2 -B2 pattern file` — context flags route to passthrough
+        // (rg honours them natively); never an `unexpected argument` error.
+        let out = preprocess_grep_args(v(&["-A2", "-B2", "needle", "file"]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-A2", "-B2", "needle", "file"]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_regex_flavour_flags_reorder() {
+        // -F/-P/-G regex-flavour flags are accepted, reordered behind the
+        // positionals and forwarded to rg.
+        for flag in ["-F", "-P", "-G"] {
+            let out = preprocess_grep_args(v(&[flag, "needle", "file"]));
+            assert_eq!(
+                out,
+                GrepPreprocess::Stripped(v(&["needle", "file", flag])),
+                "flag {flag} should reorder behind positionals"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preprocess_grep_value_flag_routes_passthrough() {
+        // `grep -e pattern file` — `-e` takes a value; reordering it is
+        // fragile, so the call routes to passthrough where rg parses it.
+        let out = preprocess_grep_args(v(&["-e", "needle", "file"]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Passthrough(v(&["-e", "needle", "file"]))
+        );
+    }
+
+    #[test]
+    fn test_preprocess_grep_invert_match_reorders() {
+        // `-v` (invert-match) is a standard bool flag. NB: clap also declares
+        // `-v` as the global verbosity flag, but on the grep path it is a
+        // recognised grep bool flag and reorders into extra_args.
+        let out = preprocess_grep_args(v(&["-v", "needle", "file"]));
+        assert_eq!(
+            out,
+            GrepPreprocess::Stripped(v(&["needle", "file", "-v"]))
+        );
+    }
+
+    // Helper-level coverage for the classifiers.
+    #[test]
+    fn test_classifier_quiet() {
+        use super::is_grep_quiet_flag;
+        assert!(is_grep_quiet_flag("-q"));
+        assert!(is_grep_quiet_flag("--quiet"));
+        assert!(is_grep_quiet_flag("--silent"));
+        assert!(is_grep_quiet_flag("-iq"));
+        assert!(!is_grep_quiet_flag("-i"));
+        assert!(!is_grep_quiet_flag("needle"));
+        assert!(!is_grep_quiet_flag("--q")); // not a real long flag
+    }
+
+    #[test]
+    fn test_classifier_bool() {
+        use super::is_grep_bool_flag;
+        assert!(is_grep_bool_flag("-i"));
+        assert!(is_grep_bool_flag("-in"));
+        assert!(is_grep_bool_flag("--ignore-case"));
+        assert!(!is_grep_bool_flag("-A")); // context flag
+        assert!(!is_grep_bool_flag("-c")); // format flag
+        assert!(!is_grep_bool_flag("needle"));
+    }
+
+    #[test]
+    fn test_classifier_value() {
+        use super::is_grep_value_flag;
+        assert!(is_grep_value_flag("-e"));
+        assert!(is_grep_value_flag("-f"));
+        assert!(is_grep_value_flag("-m"));
+        assert!(is_grep_value_flag("--include"));
+        assert!(is_grep_value_flag("--include=*.rs"));
+        assert!(!is_grep_value_flag("-i"));
+        assert!(!is_grep_value_flag("needle"));
     }
 
     // ---- run_cli pipeline-ordering regression tests ----
@@ -2358,13 +2621,17 @@ mod grep_preprocess_tests {
         // sees. Returns the final args slice (without the leading "grep").
         let preprocessed = preprocess_grep_args(args);
         let working: &[String] = match &preprocessed {
-            GrepPreprocess::Stripped(a) | GrepPreprocess::Passthrough(a) => a.as_slice(),
+            GrepPreprocess::Stripped(a)
+            | GrepPreprocess::Passthrough(a)
+            | GrepPreprocess::Quiet(a) => a.as_slice(),
         };
         if grep_format_flag_present(working) {
             return working.to_vec();
         }
         match preprocessed {
-            GrepPreprocess::Passthrough(a) | GrepPreprocess::Stripped(a) => a,
+            GrepPreprocess::Passthrough(a)
+            | GrepPreprocess::Stripped(a)
+            | GrepPreprocess::Quiet(a) => a,
         }
     }
 
@@ -2436,7 +2703,8 @@ mod grep_preprocess_tests {
         let out = run_cli_grep_pipeline(v(&["-rnE", "needle", "."]));
         assert!(!pipeline_has_clap_rejecting_flag(&out), "got {:?}", out);
         assert!(!out.iter().any(|a| a == "-r"), "stale -r in {:?}", out);
-        assert_eq!(out, v(&["-n", "needle", "."]));
+        // -n reorders behind the positionals so clap parses it as extra_args.
+        assert_eq!(out, v(&["needle", ".", "-n"]));
     }
 
     #[test]
@@ -2558,11 +2826,15 @@ fn run_cli() -> Result<i32> {
             // wrong behaviour. Strip first, then route.
             let preprocessed = preprocess_grep_args(raw_args[1..].to_vec());
             let working_args: &[String] = match &preprocessed {
-                GrepPreprocess::Stripped(a) | GrepPreprocess::Passthrough(a) => a.as_slice(),
+                GrepPreprocess::Stripped(a)
+                | GrepPreprocess::Passthrough(a)
+                | GrepPreprocess::Quiet(a) => a.as_slice(),
             };
 
             // Format-flag intercept runs on the stripped args so -r/-R/
-            // --recursive cannot leak through to rg.
+            // --recursive cannot leak through to rg. `grep_format_flag_present`
+            // scans every token position-independently, so it still fires
+            // after the Pass-4 reorder.
             if grep_format_flag_present(working_args) {
                 let mut full = Vec::with_capacity(working_args.len() + 1);
                 full.push("grep".to_string());
@@ -2571,6 +2843,17 @@ fn run_cli() -> Result<i32> {
             }
 
             match preprocessed {
+                GrepPreprocess::Quiet(stripped) => {
+                    // `-q`/`--quiet`: no stdout, exit code only. rg honours
+                    // `-q` natively; route the call straight to rg so the
+                    // filter never tries to model empty output and never
+                    // logs a parse failure (P0: `-q` is the single biggest
+                    // source of grep parse failures).
+                    let mut full = Vec::with_capacity(stripped.len() + 1);
+                    full.push("grep".to_string());
+                    full.extend(stripped);
+                    return run_grep_format_passthrough(&full);
+                }
                 GrepPreprocess::Passthrough(stripped) => {
                     // Context-flag passthrough: rtk-backed grep can't honour
                     // -A/-B/-C, so route the (now stripped) args to rg.
