@@ -3302,6 +3302,146 @@ pub fn check_forbidden_pip_args<S: AsRef<str>>(args: &[S]) -> Result<(), String>
     Ok(())
 }
 
+/// MSBuild property *prefixes* that, when assigned a path, inject an
+/// attacker-controlled `.targets` / `.props` file into the build. MSBuild
+/// evaluates these as imports during every build, and a `<Exec Command="…">`
+/// task inside such a file is arbitrary code execution. The match is on a
+/// lowercased property name and is a `starts_with`, so the whole family is
+/// covered: `CustomBeforeMicrosoftCommonTargets`,
+/// `CustomAfterMicrosoftCommonTargets`,
+/// `CustomBeforeMicrosoftCommonProps`, `CustomAfterMicrosoftCommonProps`,
+/// `CustomBeforeDirectoryBuildTargets`, `CustomAfterDirectoryBuildTargets`,
+/// `CustomBeforeDirectoryBuildProps`, `CustomAfterDirectoryBuildProps`,
+/// and any future `CustomBefore*` / `CustomAfter*` variant. MSBuild property
+/// names are case-insensitive, so the comparison must be too.
+const FORBIDDEN_MSBUILD_PROPERTY_PREFIXES: &[&str] = &["custombefore", "customafter"];
+
+/// Flag spellings that introduce an MSBuild property assignment. dotnet /
+/// MSBuild treat `-p:` and `/p:` as equivalent, and also accept the long
+/// `--property:` / `-property:` forms. All carry `NAME=VALUE` glued to the
+/// flag (`-p:Name=Value`).
+const MSBUILD_PROPERTY_FLAG_PREFIXES: &[&str] = &["-p:", "/p:", "--property:", "-property:"];
+
+/// `dotnet test` accepts a `.runsettings` file via `--runsettings` or the
+/// `-s` short form. A `.runsettings` file can declare `TestAdaptersPaths` /
+/// data collectors that load an attacker-controlled assembly into the test
+/// host — RCE. This is a CLI flag, not an env var, so `secure_dotnet_command`
+/// does NOT defend it.
+const DOTNET_RUNSETTINGS_FLAGS_EXACT: &[&str] = &["--runsettings", "-s"];
+
+/// Returns `Some(names)` with every property name if `arg` is an MSBuild
+/// property assignment (`-p:NAME=VALUE`, `/p:NAME=VALUE`,
+/// `--property:NAME=VALUE`, `-property:NAME=VALUE`).
+///
+/// MSBuild accepts multiple properties batched into one flag, semicolon-
+/// delimited (`-p:A=1;B=2`), so the remainder after the flag prefix is split
+/// on `;` and the name of every `NAME=VALUE` pair is returned. Each name is
+/// the text before its first `=`, with surrounding whitespace trimmed
+/// (MSBuild tolerates `-p: Name =Value`).
+///
+/// The flag-prefix match is case-insensitive: MSBuild compares switch names
+/// case-insensitively, so `-P:`, `/P:`, `--PROPERTY:` are all valid.
+fn msbuild_property_names(arg: &str) -> Option<Vec<&str>> {
+    for prefix in MSBUILD_PROPERTY_FLAG_PREFIXES {
+        // Case-insensitive prefix match: lowercase only the leading span of
+        // `arg` that is the same length as `prefix`, then compare.
+        if arg.len() >= prefix.len()
+            && arg[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            let rest = &arg[prefix.len()..];
+            let names = rest
+                .split(';')
+                .map(|pair| pair.split('=').next().unwrap_or(pair).trim())
+                .collect();
+            return Some(names);
+        }
+    }
+    None
+}
+
+/// dotnet / MSBuild expose RCE-grade *CLI flags* that env-stripping
+/// (`secure_dotnet_command`, issue #36) does NOT touch:
+///
+/// * `-p:CustomBeforeMicrosoftCommonTargets=<path>` (and the `CustomAfter*`,
+///   `*DirectoryBuildTargets`, and `*Props` variants) injects an attacker-
+///   controlled `.targets` / `.props` file evaluated during the build; an
+///   `<Exec Command="…">` task in it is arbitrary code execution. The `/p:`
+///   syntax is equivalent to `-p:`; `--property:` / `-property:` likewise.
+/// * `dotnet test --runsettings <file>` / `-s <file>` loads a `.runsettings`
+///   file that can declare `TestAdaptersPaths` / data collectors which load
+///   an attacker assembly into the test host.
+///
+/// This is the same class as #111 (`go -toolexec`) and #34 (`cargo
+/// --config target.*.runner`). Legitimate properties such as
+/// `-p:Configuration=Release` are NOT rejected — only the
+/// `Custom(Before|After)*` family and runsettings.
+pub fn check_forbidden_dotnet_args<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let raw = args[i].as_ref();
+
+        // `@response-file` → MSBuild expands the file's contents into flags
+        // before parsing, so a `.rsp` containing `-p:CustomBefore...` would
+        // bypass this checker entirely. There is no benign response-file use
+        // under the contextcrawler wrapper; the escape hatch is
+        // `contextcrawler proxy dotnet`.
+        if raw.starts_with('@') {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "dotnet",
+                raw,
+                "@response-file expands to arbitrary MSBuild flags bypassing \
+                 the arg checker",
+                "#36",
+            ));
+        }
+
+        // MSBuild property assignment → reject only the Custom*Targets /
+        // Custom*Props family. Both the flag-prefix match and the property
+        // name match are case-insensitive (MSBuild switch names and property
+        // names are both case-insensitive). Multiple properties batched into
+        // one flag (`-p:A=1;B=2`) are all checked, not just the first.
+        if let Some(names) = msbuild_property_names(raw) {
+            for name in names {
+                let name_lower = name.to_ascii_lowercase();
+                if FORBIDDEN_MSBUILD_PROPERTY_PREFIXES
+                    .iter()
+                    .any(|p| name_lower.starts_with(p))
+                {
+                    return Err(pyrbjvm_deny_message_with_issue(
+                        "dotnet",
+                        raw,
+                        "MSBuild Custom(Before|After)* property imports an attacker \
+                         .targets/.props file evaluated during the build (Exec task = RCE)",
+                        "#36",
+                    ));
+                }
+            }
+        }
+
+        // `--runsettings <file>` / `-s <file>` (separate-arg form) and the
+        // attached `--runsettings=<file>` / `-s:<file>` / `-s=<file>` forms.
+        // A bare `-s` / `--runsettings` with no following value is harmless,
+        // but we reject it too: there is no benign use of it under
+        // contextcrawler, and the escape hatch is `contextcrawler proxy`.
+        let is_runsettings = DOTNET_RUNSETTINGS_FLAGS_EXACT.contains(&raw)
+            || raw.starts_with("--runsettings=")
+            || raw.starts_with("-s:")
+            || raw.starts_with("-s=");
+        if is_runsettings {
+            return Err(pyrbjvm_deny_message_with_issue(
+                "dotnet",
+                raw,
+                "--runsettings / -s loads a .runsettings file that can declare \
+                 TestAdaptersPaths / data collectors loading an attacker assembly",
+                "#36",
+            ));
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod secure_pyrbjvmdotnet_tests {
@@ -3723,6 +3863,194 @@ mod secure_pyrbjvmdotnet_tests {
     fn pip_allows_normal_args() {
         assert!(check_forbidden_pip_args(&["install", "requests"]).is_ok());
         assert!(check_forbidden_pip_args(&["list", "--format=json"]).is_ok());
+    }
+
+    // ── dotnet deny (SEC-C1) ─────────────────────────────────────────
+
+    #[test]
+    fn dotnet_rejects_custom_before_after_targets_props() {
+        // CustomBefore/After*Targets — the canonical MSBuild import RCE.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomBeforeMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomAfterMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomBeforeDirectoryBuildTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomAfterDirectoryBuildTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        // The Custom*Props variants.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomBeforeMicrosoftCommonProps=/tmp/evil.props"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomAfterDirectoryBuildProps=/tmp/evil.props"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dotnet_rejects_slash_p_and_long_property_forms() {
+        // `/p:` is equivalent to `-p:`.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "/p:CustomBeforeMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        // `--property:` / `-property:` long forms.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "--property:CustomAfterMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-property:CustomBeforeDirectoryBuildTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dotnet_property_name_match_is_case_insensitive() {
+        // MSBuild property names are case-insensitive — a lowercased or
+        // mixed-case spelling must still be caught.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:custombeforemicrosoftcommontargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CuStOmAfTeRmicrosoftcommontargets=/tmp/evil.targets"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dotnet_rejects_runsettings() {
+        assert!(
+            check_forbidden_dotnet_args(&["test", "--runsettings", "/tmp/evil.runsettings"])
+                .is_err()
+        );
+        assert!(
+            check_forbidden_dotnet_args(&["test", "--runsettings=/tmp/evil.runsettings"]).is_err()
+        );
+        assert!(check_forbidden_dotnet_args(&["test", "-s", "/tmp/evil.runsettings"]).is_err());
+        assert!(check_forbidden_dotnet_args(&["test", "-s:/tmp/evil.runsettings"]).is_err());
+    }
+
+    #[test]
+    fn dotnet_allows_legitimate_properties_and_args() {
+        // Legitimate `-p:` / `/p:` properties must NOT be rejected.
+        assert!(check_forbidden_dotnet_args(&["build", "-p:Configuration=Release"]).is_ok());
+        assert!(check_forbidden_dotnet_args(&["build", "/p:Configuration=Debug"]).is_ok());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:TreatWarningsAsErrors=true"
+        ])
+        .is_ok());
+        assert!(check_forbidden_dotnet_args(&["test", "--filter", "Category=Unit"]).is_ok());
+        assert!(check_forbidden_dotnet_args(&["build"]).is_ok());
+        assert!(check_forbidden_dotnet_args(&["build", "MyApp.csproj"]).is_ok());
+        // A property that merely *contains* "custom" but is not the
+        // Custom(Before|After)* family is fine.
+        assert!(check_forbidden_dotnet_args(&["build", "-p:MyCustomProp=value"]).is_ok());
+    }
+
+    #[test]
+    fn dotnet_rejects_semicolon_batched_custom_property() {
+        // MSBuild accepts multiple properties in one `-p:` arg, semicolon-
+        // delimited. The forbidden property may be in ANY position, not just
+        // the first — every pair's name must be checked.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:Configuration=Release;CustomBeforeMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:A=1;B=2;CustomAfterMicrosoftCommonTargets=/x"
+        ])
+        .is_err());
+        // Forbidden property first, benign property after.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomBeforeMicrosoftCommonTargets=/x;OutputPath=bin"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dotnet_flag_prefix_match_is_case_insensitive() {
+        // MSBuild compares switch names case-insensitively — `-P:`, `/P:`,
+        // `--PROPERTY:` are all valid and must not bypass the checker.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-P:CustomBeforeMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "/P:CustomBeforeMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "--PROPERTY:CustomAfterMicrosoftCommonTargets=/tmp/evil.targets"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dotnet_rejects_response_file() {
+        // `@file` is expanded by MSBuild into flags before parsing, so a
+        // `.rsp` file could smuggle `-p:CustomBefore...` past the checker.
+        let e = check_forbidden_dotnet_args(&["build", "@/tmp/evil.rsp"]).unwrap_err();
+        assert!(e.contains("contextcrawler proxy dotnet"));
+        assert!(e.contains("@response-file"));
+    }
+
+    #[test]
+    fn dotnet_rejects_whitespace_padded_property_name() {
+        // MSBuild tolerates `-p: Name =Value`; the trimmed name must still
+        // be matched against the forbidden family.
+        assert!(check_forbidden_dotnet_args(&[
+            "build",
+            "-p: CustomBeforeMicrosoftCommonTargets =/tmp/evil.targets"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dotnet_allows_semicolon_batched_benign_properties() {
+        // A semicolon-batched `-p:` with no Custom(Before|After)* member is
+        // legitimate and must NOT be rejected.
+        assert!(check_forbidden_dotnet_args(&["build", "-p:A=1;B=2"]).is_ok());
+    }
+
+    #[test]
+    fn dotnet_deny_message_mentions_escape_hatch() {
+        let e = check_forbidden_dotnet_args(&[
+            "build",
+            "-p:CustomBeforeMicrosoftCommonTargets=/tmp/evil.targets",
+        ])
+        .unwrap_err();
+        assert!(e.contains("contextcrawler proxy dotnet"));
+        assert!(e.contains("-p:CustomBeforeMicrosoftCommonTargets"));
     }
 
     // ── error message ────────────────────────────────────────────────
