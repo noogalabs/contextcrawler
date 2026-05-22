@@ -277,7 +277,7 @@ pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
     //    Run against the whitespace-normalised command so spacing/quoting
     //    variants cannot evade a glob deny rule either.
     if pattern.contains('*') {
-        return glob_matches(&canonical_command(cmd), pattern);
+        return glob_matches(&canonical_command(cmd), &canonical_command(pattern));
     }
 
     // 4. No wildcard: token-sequence comparison — the pattern's tokens must
@@ -702,6 +702,37 @@ mod tests {
         );
     }
 
+    // Review fix: arithmetic expansion `$((...))` is not command execution,
+    // so a command containing it must still reach Allow when its base
+    // pattern matches. Previously the spurious inner segment dropped it
+    // to Default and prompted the user unexpectedly.
+    #[test]
+    fn test_allow_survives_arithmetic_expansion() {
+        let allow = vec!["echo *".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo $((COUNT+1))", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    // Review fix: a glob pattern written with irregular whitespace must
+    // still match the equivalent command — the pattern is now normalised
+    // via `canonical_command` in the glob branch, same as the command.
+    #[test]
+    fn test_glob_pattern_whitespace_normalised() {
+        // Double space in the pattern around the wildcard.
+        assert!(command_matches_pattern(
+            "git push --force origin main",
+            "git  *  --force *"
+        ));
+        // And via the full rule path.
+        let allow = vec!["git  push  *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git push origin main", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
     // --- Regression tests for #1213 ---
     // Compound command permission escalation: a single allowed segment must NOT
     // grant Allow to the entire chain. Every non-empty segment must match
@@ -1001,5 +1032,445 @@ mod tests {
             PermissionVerdict::Allow,
             "all segments allowed → Allow even with substitution"
         );
+    }
+
+    // ===== ADVERSARIAL BYPASS PROBES =====
+
+    // --- Probe A1: $( ) with inner whitespace-only ---
+    // An empty substitution $(  ) should not crash and should fail-closed.
+    #[test]
+    fn probe_a1_empty_subst_whitespace() {
+        let deny = vec!["rm -rf".to_string()];
+        let allow = vec!["echo *".to_string()];
+        // Should not panic; whitespace-only inner is benign but must not allow
+        let v = check_command_with_rules("echo $(  )", &deny, &[], &allow);
+        // We accept Allow or Default — the key is it must NOT panic
+        // and must not Deny a benign command.
+        assert_ne!(v, PermissionVerdict::Deny, "empty subst must not Deny a benign cmd");
+    }
+
+    // --- Probe A2: ${VAR} parameter expansion — must NOT be extracted as command subst ---
+    // ${VAR} is variable expansion, not command substitution.
+    // The gate must not mistakenly treat it as a command and deny/allow based on inner.
+    #[test]
+    fn probe_a2_dollar_brace_not_command_subst() {
+        let deny = vec!["rm -rf".to_string()];
+        // ${rm -rf /x} is NOT valid command substitution — it's a bad variable name.
+        // It must NOT match the deny rule (no inner command execution).
+        // More importantly: it must not extract "rm -rf /x" as a command.
+        let v = check_command_with_rules("echo ${rm -rf /x}", &deny, &[], &[]);
+        // In bash ${rm -rf /x} is a syntax error — it's NOT a command subst.
+        // The correct result: no command substitution extracted, so Deny only
+        // if the outer segment "echo ${rm -rf /x}" itself matches.
+        // CRITICAL: if the gate incorrectly extracts "rm -rf /x" from ${...},
+        // the result would be Deny — but that's actually SAFE (over-blocking).
+        // The dangerous case is if it ALLOWS. Let's just assert it's not Allow.
+        assert_ne!(v, PermissionVerdict::Allow);
+    }
+
+    // --- Probe A3: $(cmd1; cmd2) — semicolon chain inside substitution ---
+    // The inner split_on_operators should decompose this further.
+    #[test]
+    fn probe_a3_semicolon_chain_inside_subst() {
+        let deny = vec!["rm -rf".to_string()];
+        // echo $(echo benign; rm -rf /x) — the rm -rf is hidden after ;
+        let v = check_command_with_rules("echo $(echo benign; rm -rf /x)", &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "semicolon inside substitution must still surface rm -rf for deny check");
+    }
+
+    // --- Probe A4: substitution inside single quotes — must be SKIPPED ---
+    #[test]
+    fn probe_a4_subst_in_single_quotes_skipped() {
+        let deny = vec!["rm -rf".to_string()];
+        // '$(rm -rf /x)' — single quotes suppress substitution in bash.
+        // The gate must NOT extract this as a command (it's literal text).
+        let v = check_command_with_rules("echo '$(rm -rf /x)'", &deny, &[], &[]);
+        // Shell does NOT execute rm -rf here. We want Default, not Deny.
+        // If this returns Deny, it's a false positive (over-blocking single-quoted text).
+        // If this returns Default, correct.
+        assert_eq!(v, PermissionVerdict::Default,
+            "substitution inside single quotes must not be extracted as a command");
+    }
+
+    // --- Probe A5: arithmetic $((...)) must not be mistaken for command subst ---
+    // $((2+2)) is arithmetic expansion, not command substitution.
+    // Extracting "2+2" as a "command" and checking it is harmless but must not cause
+    // a false deny or bypass.
+    #[test]
+    fn probe_a5_arithmetic_double_paren() {
+        let deny = vec!["rm -rf".to_string()];
+        let allow = vec!["echo *".to_string()];
+        // $((2+2)) should be benign — outer is "echo 4"
+        let v = check_command_with_rules("echo $((2+2))", &deny, &[], &allow);
+        // This is benign — must not Deny. May return Allow or Default.
+        assert_ne!(v, PermissionVerdict::Deny,
+            "arithmetic expansion must not trigger a false deny");
+    }
+
+    // --- Probe A6: deeply nested $(a $(b $(c))) ---
+    #[test]
+    fn probe_a6_deeply_nested_substitution() {
+        let deny = vec!["rm -rf".to_string()];
+        let v = check_command_with_rules("echo $(echo $(echo $(rm -rf /x)))", &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "deeply nested substitution must surface rm -rf and deny");
+    }
+
+    // --- Probe A7: inner payload contains operator (echo $(x && rm -rf /)) ---
+    #[test]
+    fn probe_a7_inner_payload_with_operator() {
+        let deny = vec!["rm -rf".to_string()];
+        let v = check_command_with_rules("echo $(x && rm -rf /)", &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "operator inside substitution inner must still be split and denied");
+    }
+
+    // --- Probe A8: NUL byte injection — can attacker forge the sentinel? ---
+    // Attacker sends literal NUL in command to try to forge the sentinel or
+    // cause issues in matching.
+    #[test]
+    fn probe_a8_nul_byte_injection() {
+        let deny = vec!["rm -rf".to_string()];
+        let allow = vec!["echo *".to_string()];
+        // Literal NUL in command — shell would reject this but we must handle gracefully.
+        // The sentinel is "\0contextcrawler-unparsable-substitution\0".
+        // Can an attacker inject NUL to forge a benign-looking segment?
+        let cmd_with_nul = "echo\0some";
+        let v = check_command_with_rules(cmd_with_nul, &deny, &[], &allow);
+        // The key safety property: this must not Deny a genuinely benign command
+        // AND must not Allow a deny-worthy command via NUL injection.
+        // NUL-containing segments cannot match any shell command meaningfully.
+        // We just assert no panic.
+        let _ = v; // result doesn't matter; no panic = pass
+    }
+
+    // --- Probe B1: quoted token that merges two words (false match concern) ---
+    // git 'push --force' is ONE argument (push --force), NOT two tokens.
+    // A deny rule for "git push --force" should NOT match this — it's a different command.
+    #[test]
+    fn probe_b1_quoted_multi_word_single_arg() {
+        let deny = vec!["git push --force".to_string()];
+        // shell_split("git 'push --force'") should yield ["git", "push --force"]
+        // after strip_quotes → ["git", "push --force"]
+        // deny pattern tokens: ["git", "push", "--force"]  (3 tokens)
+        // command tokens: ["git", "push --force"]  (2 tokens)
+        // These should NOT match — different argument boundaries.
+        // This is a FALSE NEGATIVE concern: we want to make sure a quoted single-arg
+        // does not accidentally match a multi-token pattern.
+        // Actually here it's a safety net: if it DID match, it might over-block.
+        // Let's verify behaviour either way.
+        let v = check_command_with_rules("git 'push --force'", &deny, &[], &[]);
+        // In bash, git 'push --force' passes the literal string "push --force" as one
+        // argument to git — it is NOT the same as git push --force. So this should be
+        // Default (not Deny). If it IS Deny, it's a false positive, not a bypass.
+        // Document the actual behavior:
+        println!("probe_b1: git 'push --force' against deny[git push --force] = {:?}", v);
+        // For security: false positive (Deny when shouldn't) is acceptable.
+        // False negative (not Deny when should be) would be a bypass.
+        // For this specific case Default is CORRECT behavior.
+    }
+
+    // --- Probe B2: backslash-escaped space in command ---
+    // git\ push is actually "git push" in bash (one arg: "git push")
+    // After shell_split with backslash handling: "git push" becomes ONE token.
+    // A deny rule for "git push --force" (3 tokens) must NOT match "git\\ push" (1 token).
+    #[test]
+    fn probe_b2_backslash_escaped_space() {
+        let deny = vec!["git push --force".to_string()];
+        // "git\ push --force" — backslash escapes the space, making "git push" one token.
+        // shell_split behavior: backslash-space → consumes next char into current token.
+        // Result should be tokens: ["git push", "--force"] (2 tokens).
+        // Pattern tokens: ["git", "push", "--force"] (3 tokens).
+        // 2 tokens != 3 tokens → no match. This is CORRECT (no bypass, but also no false deny).
+        let v = check_command_with_rules("git\\ push --force", &deny, &[], &[]);
+        println!("probe_b2: git\\ push --force = {:?}", v);
+        // This SHOULD be Default (the shell treats git\ push as one word, not git push).
+        // If it's Deny, that's a false positive. If it's Default, it's correct.
+        // This is not a bypass — Default ≠ Allow.
+    }
+
+    // --- Probe B3: tab vs space separator ---
+    #[test]
+    fn probe_b3_tab_separator_still_matches() {
+        let deny = vec!["git push --force".to_string()];
+        // shell_split handles tabs as whitespace separators.
+        let v = check_command_with_rules("git\tpush\t--force", &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "tab-separated tokens must match the deny rule (tab = whitespace)");
+    }
+
+    // --- Probe B4: empty pattern — must never match ---
+    #[test]
+    fn probe_b4_empty_pattern() {
+        // An empty deny pattern must match nothing (tokens_prefix_match returns false for empty pat).
+        assert!(!command_matches_pattern("git push", ""));
+        assert!(!command_matches_pattern("", ""));
+    }
+
+    // --- Probe B5: NBSP (U+00A0) as token separator ---
+    // NBSP is not ASCII space/tab; shell_split only strips ' ' and '\t'.
+    // An attacker using NBSP to separate tokens won't be split.
+    #[test]
+    fn probe_b5_nbsp_does_not_split_tokens() {
+        let deny = vec!["git push --force".to_string()];
+        // U+00A0 NBSP between git and push — shell_split won't treat it as separator.
+        // So "git\u{00A0}push --force" → tokens: ["git\u{00A0}push", "--force"]
+        // Pattern: ["git", "push", "--force"] — won't match. Default.
+        // This is correct: NBSP is not a shell separator; the command is syntactically different.
+        let nbsp_cmd = "git\u{00A0}push --force";
+        let v = check_command_with_rules(nbsp_cmd, &deny, &[], &[]);
+        // Should be Default, not Deny. This is a HARDENING GAP but not a bypass:
+        // bash itself would not parse NBSP as a separator, so this isn't the same command.
+        println!("probe_b5: git NBSP push --force = {:?}", v);
+    }
+
+    // --- Probe C1: literal NUL sentinel in attacker command ---
+    // Attacker tries to inject the SUBST_FAIL_CLOSED_SENTINEL directly as a command
+    // to see if it causes any false Allow/Deny.
+    #[test]
+    fn probe_c1_literal_sentinel_injection() {
+        let sentinel = "\u{0}contextcrawler-unparsable-substitution\u{0}";
+        let deny = vec!["rm -rf".to_string()];
+        let allow = vec!["*".to_string()];
+        // If attacker submits the sentinel as their command, does it get Allow?
+        // allow = ["*"] matches everything... so this would Allow even the sentinel.
+        // But that's the allow rule's job — this isn't a bypass of the sentinel logic.
+        let v = check_command_with_rules(sentinel, &deny, &[], &allow);
+        println!("probe_c1: sentinel injection with allow[*] = {:?}", v);
+        // The key question: does the sentinel accidentally match a deny rule?
+        // Answer: it can't match "rm -rf" because it doesn't tokenise to those tokens.
+        // No security issue here.
+    }
+
+    // --- Probe C2: sentinel injection with no allow rules (fail-closed check) ---
+    // If someone submits the sentinel literal as a real command, does it fail open?
+    #[test]
+    fn probe_c2_sentinel_injection_no_allow() {
+        let sentinel = "\u{0}contextcrawler-unparsable-substitution\u{0}";
+        let v = check_command_with_rules(sentinel, &[], &[], &[]);
+        assert_eq!(v, PermissionVerdict::Default,
+            "sentinel literal as command with no rules must be Default, not Allow");
+    }
+
+    // --- Probe D1: glob on whitespace-normalised command ---
+    // After canonical_command(), "git  push  --force" becomes "git push --force".
+    // A glob deny rule like "git * --force" must still match.
+    #[test]
+    fn probe_d1_glob_whitespace_normalised() {
+        let deny = vec!["git * --force".to_string()];
+        let v = check_command_with_rules("git  push  --force", &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "glob deny must match after whitespace normalisation");
+    }
+
+    // --- Probe D2: glob with quoted tokens in command ---
+    // "git 'push' --force" normalised → "git push --force"
+    // glob "git * --force" must match.
+    #[test]
+    fn probe_d2_glob_quoted_tokens() {
+        let deny = vec!["git * --force".to_string()];
+        let v = check_command_with_rules("git 'push' --force", &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "glob deny must match after quote stripping and normalisation");
+    }
+
+    // --- Probe E1: allow verdict when substitution segment is itself allowed ---
+    // If deny=[] and allow=["echo *", "date"], then "echo $(date)" should Allow.
+    // Already tested above, but let's also check with a substitution that itself
+    // matches an allow rule explicitly.
+    #[test]
+    fn probe_e1_substitution_verdict_not_dropped() {
+        let deny = vec!["rm -rf".to_string()];
+        let allow = vec!["echo *".to_string(), "date".to_string()];
+        // echo $(date) → segments: ["echo $(date)", "date"]
+        // Both must match allow rules. echo $(date) matches "echo *", date matches "date".
+        let v = check_command_with_rules("echo $(date)", &deny, &[], &allow);
+        assert_eq!(v, PermissionVerdict::Allow,
+            "all segments allowed including extracted substitution → Allow");
+    }
+
+    // --- Probe E2: deny inside substitution of allowed outer command ---
+    // echo $(rm -rf /x) — outer "echo ..." might match allow, but inner must Deny.
+    #[test]
+    fn probe_e2_deny_inside_allowed_outer() {
+        let deny = vec!["rm -rf".to_string()];
+        let allow = vec!["echo *".to_string()];
+        let v = check_command_with_rules("echo $(rm -rf /x)", &deny, &[], &allow);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "deny inside substitution must not be hidden by outer allow match");
+    }
+
+    // --- Probe F1: $(...) inside double-quoted string ---
+    // Bash DOES expand $(...) inside double quotes. The gate must extract it.
+    #[test]
+    fn probe_f1_subst_inside_double_quotes() {
+        let deny = vec!["rm -rf".to_string()];
+        // echo "$(rm -rf /x)" — inside double quotes, still active
+        let v = check_command_with_rules(r#"echo "$(rm -rf /x)""#, &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "$(…) inside double quotes must still be extracted and denied");
+    }
+
+    // --- Probe F2: backtick inside double-quoted string ---
+    // bash executes `cmd` even inside double quotes.
+    #[test]
+    fn probe_f2_backtick_inside_double_quotes() {
+        let deny = vec!["rm -rf".to_string()];
+        let v = check_command_with_rules(r#"echo "`rm -rf /x`""#, &deny, &[], &[]);
+        assert_eq!(v, PermissionVerdict::Deny,
+            "backtick inside double quotes must still be extracted and denied");
+    }
+
+    // --- Probe G1: $VAR (parameter expansion, not substitution) ---
+    // echo $HOME must not be extracted as a command substitution.
+    #[test]
+    fn probe_g1_dollar_variable_not_subst() {
+        let deny = vec!["HOME".to_string()];
+        let allow = vec!["echo *".to_string()];
+        // $HOME is NOT a command substitution. "HOME" must not be surfaced as a segment.
+        // If it were, the allow check would fail on "HOME" since "HOME" doesn't match "echo *".
+        let v = check_command_with_rules("echo $HOME", &deny, &[], &allow);
+        // $HOME → no substitution extracted → only segment is "echo $HOME"
+        // "echo $HOME" matches "echo *" → Allow
+        // If it incorrectly extracts "HOME" as a segment and that segment matches deny["HOME"] → Deny
+        // The allow case: if "HOME" is NOT in deny but also not in allow → Default (not Allow)
+        // Let's use a different deny to test correctness:
+        let deny2: Vec<String> = vec![];
+        let v2 = check_command_with_rules("echo $HOME", &deny2, &[], &allow);
+        assert_eq!(v2, PermissionVerdict::Allow,
+            "$VAR must not be extracted as substitution, breaking the allow chain");
+    }
+}
+
+
+#[cfg(test)]
+mod adversarial_trace {
+    use super::*;
+    use crate::discover::lexer::{extract_substitutions, shell_split, strip_quotes};
+
+    // Verify shell_split behavior on contested inputs
+    #[test]
+    fn trace_shell_split_quoted_multiword() {
+        // git 'push --force' → shell treats 'push --force' as ONE arg
+        let tokens = shell_split("git 'push --force'");
+        // shell_split drops the quotes but preserves the single token
+        println!("shell_split(git 'push --force') = {:?}", tokens);
+        // Expected: ["git", "push --force"]  (2 tokens after quote stripping by shell_split)
+        // But strip_quotes only strips the SURROUNDING quotes of each token.
+        // shell_split just toggles in_single without emitting the quote char,
+        // so 'push --force' yields "push --force" as one token.
+        assert_eq!(tokens, vec!["git", "push --force"]);
+    }
+
+    #[test]
+    fn trace_normalise_tokens_quoted_multiword() {
+        // normalise_tokens strips outer quotes from each token.
+        // "push --force" (double-quoted) → strip_quotes → "push --force" (string with space)
+        // But shell_split("git 'push --force'") returns ["git", "push --force"] — 
+        // the quotes are already consumed by shell_split itself (toggle, no emit).
+        // So strip_quotes("push --force") = "push --force" (no quotes to strip).
+        // Deny pattern "git push --force" → tokens ["git", "push", "--force"] (3 tokens)
+        // Command tokens ["git", "push --force"] (2 tokens) — pat_tokens.len() > cmd_tokens.len()? No:
+        // pat=3, cmd=2 → pat.len() > cmd.len() → tokens_prefix_match returns FALSE. Correct!
+        let deny = vec!["git push --force".to_string()];
+        let v = super::check_command_with_rules("git 'push --force'", &deny, &[], &[]);
+        println!("git 'push --force' against deny[git push --force] = {:?}", v);
+        assert_eq!(v, PermissionVerdict::Default,
+            "single-quoted multi-word arg is NOT the same as separate tokens — must be Default");
+    }
+
+    #[test]
+    fn trace_arithmetic_expansion_segments() {
+        // Review fix: `$((2+2))` is arithmetic expansion, NOT command
+        // substitution — bash never runs the inner as a command. So
+        // extract_substitutions must yield NO Substitution for it.
+        let subs = extract_substitutions("echo $((2+2))");
+        println!("extract_substitutions(echo $((2+2))) = {:?}", subs);
+        assert!(
+            subs.is_empty(),
+            "arithmetic expansion must not surface a substitution"
+        );
+    }
+
+    #[test]
+    fn trace_arithmetic_allow_regression() {
+        // Review fix: arithmetic expansion no longer produces a spurious
+        // inner segment, so a command with `$((...))` keeps its Allow
+        // verdict instead of dropping to Default.
+        let allow = vec!["echo *".to_string()];
+        let v = check_command_with_rules("echo $((2+2))", &[], &[], &allow);
+        println!("echo $((2+2)) with allow[echo *] = {:?}", v);
+        assert_eq!(
+            v,
+            PermissionVerdict::Allow,
+            "arithmetic expansion in an allowed command must stay Allow"
+        );
+    }
+
+    #[test]
+    fn trace_dollar_brace_not_extracted() {
+        // ${HOME} is parameter expansion, NOT command substitution.
+        // extract_substitutions looks for $( not ${ — so this should yield nothing.
+        let subs = extract_substitutions("echo ${HOME}");
+        println!("extract_substitutions(echo ${{HOME}}) = {:?}", subs);
+        assert!(subs.is_empty(), "dollar-brace must not be extracted as command substitution");
+    }
+
+    #[test]
+    fn trace_inner_semicolon_decomposition() {
+        // echo $(echo benign; rm -rf /x)
+        // Outer: split_on_operators sees no top-level operators → one segment
+        // extract_substitutions: inner = "echo benign; rm -rf /x"
+        // split_on_operators on inner: ["echo benign", "rm -rf /x"]
+        // Both added as segments.
+        let deny = vec!["rm -rf".to_string()];
+        let v = check_command_with_rules("echo $(echo benign; rm -rf /x)", &deny, &[], &[]);
+        println!("echo $(echo benign; rm -rf /x) = {:?}", v);
+        assert_eq!(v, PermissionVerdict::Deny);
+    }
+
+    #[test]
+    fn trace_glob_route_normalisation() {
+        // When pattern has *, glob_matches is called on canonical_command(cmd).
+        // canonical_command("git  push  --force") → "git push --force"
+        // glob pattern "git * --force" → must match.
+        let deny = vec!["git * --force".to_string()];
+        let v = check_command_with_rules("git  push  --force", &deny, &[], &[]);
+        println!("git  push  --force against glob deny[git * --force] = {:?}", v);
+        assert_eq!(v, PermissionVerdict::Deny);
+    }
+
+    #[test]
+    fn trace_double_quote_subst_extraction() {
+        // "$(rm -rf /x)" — inside double quotes, $() IS active.
+        // extract_substitutions sees c='"', sets in_double=true, continue.
+        // Next chars: '$', '(' → is_dollar_paren=true, open=...
+        // inner = "rm -rf /x", extracted.
+        let subs = extract_substitutions(r#"echo "$(rm -rf /x)""#);
+        println!("extract_substitutions on double-quoted subst = {:?}", subs);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+    }
+
+    #[test]
+    fn trace_backtick_in_double_quotes() {
+        // echo "`rm -rf /x`" — backtick inside double quotes is active.
+        let subs = extract_substitutions(r#"echo "`rm -rf /x`""#);
+        println!("extract_substitutions on backtick in double quotes = {:?}", subs);
+        // backtick handler fires even when in_double=true
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+    }
+
+    #[test]
+    fn trace_process_subst_inside_double_quotes_not_extracted() {
+        // <(...) process substitution inside double quotes — NOT active in bash, and
+        // the code checks !in_double for is_process_subst.
+        let subs = extract_substitutions(r#"echo "<(rm -rf /x)""#);
+        println!("extract_substitutions on process subst in double quotes = {:?}", subs);
+        // Expected: empty (process subst not active in double-quoted context)
+        assert!(subs.is_empty(),
+            "process substitution inside double quotes should not be extracted");
     }
 }

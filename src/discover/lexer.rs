@@ -311,6 +311,13 @@ pub fn split_on_operators(cmd: &str, stop_at_pipe: bool) -> Vec<&str> {
 /// Used by token-aware permission matching so that `"push"` and `push`
 /// compare equal. Only strips when the first and last char are the same
 /// quote character; mismatched or unquoted strings are returned unchanged.
+///
+/// Note: `shell_split` already consumes the outer quote layer when it
+/// tokenises a command, so a token reaching here is normally unquoted.
+/// This "one layer" of stripping therefore runs *on top of* what
+/// `shell_split` removed — it catches a residual quote layer (e.g. from
+/// a quote nested inside the layer `shell_split` stripped), not the
+/// original outer quoting.
 pub fn strip_quotes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() >= 2
@@ -428,6 +435,31 @@ pub fn extract_substitutions(cmd: &str) -> Vec<Substitution> {
         let paren_subst = (is_dollar_paren || is_process_subst).then_some(i + 2);
 
         if let Some(open) = paren_subst {
+            // Arithmetic expansion `$((expr))` is NOT command execution —
+            // bash evaluates the inner as arithmetic, never as a command.
+            // Detect the `$((` form (char after `$(` is another `(`) and
+            // skip it entirely, emitting no Substitution. If unbalanced,
+            // fail closed like any other malformed construct.
+            if is_dollar_paren && open < chars.len() && chars[open] == '(' {
+                match find_matching_paren(&chars, open) {
+                    Some(close) => {
+                        // `find_matching_paren` counts the inner `(` at
+                        // `open` as an extra depth level, so the index it
+                        // returns is the OUTER `)` that closes `$((`.
+                        i = close + 1;
+                    }
+                    None => {
+                        let inner: String = chars[open..].iter().collect();
+                        out.push(Substitution {
+                            inner,
+                            malformed: true,
+                        });
+                        break;
+                    }
+                }
+                continue;
+            }
+
             match find_matching_paren(&chars, open) {
                 Some(close) => {
                     let inner: String = chars[open..close].iter().collect();
@@ -1265,6 +1297,29 @@ mod tests {
     #[test]
     fn test_extract_unbalanced_is_malformed() {
         let subs = extract_substitutions("echo $(rm -rf /x");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_arithmetic_expansion_no_substitution() {
+        // `$((expr))` is arithmetic, not command execution — no Substitution.
+        assert!(extract_substitutions("echo $((2+2))").is_empty());
+        assert!(extract_substitutions("echo $((COUNT+1))").is_empty());
+    }
+
+    #[test]
+    fn test_extract_arithmetic_then_real_subst() {
+        // Arithmetic skipped, but a following real substitution still caught.
+        let subs = extract_substitutions("echo $((1+1)) $(rm -rf /x)");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+        assert!(!subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_unbalanced_arithmetic_fails_closed() {
+        let subs = extract_substitutions("echo $((COUNT+1");
         assert_eq!(subs.len(), 1);
         assert!(subs[0].malformed);
     }
