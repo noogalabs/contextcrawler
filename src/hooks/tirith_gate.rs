@@ -198,84 +198,74 @@ pub fn downgrades_log_path() -> Option<std::path::PathBuf> {
     dirs::data_local_dir().map(|d| d.join("contextcrawler/downgrades.jsonl"))
 }
 
+/// Maximum number of bytes read from the tail of `downgrades.jsonl`.
+///
+/// The log lives in a user-writable data dir, so an attacker (or a runaway
+/// writer) could grow it without bound. We only ever need the last `limit`
+/// records — each record is one short line — so 256 KB of tail is plentiful.
+/// Capping the read keeps `read_recent_downgrades` O(tail), not O(filesize).
+const DOWNGRADES_TAIL_BYTES: u64 = 256 * 1024;
+
 /// Read the tail of the downgrades log, returning up to `limit` most
 /// recent records. Each returned `String` is one VALID JSON record
-/// (re-serialised compactly via `serde_json` to ensure parseability),
-/// so multi-line / pretty-printed records get coalesced into single
-/// logical entries.
+/// (re-serialised compactly via `serde_json` to ensure parseability).
 ///
-/// Naive `content.lines()` splitting would corrupt any record that ever
-/// spans multiple physical lines (today `log_downgrade` writes
-/// single-line JSON, but a future change to pretty-print would silently
-/// break the `--json` dashboard output). Codex P2 catch on the initial
-/// draft of this fix.
+/// SEC-I4 hardening:
+///
+/// - The read is capped to the last [`DOWNGRADES_TAIL_BYTES`] of the file
+///   instead of slurping the whole file with `read_to_string`. An attacker
+///   who grows the log can no longer force an unbounded allocation.
+/// - Records are parsed line-by-line (`log_downgrade` always writes
+///   single-line JSON), replacing the previous multi-line balanced-brace
+///   scanner that was O(n²) on a large/adversarial file.
+///
+/// Behaviour is identical for well-formed single-line logs.
 pub fn read_recent_downgrades(limit: usize) -> Vec<String> {
     let path = match downgrades_log_path() {
         Some(p) if p.exists() => p,
         _ => return Vec::new(),
     };
-    let content = match std::fs::read_to_string(&path) {
+
+    let content = match read_file_tail(&path, DOWNGRADES_TAIL_BYTES) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
 
-    // Walk the file looking for top-level `{...}` balanced regions and
-    // parse each as a JSON value. Any malformed run is skipped — better
-    // to drop one record than corrupt the whole dashboard.
-    let bytes = content.as_bytes();
-    let mut records: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] != b'{' {
-            i += 1;
-            continue;
-        }
-        // Find the matching '}' with brace-balance + string-aware scanning
-        // so braces inside JSON string literals don't fool us.
-        let mut depth = 0i32;
-        let mut in_str = false;
-        let mut escaped = false;
-        let mut end = i;
-        for (j, b) in bytes[i..].iter().enumerate() {
-            if in_str {
-                if escaped {
-                    escaped = false;
-                } else if *b == b'\\' {
-                    escaped = true;
-                } else if *b == b'"' {
-                    in_str = false;
-                }
-            } else if *b == b'"' {
-                in_str = true;
-            } else if *b == b'{' {
-                depth += 1;
-            } else if *b == b'}' {
-                depth -= 1;
-                if depth == 0 {
-                    end = i + j + 1;
-                    break;
-                }
+    // Parse line-by-line. A capped read may have sliced the first line in
+    // half — skip any line that does not round-trip through serde_json.
+    // Re-serialised form is canonical (compact, single-line) so JSON
+    // consumers can rely on one record == one line.
+    let records: Vec<String> = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
             }
-        }
-        if end > i {
-            let chunk = &content[i..end];
-            // Validate by round-tripping through serde_json. Re-serialised
-            // form is canonical (single-line, compact) so JSON consumers
-            // can rely on one record == one line.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(chunk) {
-                if let Ok(canon) = serde_json::to_string(&v) {
-                    records.push(canon);
-                }
-            }
-            i = end;
-        } else {
-            // Malformed tail — bail out, don't loop forever.
-            break;
-        }
-    }
+            let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            serde_json::to_string(&v).ok()
+        })
+        .collect();
 
     let start = records.len().saturating_sub(limit);
     records[start..].to_vec()
+}
+
+/// Read at most the last `max_bytes` of `path` as a UTF-8 string.
+///
+/// Seeks to `len - max_bytes` for large files so the read cost is bounded by
+/// `max_bytes` rather than the file size. A lossy UTF-8 conversion is used so
+/// a tail that begins mid-multibyte-sequence does not abort the read.
+fn read_file_tail(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len > max_bytes {
+        f.seek(SeekFrom::Start(len - max_bytes))?;
+    }
+    let mut buf = Vec::with_capacity(max_bytes.min(len) as usize);
+    f.take(max_bytes).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// `contextcrawler security` dashboard. Renders the current Tirith gate
@@ -399,4 +389,84 @@ fn json_escape(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_file_tail_returns_whole_small_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+        let out = read_file_tail(&path, DOWNGRADES_TAIL_BYTES).unwrap();
+        assert_eq!(out, "line one\nline two\n");
+    }
+
+    #[test]
+    fn read_file_tail_caps_oversized_file() {
+        // Write a file larger than the cap; the tail read must return at
+        // most `max_bytes` and never allocate the whole file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 1 MB of filler, then a recognisable trailer.
+        let filler = vec![b'x'; 1024 * 1024];
+        f.write_all(&filler).unwrap();
+        f.write_all(b"\nTAIL-MARKER\n").unwrap();
+        drop(f);
+
+        let cap = 4 * 1024;
+        let out = read_file_tail(&path, cap).unwrap();
+        assert!(
+            out.len() as u64 <= cap,
+            "tail read must not exceed cap: got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.ends_with("TAIL-MARKER\n"),
+            "tail read must include the end of the file"
+        );
+    }
+
+    #[test]
+    fn read_file_tail_oversized_jsonl_parses_last_records() {
+        // Simulate an attacker-grown downgrades.jsonl: many lines, far past
+        // the cap. The line-by-line parse must still recover well-formed
+        // trailing records and silently drop any half-line at the cap edge.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("downgrades.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..50_000 {
+            writeln!(
+                f,
+                r#"{{"ts":"2026-01-01T00:00:00Z","reason":"r","cmd":"c{}"}}"#,
+                i
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        let content = read_file_tail(&path, DOWNGRADES_TAIL_BYTES).unwrap();
+        assert!(
+            content.len() as u64 <= DOWNGRADES_TAIL_BYTES,
+            "tail must be capped"
+        );
+        // Parse line-by-line exactly as read_recent_downgrades does.
+        let records: Vec<String> = content
+            .lines()
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l.trim()).ok()?;
+                serde_json::to_string(&v).ok()
+            })
+            .collect();
+        assert!(!records.is_empty(), "must recover trailing records");
+        // The very last line of the file is record 49999.
+        assert!(
+            records.last().unwrap().contains("c49999"),
+            "last record must be the most recent line"
+        );
+    }
 }
