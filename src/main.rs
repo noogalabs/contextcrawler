@@ -1838,8 +1838,13 @@ enum GrepPreprocess {
 /// behind the positional pattern/path so clap parses them as `extra_args`.
 /// `r`/`R`/`E` are NOT here — they are stripped separately (no-ops for rg).
 /// `A`/`B`/`C`/`H` are NOT here — they route to passthrough.
+/// `h`/`G` are NOT here — their grep meaning collides with rg: `rg -h` is
+/// `--help` (grep `-h` is `--no-filename`) and rg has no `-G` (grep `-G` is
+/// basic-regex). Reordering+forwarding either to rg yields silent help text
+/// or an "unrecognized flag" exit 2. Both route to passthrough instead, where
+/// the system-grep fallback handles them correctly — same as `-H`.
 const GREP_BOOL_SHORTS: &[u8] = &[
-    b'i', b'w', b'x', b'v', b'n', b'h', b's', b'F', b'P', b'G', b'a', b'I',
+    b'i', b'w', b'x', b'v', b'n', b's', b'F', b'P', b'a', b'I',
 ];
 
 /// Long-form boolean grep flags forwarded to rg with output still filtered.
@@ -1893,7 +1898,7 @@ fn is_grep_quiet_flag(arg: &str) -> bool {
 /// or a long form in `GREP_VALUE_LONGS`, possibly `--flag=value`).
 fn is_grep_value_flag(arg: &str) -> bool {
     for long in GREP_VALUE_LONGS {
-        if arg == *long || arg.starts_with(&format!("{}=", long)) {
+        if arg == *long || arg.strip_prefix(long).is_some_and(|s| s.starts_with('=')) {
             return true;
         }
     }
@@ -2025,7 +2030,7 @@ fn has_grep_context_flag(args: &[String]) -> bool {
 
     for arg in args {
         // Long forms — match exact and `--flag=value`.
-        if LONG_FLAGS.iter().any(|f| arg == f || arg.starts_with(&format!("{}=", f))) {
+        if LONG_FLAGS.iter().any(|f| arg == f || arg.strip_prefix(f).is_some_and(|s| s.starts_with('='))) {
             return true;
         }
         if arg.starts_with("--") || !arg.starts_with('-') || arg.len() < 2 {
@@ -2054,11 +2059,20 @@ fn has_grep_context_flag(args: &[String]) -> bool {
     false
 }
 
-/// True if any arg is grep's print-filename flag (`-H` short, `-H` inside an
-/// alphabetic bundle, or `--with-filename` long form). Codex review of
-/// #96/#97: `-H` used to be stripped, which silently dropped filename
-/// output from `grep -H -c …` / `grep -H -o …`. rg honours `-H` /
-/// `--with-filename`, so we route any `-H`-carrying call to passthrough.
+/// True if any arg carries a grep short flag whose meaning collides with rg
+/// and so must route to passthrough rather than be reordered+forwarded:
+///
+/// - `-H` / `--with-filename` — print-filename. Codex review of #96/#97:
+///   stripping `-H` silently dropped filename output from `grep -H -c …`.
+/// - `-h` / `--no-filename` — grep suppresses filenames, but `rg -h` is
+///   `--help`. Forwarding it makes rg print help text the filter mangles.
+/// - `-G` / `--basic-regexp` — grep basic-regex, but rg has no `-G` and
+///   exits 2 with "unrecognized flag".
+///
+/// Long forms (`--with-filename`, `--no-filename`, `--basic-regexp`) are in
+/// `GREP_BOOL_LONGS` and rg understands those, so only the short forms need
+/// this special routing. The system-grep fallback in the passthrough path
+/// handles all three correctly.
 fn has_grep_with_filename_flag(args: &[String]) -> bool {
     for arg in args {
         if arg == "--with-filename" {
@@ -2067,11 +2081,11 @@ fn has_grep_with_filename_flag(args: &[String]) -> bool {
         if !arg.starts_with('-') || arg.starts_with("--") || arg.len() < 2 {
             continue;
         }
-        // Bare `-H` or `-H` inside an all-alphabetic short bundle (`-Hn`,
-        // `-iHc`). Digits would mean it's a context-flag bundle, handled
-        // separately; `-H` itself never takes a value.
+        // Bare `-H`/`-h`/`-G` or any of them inside an all-alphabetic short
+        // bundle (`-Hn`, `-iHc`, `-hn`, `-iG`). Digits would mean it's a
+        // context-flag bundle, handled separately; none of these take a value.
         let body = &arg[1..];
-        if body.bytes().any(|b| b == b'H') {
+        if body.bytes().any(|b| b == b'H' || b == b'h' || b == b'G') {
             return true;
         }
     }
@@ -2085,6 +2099,13 @@ fn has_grep_with_filename_flag(args: &[String]) -> bool {
 /// options the rtk-backed grep path accepts (`--glob`, `--type`/`-t`,
 /// `--include`). Falls back to system `grep` only if rg cannot be located.
 fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
+    run_grep_passthrough_labelled(args, "format-flag passthrough")
+}
+
+/// Variant of `run_grep_format_passthrough` that lets the caller supply an
+/// accurate tracking-DB label for the route taken (e.g. "quiet passthrough"
+/// for `-q` calls, where "format-flag passthrough" would be misleading).
+fn run_grep_passthrough_labelled(args: &[String], route: &str) -> Result<i32> {
     let raw_command = args.join(" ");
     let timer = core::tracking::TimedExecution::start();
     let user_args = &args[1..];
@@ -2114,8 +2135,8 @@ fn run_grep_format_passthrough(args: &[String]) -> Result<i32> {
             timer.track_passthrough(
                 &raw_command,
                 &format!(
-                    "contextcrawler grep (format-flag passthrough via {}): {}",
-                    preferred, raw_command
+                    "contextcrawler grep ({} via {}): {}",
+                    route, preferred, raw_command
                 ),
             );
             Ok(core::utils::exit_code_from_status(&s, &raw_command))
@@ -2442,6 +2463,19 @@ mod grep_preprocess_tests {
     }
 
     #[test]
+    fn test_preprocess_grep_lowercase_h_routes_passthrough() {
+        // grep -h = --no-filename; rg -h = --help. Must route to passthrough.
+        let out = preprocess_grep_args(v(&["-h", "needle", "file"]));
+        assert!(matches!(out, GrepPreprocess::Passthrough(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn test_preprocess_grep_basic_regex_G_routes_passthrough() {
+        let out = preprocess_grep_args(v(&["-G", "needle", "file"]));
+        assert!(matches!(out, GrepPreprocess::Passthrough(_)), "got {out:?}");
+    }
+
+    #[test]
     fn test_preprocess_grep_strips_bundled_rnE() {
         // -rnE: r + E stripped, -n survives and reorders behind positionals.
         let out = preprocess_grep_args(v(&["-rnE", "needle", "."]));
@@ -2535,9 +2569,11 @@ mod grep_preprocess_tests {
 
     #[test]
     fn test_preprocess_grep_regex_flavour_flags_reorder() {
-        // -F/-P/-G regex-flavour flags are accepted, reordered behind the
-        // positionals and forwarded to rg.
-        for flag in ["-F", "-P", "-G"] {
+        // -F/-P regex-flavour flags are accepted, reordered behind the
+        // positionals and forwarded to rg. -G is NOT here — rg has no -G,
+        // so it routes to passthrough (see
+        // test_preprocess_grep_basic_regex_G_routes_passthrough).
+        for flag in ["-F", "-P"] {
             let out = preprocess_grep_args(v(&[flag, "needle", "file"]));
             assert_eq!(
                 out,
@@ -2852,7 +2888,10 @@ fn run_cli() -> Result<i32> {
                     let mut full = Vec::with_capacity(stripped.len() + 1);
                     full.push("grep".to_string());
                     full.extend(stripped);
-                    return run_grep_format_passthrough(&full);
+                    return run_grep_passthrough_labelled(
+                        &full,
+                        "quiet passthrough",
+                    );
                 }
                 GrepPreprocess::Passthrough(stripped) => {
                     // Context-flag passthrough: rtk-backed grep can't honour
