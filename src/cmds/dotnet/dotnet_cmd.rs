@@ -3,7 +3,7 @@
 use crate::binlog;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::{secure_dotnet_command, truncate};
+use crate::core::utils::{check_forbidden_dotnet_args, secure_dotnet_command, truncate};
 use crate::dotnet_format_report;
 use crate::dotnet_trx;
 use anyhow::{Context, Result};
@@ -32,6 +32,15 @@ pub fn run_restore(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
+    // `secure_dotnet_command` strips dangerous *env vars*, but dotnet/MSBuild
+    // also exposes RCE-grade *CLI flags* (`-p:CustomBefore*Targets=<path>`,
+    // `--runsettings`) that env-stripping does not touch. Reject those before
+    // any arg reaches the child process — fail closed (SEC-C1).
+    if let Err(msg) = check_forbidden_dotnet_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let timer = tracking::TimedExecution::start();
     let (report_path, cleanup_report_path) = resolve_format_report_path(args);
     // `secure_dotnet_command` strips DOTNET_STARTUP_HOOKS /
@@ -80,6 +89,15 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
         anyhow::bail!("dotnet: no subcommand specified");
     }
 
+    // Reject RCE-grade dotnet/MSBuild CLI flags (`-p:CustomBefore*Targets`,
+    // `--runsettings`) that `secure_dotnet_command`'s env-strip cannot defend.
+    // Fail closed before any arg reaches the child process (SEC-C1).
+    let arg_strs: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Err(msg) = check_forbidden_dotnet_args(&arg_strs) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let timer = tracking::TimedExecution::start();
     let subcommand = args[0].to_string_lossy().to_string();
 
@@ -117,6 +135,14 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
 }
 
 fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Result<i32> {
+    // Reject RCE-grade dotnet/MSBuild CLI flags (`-p:CustomBefore*Targets`,
+    // `--runsettings`) that `secure_dotnet_command`'s env-strip cannot defend.
+    // Fail closed before any arg reaches the child process (SEC-C1).
+    if let Err(msg) = check_forbidden_dotnet_args(args) {
+        eprintln!("{}", msg);
+        return Ok(2);
+    }
+
     let timer = tracking::TimedExecution::start();
     let binlog_path = build_binlog_path(subcommand);
     let should_expect_binlog = subcommand != "test" || has_binlog_arg(args);
