@@ -1,6 +1,6 @@
 use super::constants::{CLAUDE_DIR, SETTINGS_JSON, SETTINGS_LOCAL_JSON};
 use crate::core::stream::exec_capture_short;
-use crate::discover::lexer::split_on_operators;
+use crate::discover::lexer::{extract_substitutions, shell_split, split_on_operators, strip_quotes};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -214,20 +214,51 @@ pub(crate) fn extract_bash_pattern(rule: &str) -> &str {
     rule
 }
 
+/// Normalise a command (or pattern) into a canonical token sequence.
+///
+/// Tokenises via the shell lexer (`shell_split`), which collapses runs of
+/// whitespace, honours quotes, and resolves backslash escapes. Each token
+/// then has one layer of surrounding quotes stripped, so `"push"` and
+/// `push` compare equal.
+///
+/// This is the SEC-C3 fix: byte-prefix matching let an attacker dodge a
+/// deny rule with `git  push  --force` (double space) or `git "push"
+/// --force` (quoted token). Comparing normalised token *sequences* makes
+/// those variants identical to the canonical command.
+fn normalise_tokens(s: &str) -> Vec<String> {
+    shell_split(s)
+        .into_iter()
+        .map(|t| strip_quotes(&t))
+        .collect()
+}
+
+/// Re-join a command into a canonical, single-space-separated form.
+///
+/// Used so the glob/wildcard matcher sees the same whitespace-normalised
+/// string regardless of how the attacker spaced or quoted the original.
+fn canonical_command(cmd: &str) -> String {
+    normalise_tokens(cmd).join(" ")
+}
+
 /// Check if `cmd` matches a Claude Code permission pattern.
+///
+/// Matching is **token-aware** (SEC-C3): both `cmd` and `pattern` are
+/// normalised into token sequences (whitespace collapsed, surrounding
+/// quotes stripped) before comparison, so `git  push  --force` and
+/// `git "push" --force` match a `git push --force` rule.
 ///
 /// Pattern forms:
 /// - `*` → matches everything
-/// - `prefix:*` or `prefix *` (trailing `*`, no other wildcards) → prefix match with word boundary
+/// - `prefix:*` or `prefix *` (trailing `*`, no other wildcards) → token-prefix match
 /// - `* suffix`, `pre * suf` → glob matching where `*` matches any sequence of characters
-/// - `pattern` → exact match or prefix match (cmd must equal pattern or start with `{pattern} `)
+/// - `pattern` → exact match or token-prefix match (pattern tokens must prefix cmd tokens)
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
     // 1. Global wildcard
     if pattern == "*" {
         return true;
     }
 
-    // 2. Trailing-only wildcard: fast path with word-boundary preservation
+    // 2. Trailing-only wildcard: token-prefix match with word-boundary preservation
     //    Handles: "git push*", "git push *", "sudo:*"
     if let Some(p) = pattern.strip_suffix('*') {
         let prefix = p.trim_end_matches(':').trim_end();
@@ -235,20 +266,40 @@ pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
         if prefix.is_empty() || prefix == "*" {
             return true;
         }
-        // No other wildcards in prefix -> use word-boundary fast path
+        // No other wildcards in prefix -> token-prefix fast path
         if !prefix.contains('*') {
-            return cmd == prefix || cmd.starts_with(&format!("{} ", prefix));
+            return tokens_prefix_match(cmd, prefix);
         }
         // Prefix still contains '*' -> fall through to glob matching
     }
 
-    // 3. Complex wildcards (leading, middle, multiple): glob matching
+    // 3. Complex wildcards (leading, middle, multiple): glob matching.
+    //    Run against the whitespace-normalised command so spacing/quoting
+    //    variants cannot evade a glob deny rule either.
     if pattern.contains('*') {
-        return glob_matches(cmd, pattern);
+        return glob_matches(&canonical_command(cmd), pattern);
     }
 
-    // 4. No wildcard: exact match or prefix with word boundary
-    cmd == pattern || cmd.starts_with(&format!("{} ", pattern))
+    // 4. No wildcard: token-sequence comparison — the pattern's tokens must
+    //    be a prefix of the command's tokens (exact when equal length).
+    tokens_prefix_match(cmd, pattern)
+}
+
+/// True when `pattern`'s normalised token sequence is a prefix of `cmd`'s.
+///
+/// Equal-length sequences mean an exact command match; a shorter pattern
+/// means a prefix match with a word (token) boundary — `git push --force`
+/// matches a `git push` pattern, but `git pushy` does not.
+fn tokens_prefix_match(cmd: &str, pattern: &str) -> bool {
+    let cmd_tokens = normalise_tokens(cmd);
+    let pat_tokens = normalise_tokens(pattern);
+    if pat_tokens.is_empty() || pat_tokens.len() > cmd_tokens.len() {
+        return false;
+    }
+    cmd_tokens
+        .iter()
+        .zip(pat_tokens.iter())
+        .all(|(c, p)| c == p)
 }
 
 /// Glob-style matching where `*` matches any character sequence (including empty).
@@ -304,9 +355,54 @@ fn glob_matches(cmd: &str, pattern: &str) -> bool {
     true
 }
 
-fn split_compound_command(cmd: &str) -> Vec<&str> {
-    split_on_operators(cmd, false)
+/// Decompose a command into independently-checkable segments.
+///
+/// Splits on shell operators (`&&`, `||`, `;`, `|`) AND surfaces the inner
+/// payload of every command substitution (`$(...)`, backtick, `<(...)`,
+/// `>(...)`) as its own segment — including nested substitutions.
+///
+/// This is the SEC-C2 fix: previously a deny rule like `rm -rf` was fully
+/// bypassed by `echo $(rm -rf /x)`, because the inner `rm` was only a
+/// substring of the outer segment and `command_matches_pattern` does
+/// token-prefix matching, not substring matching. By promoting the inner
+/// command to a first-class segment, `check_command_with_rules` evaluates
+/// it against the deny/ask/allow rules directly.
+///
+/// Fail-closed: a malformed (unbalanced) substitution surfaces a sentinel
+/// segment that no allow rule can match, so the compound command can never
+/// reach `Allow` while carrying an un-evaluatable substitution.
+fn split_compound_command(cmd: &str) -> Vec<String> {
+    let mut segments: Vec<String> = split_on_operators(cmd, false)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    // Surface command-substitution payloads. Each inner command is itself
+    // split on operators so a substitution containing a chain is fully
+    // decomposed.
+    for sub in extract_substitutions(cmd) {
+        // A malformed (unbalanced) substitution still gets its recovered
+        // inner text evaluated — a deny rule inside it must still bite —
+        // AND a fail-closed sentinel is pushed so the chain can never
+        // reach Allow while carrying an un-parsable construct.
+        if sub.malformed {
+            segments.push(SUBST_FAIL_CLOSED_SENTINEL.to_string());
+        }
+        for inner_seg in split_on_operators(&sub.inner, false) {
+            let trimmed = inner_seg.trim();
+            if !trimmed.is_empty() {
+                segments.push(trimmed.to_string());
+            }
+        }
+    }
+
+    segments
 }
+
+/// Sentinel segment emitted for a malformed/un-evaluatable command
+/// substitution. Contains characters no real command starts with, so it
+/// matches no allow rule (forcing the chain off `Allow`) and no deny rule.
+const SUBST_FAIL_CLOSED_SENTINEL: &str = "\u{0}contextcrawler-unparsable-substitution\u{0}";
 
 #[cfg(test)]
 mod tests {
@@ -719,6 +815,191 @@ mod tests {
         assert_eq!(
             check_command_with_rules("git status && git push origin main", &[], &ask, &allow),
             PermissionVerdict::Ask
+        );
+    }
+
+    // --- SEC-C3: token-aware matching ---
+    // Byte-prefix matching let an attacker dodge a deny rule with trivial
+    // whitespace/quoting variation. Matching must be token-aware: collapse
+    // whitespace, strip surrounding quotes from tokens, compare token
+    // sequences (pattern tokens must prefix command tokens).
+
+    #[test]
+    fn test_c3_double_space_still_matches() {
+        // "git  push  --force" (double spaces) is the SAME command as
+        // "git push --force" and MUST still match the deny pattern.
+        assert!(command_matches_pattern(
+            "git  push  --force",
+            "git push --force"
+        ));
+    }
+
+    #[test]
+    fn test_c3_trailing_double_space_still_matches() {
+        assert!(command_matches_pattern(
+            "git push  --force",
+            "git push --force"
+        ));
+    }
+
+    #[test]
+    fn test_c3_quoted_token_still_matches() {
+        // 'git "push" --force' is the same command — quoting an argument
+        // must not let it slip past the deny rule.
+        assert!(command_matches_pattern(
+            r#"git "push" --force"#,
+            "git push --force"
+        ));
+    }
+
+    #[test]
+    fn test_c3_positive_control_exact_still_matches() {
+        // Positive control: an unaltered command must still match.
+        assert!(command_matches_pattern(
+            "git push --force",
+            "git push --force"
+        ));
+    }
+
+    #[test]
+    fn test_c3_positive_control_different_command_no_match() {
+        // Positive control: a genuinely different command must NOT match.
+        assert!(!command_matches_pattern("git status", "git push --force"));
+    }
+
+    #[test]
+    fn test_c3_no_partial_token_match() {
+        // "--forceful" must not match the "--force" token (token, not byte).
+        assert!(!command_matches_pattern(
+            "git push --forceful",
+            "git push --force"
+        ));
+    }
+
+    #[test]
+    fn test_c3_deny_double_space_denied() {
+        let deny = vec!["git push --force".to_string()];
+        for cmd in &[
+            "git  push  --force",
+            "git push  --force",
+            r#"git "push" --force"#,
+            "git push --force",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &[]),
+                PermissionVerdict::Deny,
+                "C3 bypass shape must be DENIED: {cmd}"
+            );
+        }
+        // Positive control: a benign command is not denied.
+        assert_eq!(
+            check_command_with_rules("git status", &deny, &[], &[]),
+            PermissionVerdict::Default,
+            "git status must not be denied"
+        );
+    }
+
+    // --- SEC-C2: substitution-aware decomposition ---
+    // Command substitution ($(...), backtick, <(...)/>(...)) hid an inner
+    // command from the permission stack. The inner command must now be
+    // evaluated against the rules too.
+
+    #[test]
+    fn test_c2_dollar_paren_substitution_denied() {
+        let deny = vec!["rm -rf".to_string()];
+        assert_ne!(
+            check_command_with_rules("echo $(rm -rf /x)", &deny, &[], &[]),
+            PermissionVerdict::Allow,
+            "$(...) substitution must not reach Allow"
+        );
+        assert_eq!(
+            check_command_with_rules("echo $(rm -rf /x)", &deny, &[], &[]),
+            PermissionVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn test_c2_backtick_substitution_denied() {
+        let deny = vec!["rm -rf".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo `rm -rf /x`", &deny, &[], &[]),
+            PermissionVerdict::Deny,
+            "backtick substitution must be decomposed and denied"
+        );
+    }
+
+    #[test]
+    fn test_c2_process_substitution_denied() {
+        let deny = vec!["rm -rf".to_string()];
+        assert_eq!(
+            check_command_with_rules("cat <(rm -rf /x)", &deny, &[], &[]),
+            PermissionVerdict::Deny,
+            "<(...) process substitution must be decomposed and denied"
+        );
+        assert_eq!(
+            check_command_with_rules("cat >(rm -rf /x)", &deny, &[], &[]),
+            PermissionVerdict::Deny,
+            ">(...) process substitution must be decomposed and denied"
+        );
+    }
+
+    #[test]
+    fn test_c2_nested_substitution_denied() {
+        let deny = vec!["rm -rf".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo $(echo $(rm -rf /x))", &deny, &[], &[]),
+            PermissionVerdict::Deny,
+            "nested substitution must be decomposed and denied"
+        );
+    }
+
+    #[test]
+    fn test_c2_positive_control_benign_substitution() {
+        // A substitution with a benign inner command must NOT be denied.
+        let deny = vec!["rm -rf".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo hello", &deny, &[], &[]),
+            PermissionVerdict::Default,
+            "benign command stays Default"
+        );
+        assert_eq!(
+            check_command_with_rules("echo $(date)", &deny, &[], &[]),
+            PermissionVerdict::Default,
+            "benign substitution stays Default — no over-blocking"
+        );
+    }
+
+    #[test]
+    fn test_c2_malformed_substitution_inner_still_denied() {
+        // Unbalanced `$(` — the recovered inner command must still hit deny.
+        let deny = vec!["rm -rf".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo $(rm -rf /x", &deny, &[], &[]),
+            PermissionVerdict::Deny,
+            "malformed substitution must not hide an inner deny"
+        );
+    }
+
+    #[test]
+    fn test_c2_malformed_substitution_fails_closed_off_allow() {
+        // A benign-looking malformed substitution must NOT reach Allow:
+        // the fail-closed sentinel demotes the chain to Default.
+        let allow = vec!["echo *".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo $(date", &[], &[], &allow),
+            PermissionVerdict::Default,
+            "un-parsable substitution must never auto-Allow"
+        );
+    }
+
+    #[test]
+    fn test_c2_benign_substitution_still_allowed() {
+        // Substitution decomposition must not break a legitimate Allow.
+        let allow = vec!["echo *".to_string(), "date".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo $(date)", &[], &[], &allow),
+            PermissionVerdict::Allow,
+            "all segments allowed → Allow even with substitution"
         );
     }
 }
