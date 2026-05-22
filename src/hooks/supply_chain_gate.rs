@@ -27,7 +27,23 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
+
+// ---------------------------------------------------------------------------
+// SEC-I2: aggregate budget + package cap
+// ---------------------------------------------------------------------------
+
+/// Aggregate wall-clock budget for an entire `check()` call. Each registry /
+/// OSV request carries its own 8s timeout; without an aggregate cap a command
+/// installing many packages against a slow/hostile registry could stall the
+/// hook for minutes. Once this budget is exceeded `check()` stops vetting and
+/// fails closed to `Ask`/`Unavailable`.
+const CHECK_WALL_BUDGET: StdDuration = StdDuration::from_secs(25);
+
+/// Maximum number of distinct packages `check()` will vet in one command.
+/// Beyond this the install is too large to vet within budget — fail closed to
+/// `Ask` ("too many packages to vet") rather than issuing dozens of requests.
+const MAX_PACKAGES_PER_CHECK: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -635,13 +651,29 @@ fn split_name_version(s: &str) -> (String, Option<String>) {
 // HTTP queries
 // ---------------------------------------------------------------------------
 
-/// 64 MB cap. npm's `/<pkg>` for popular packages (e.g. `@types/node`) can
-/// run ~30 MB. ureq's `into_string()` caps at 10 MB which fails them.
-const HTTP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// 8 MB cap on a single HTTP response body (SEC-I2).
+///
+/// The previous 64 MB cap was sized for npm's full `/<pkg>` document, but the
+/// gate only ever reads `dist-tags` + `time` (npm) or `info`/`releases`/`urls`
+/// (PyPI) — a few KB. For npm we also send the abbreviated-metadata `Accept`
+/// header (`application/vnd.npm.install-v1+json`), which the registry honours
+/// by returning a document ~100x smaller. 8 MB is comfortably above any
+/// legitimate abbreviated response while denying a hostile registry the
+/// ability to stream 64 MB per package into a short-lived hook process.
+const HTTP_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// npm abbreviated-metadata media type. The registry returns a far smaller
+/// document (dist-tags + per-version essentials) when this is the `Accept`
+/// header. The `time` map and `dist-tags` we rely on are still present.
+const NPM_ABBREVIATED_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 
 fn read_body(resp: ureq::Response) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut buf = Vec::new();
+    // `take` caps the read; if the body would exceed the cap we still only
+    // pull `HTTP_MAX_BYTES`, so a hostile infinite/huge response cannot
+    // exhaust memory. A truncated body then fails JSON parsing -> Err ->
+    // the caller fails closed to Ask.
     resp.into_reader()
         .take(HTTP_MAX_BYTES)
         .read_to_end(&mut buf)
@@ -650,9 +682,16 @@ fn read_body(resp: ureq::Response) -> Result<Vec<u8>, String> {
 }
 
 fn http_get_json(url: &str) -> Result<Value, String> {
-    let resp = ureq::get(url)
+    let mut req = ureq::get(url)
         .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
-        .timeout(StdDuration::from_secs(8))
+        .timeout(StdDuration::from_secs(8));
+    // Request npm's abbreviated metadata where applicable — ~100x smaller.
+    // PyPI ignores the header, so it is safe to send unconditionally for npm
+    // hosts only.
+    if url.starts_with("https://registry.npmjs.org/") {
+        req = req.set("Accept", NPM_ABBREVIATED_ACCEPT);
+    }
+    let resp = req
         .call()
         .map_err(|e| format!("HTTP {}: {}", url, e))?;
     let buf = read_body(resp)?;
@@ -752,11 +791,58 @@ fn pypi_metadata(pkg: &str, pinned: Option<&str>) -> Result<(String, DateTime<Ut
     Ok((latest, publish))
 }
 
+/// Parse an ISO-8601 / RFC-3339 timestamp into a UTC `DateTime`.
+///
+/// SEC-I3 hardening: the package-age cooldown is the gate's primary control.
+/// A misparse that yields a far-past date silently skips the cooldown, and a
+/// far-future date used to be clamped to zero age — both wave a package
+/// through. So:
+///   - A failed parse is an error (`Err`), never a silent fallback. The old
+///     `{}Z`-suffix retry could coerce a malformed string into a bogus value;
+///     we keep a *conservative* retry only for the bare missing-`Z` case
+///     (`2024-01-01T00:00:00` -> append `Z`) and reject everything else.
+///   - A parsed timestamp more than ~1 day in the future is rejected as an
+///     error rather than clamped — a future publish date is not trustworthy
+///     and must not be allowed to satisfy the cooldown.
 fn parse_iso8601(s: &str) -> Result<DateTime<Utc>, String> {
-    DateTime::parse_from_rfc3339(s)
-        .or_else(|_| DateTime::parse_from_rfc3339(&format!("{}Z", s.trim_end_matches('Z'))))
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| e.to_string())
+    let parsed = DateTime::parse_from_rfc3339(s)
+        .or_else(|_| {
+            // Conservative retry: only for a timestamp that is well-formed
+            // except for a missing trailing `Z`. We do NOT strip an existing
+            // `Z` and re-append (that masked malformed input). The string
+            // must not already carry a timezone designator.
+            let t = s.trim();
+            // This guard rejects strings that already carry a `Z` or a `+HH:MM`
+            // offset (re-appending `Z` would mask malformed input). It does NOT
+            // need to test for `-HH:MM` negative offsets: a well-formed negative
+            // offset is parsed by the primary `parse_from_rfc3339` above and
+            // never reaches this retry. A malformed string with a `-` that
+            // slips through gets `Z` appended, producing invalid RFC3339 (two
+            // timezone designators) that `parse_from_rfc3339` rejects — so the
+            // gap fails closed. The guard gap is harmless.
+            if t.ends_with('Z') || t.contains('+') {
+                Err("malformed timestamp".to_string())
+            } else {
+                DateTime::parse_from_rfc3339(&format!("{}Z", t)).map_err(|e| e.to_string())
+            }
+        })
+        .map_err(|_| format!("unparseable timestamp: {:?}", s))?;
+
+    let dt = parsed.with_timezone(&Utc);
+
+    // Reject implausibly future-dated timestamps. A package cannot have been
+    // published more than a day from now; treating such a value as valid
+    // would let a hostile registry skip the age cooldown.
+    let skew = ChronoDuration::days(1);
+    if dt > Utc::now() + skew {
+        return Err(format!(
+            "timestamp {} is more than {}d in the future — refusing to trust it",
+            dt,
+            skew.num_days()
+        ));
+    }
+
+    Ok(dt)
 }
 
 fn urlencoding(s: &str) -> String {
@@ -913,14 +999,46 @@ pub fn check(cmd: &str) -> Verdict {
         return Verdict::Skip;
     }
 
+    // SEC-I2: package-count cap. A command installing more distinct packages
+    // than we can vet within budget is failed closed to Ask rather than
+    // issuing dozens of serial registry/OSV requests.
+    let total_packages: usize = installs.iter().map(|i| i.packages.len()).sum();
+    if total_packages > MAX_PACKAGES_PER_CHECK {
+        return Verdict::Ask(vec![Finding {
+            package: format!("<{} packages>", total_packages),
+            ecosystem: "multiple".to_string(),
+            reason: FindingReason::UnvettableInstall {
+                detail: format!(
+                    "install lists {} packages — more than the {} the gate will vet \
+                     in one command. Confirm to proceed, or split the install.",
+                    total_packages, MAX_PACKAGES_PER_CHECK
+                ),
+            },
+            severity: Severity::Medium,
+        }]);
+    }
+
+    // SEC-I2: aggregate wall-clock budget. Each registry/OSV call has its own
+    // 8s timeout; this deadline bounds the whole `check()` so a slow/hostile
+    // registry cannot stall the hook for minutes.
+    let started = Instant::now();
+    let budget_exceeded = || started.elapsed() >= CHECK_WALL_BUDGET;
+
     let mut findings = Vec::new();
     // Findings that should downgrade to Ask (fail-closed-to-confirm) rather
     // than a hard Block. An unvettable install (lockfile / requirements file)
     // is not a known-bad package — we just can't enumerate what it pulls.
     let mut ask_findings = Vec::new();
     let mut transient_err: Option<String> = None;
+    // Set when the wall-clock budget runs out mid-vetting. The remaining
+    // packages are unvetted, so we fail closed.
+    let mut budget_blown = false;
 
     for install in installs {
+        if budget_exceeded() {
+            budget_blown = true;
+            break;
+        }
         let eco_cfg = match install.ecosystem {
             Ecosystem::Npm => &config.npm,
             Ecosystem::Pypi => &config.pypi,
@@ -961,6 +1079,13 @@ pub fn check(cmd: &str) -> Verdict {
         // Dedupe within an install: pip install foo bar foo -> check foo once.
         let mut seen = std::collections::HashSet::<(String, Option<String>)>::new();
         for (pkg, pinned) in install.packages {
+            // SEC-I2: stop vetting once the aggregate budget is spent. The
+            // remaining packages are unvetted — fail closed below.
+            if budget_exceeded() {
+                budget_blown = true;
+                break;
+            }
+
             let key = (pkg.clone(), pinned.clone());
             if !seen.insert(key) {
                 continue;
@@ -995,6 +1120,13 @@ pub fn check(cmd: &str) -> Verdict {
                     continue;
                 }
             };
+            // SEC-I2: a registry-metadata call can itself take seconds. Re-check
+            // the budget immediately after it so a single slow network call
+            // cannot push us past the deadline before the next loop top.
+            if budget_exceeded() {
+                budget_blown = true;
+                break;
+            }
             // Clamp negative ages (registry/publisher clock skew, or a
             // genuinely future-dated entry) to zero so they always fall
             // below the cooldown threshold instead of skating past both
@@ -1026,12 +1158,44 @@ pub fn check(cmd: &str) -> Verdict {
                     }
                 }
             }
+            // SEC-I2: an osv_query can take up to ~8s. Re-check the budget
+            // right after it so the deadline cannot be overrun by a full slow
+            // OSV call per package before the loop top is reached again.
+            if budget_exceeded() {
+                budget_blown = true;
+                break;
+            }
         }
     }
 
-    // A hard Block (known-bad package / failed gate) outranks an Ask.
+    // A hard Block (known-bad package / failed gate) outranks everything:
+    // a package we positively identified as bad stays blocked even if the
+    // budget later ran out.
     if !findings.is_empty() {
         return Verdict::Block(findings);
+    }
+    // SEC-I2: the wall-clock budget ran out before every package was vetted.
+    // The remainder is unvetted, so fail closed rather than waving it through.
+    if budget_blown {
+        let budget_msg = format!(
+            "vetting budget exceeded ({}s) — install not fully vetted",
+            CHECK_WALL_BUDGET.as_secs()
+        );
+        // If we already accumulated Ask findings (e.g. an unvettable lockfile
+        // install) before the budget expired, do not discard them: surface
+        // them as Ask so the user sees the real concern, with an extra
+        // finding noting the budget was exceeded so later packages went
+        // unvetted. Block still outranks this (handled above).
+        if !ask_findings.is_empty() {
+            ask_findings.push(Finding {
+                package: "<vetting budget exceeded>".to_string(),
+                ecosystem: "*".to_string(),
+                reason: FindingReason::UnvettableInstall { detail: budget_msg },
+                severity: Severity::Medium,
+            });
+            return Verdict::Ask(ask_findings);
+        }
+        return Verdict::Unavailable(budget_msg);
     }
     if let Some(e) = transient_err {
         return Verdict::Unavailable(e);
@@ -1565,6 +1729,92 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(names(&v[0]), vec!["lodash"]);
         assert!(v[0].unvettable.is_none());
+    }
+
+    // --- SEC-I3: parse_iso8601 hardening --------------------------------
+
+    #[test]
+    fn parse_iso8601_accepts_valid_rfc3339() {
+        assert!(parse_iso8601("2024-01-15T10:30:00Z").is_ok());
+        assert!(parse_iso8601("2024-01-15T10:30:00+00:00").is_ok());
+        // Missing-Z bare form is conservatively retried.
+        assert!(parse_iso8601("2024-01-15T10:30:00").is_ok());
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_malformed() {
+        // Garbage must be an error, never coerced into a bogus value.
+        assert!(parse_iso8601("not-a-date").is_err());
+        assert!(parse_iso8601("").is_err());
+        assert!(parse_iso8601("2024-13-99T99:99:99Z").is_err());
+        // A trailing Z on otherwise-malformed input must NOT be "fixed".
+        assert!(parse_iso8601("garbageZ").is_err());
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_far_future_timestamp() {
+        // A package published >1d in the future is untrustworthy — the old
+        // code clamped age to zero and waved it through. Must be Err now.
+        let future = (Utc::now() + ChronoDuration::days(400)).to_rfc3339();
+        assert!(
+            parse_iso8601(&future).is_err(),
+            "far-future timestamp must be rejected, not clamped"
+        );
+        // A timestamp slightly in the future (clock skew) is still accepted.
+        let near = (Utc::now() + ChronoDuration::hours(2)).to_rfc3339();
+        assert!(parse_iso8601(&near).is_ok());
+    }
+
+    #[test]
+    fn parse_iso8601_far_past_still_parses() {
+        // A genuine far-past date is valid (it just means the package is old
+        // and clears the cooldown legitimately) — only future dates are
+        // suspect. The fix must not reject the past.
+        assert!(parse_iso8601("2001-09-11T00:00:00Z").is_ok());
+    }
+
+    // --- SEC-I2: package cap --------------------------------------------
+
+    #[test]
+    fn http_max_bytes_lowered_from_64mb() {
+        // Regression guard: the per-response cap must stay well under the
+        // old 64 MB. A hostile registry must not be able to stream 64 MB
+        // per package into the short-lived hook process.
+        assert!(
+            HTTP_MAX_BYTES <= 16 * 1024 * 1024,
+            "HTTP_MAX_BYTES must be lowered from the old 64MB"
+        );
+    }
+
+    #[test]
+    fn package_cap_constant_is_sane() {
+        // The cap should be a small, reviewable number — not unbounded.
+        assert!(MAX_PACKAGES_PER_CHECK > 0 && MAX_PACKAGES_PER_CHECK <= 50);
+    }
+
+    #[test]
+    fn many_packages_exceed_cap() {
+        // A command naming more than the cap of distinct packages must be
+        // detectable as over-cap. We count via detect_installs (check()
+        // itself needs config+network).
+        let pkgs: Vec<String> = (0..MAX_PACKAGES_PER_CHECK + 5)
+            .map(|i| format!("pkg{}", i))
+            .collect();
+        let cmd = format!("npm install {}", pkgs.join(" "));
+        let installs = detect_installs(&cmd);
+        let total: usize = installs.iter().map(|i| i.packages.len()).sum();
+        assert!(
+            total > MAX_PACKAGES_PER_CHECK,
+            "expected over-cap package count, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn check_budget_constant_is_bounded() {
+        // The aggregate wall-clock budget must be a finite, sane value so a
+        // hostile registry cannot stall the hook indefinitely.
+        assert!(CHECK_WALL_BUDGET.as_secs() > 0 && CHECK_WALL_BUDGET.as_secs() <= 60);
     }
 
     #[test]
