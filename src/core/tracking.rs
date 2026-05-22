@@ -399,6 +399,15 @@ impl Tracker {
                 }
             }
         }
+        // Incremental auto-vacuum: keeps freed pages on a freelist that
+        // `PRAGMA incremental_vacuum` reclaims in bounded chunks, instead of a
+        // full multi-MB file rewrite (`VACUUM`) on the record() hot path —
+        // audit PERF-I1. This pragma only takes effect on an empty DB or after
+        // a full VACUUM, so it MUST run before any table is created. For an
+        // existing legacy DB (auto_vacuum=0), a one-time migration VACUUM
+        // below switches the mode; that cost is paid exactly once, not on
+        // every retention prune.
+        let _ = conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;");
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
         let _ = conn.execute_batch(
@@ -469,6 +478,20 @@ impl Tracker {
             [],
         )?;
 
+        // One-time migration for legacy DBs: `auto_vacuum=INCREMENTAL` set
+        // above is a no-op on a DB created in mode 0 (full/none). A single
+        // full VACUUM rewrites the file and commits it to incremental mode,
+        // after which `cleanup_old()` only ever does cheap bounded reclaim.
+        // This runs once — on the next open `auto_vacuum` already reads back
+        // as 2 and the branch is skipped. Non-fatal: a failed VACUUM just
+        // leaves the DB in legacy mode (old behaviour) until the next open.
+        let auto_vacuum_mode: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap_or(0);
+        if auto_vacuum_mode != 2 {
+            let _ = conn.execute_batch("VACUUM;");
+        }
+
         Ok(Self { conn })
     }
 
@@ -483,6 +506,8 @@ impl Tracker {
 
     #[cfg(test)]
     fn init_schema(&self) -> Result<()> {
+        // Match production: incremental auto-vacuum before any table exists.
+        let _ = self.conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;");
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
                 id INTEGER PRIMARY KEY,
@@ -598,9 +623,13 @@ impl Tracker {
             params![cutoff.to_rfc3339()],
         )?;
         // Reclaim space from pruned rows so the DB file does not grow
-        // unbounded. Non-fatal: VACUUM can fail mid-transaction / on WAL.
+        // unbounded. `incremental_vacuum` moves a bounded number of freelist
+        // pages and truncates the file — it does NOT rewrite the whole DB the
+        // way `VACUUM` does, so this stays cheap on the record() hot path
+        // (audit PERF-I1). No-op on a DB still in legacy auto_vacuum mode.
+        // Non-fatal: can fail on WAL/NFS/read-only filesystems.
         if removed > 0 {
-            let _ = self.conn.execute_batch("VACUUM;");
+            let _ = self.conn.execute_batch("PRAGMA incremental_vacuum;");
         }
         Ok(())
     }
@@ -2553,5 +2582,55 @@ mod tests {
             failures.total, 0,
             "parse_failures table should be empty after reset"
         );
+    }
+
+    // PERF-I1: the tracking DB must be in incremental auto-vacuum mode, so
+    // retention pruning reclaims space with `PRAGMA incremental_vacuum`
+    // (bounded) instead of a full `VACUUM` file rewrite on the record() hot
+    // path. auto_vacuum mode 2 == INCREMENTAL.
+    #[test]
+    fn test_tracking_db_is_incremental_auto_vacuum() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let mode: i64 = tracker
+            .conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .expect("Failed to read auto_vacuum pragma");
+        assert_eq!(
+            mode, 2,
+            "tracking DB must be in INCREMENTAL auto_vacuum mode (got {mode})"
+        );
+    }
+
+    // PERF-I1: cleanup_old() prunes rows past the retention window and runs
+    // an incremental_vacuum — it must complete cheaply without error and
+    // without a full VACUUM rewrite. Verifies the prune still removes old
+    // rows after the VACUUM-removal change.
+    #[test]
+    fn test_cleanup_old_prunes_without_full_vacuum() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+
+        // An old command well past the 90-day retention window.
+        let old_ts = (Utc::now() - chrono::Duration::days(DEFAULT_HISTORY_DAYS + 30)).to_rfc3339();
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path,
+                 input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                 VALUES (?1, 'old', 'contextcrawler old', '', 100, 20, 80, 80.0, 1)",
+                params![old_ts],
+            )
+            .expect("Failed to insert old row");
+
+        // A fresh record() — this triggers cleanup_old() on the hot path.
+        tracker
+            .record("git status", "contextcrawler git status", 100, 20, 50)
+            .expect("record should succeed (cleanup_old must not error)");
+
+        // The old row is gone; the fresh one survives.
+        let total: i64 = tracker
+            .conn
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .expect("Failed to count");
+        assert_eq!(total, 1, "old row should be pruned, fresh row retained");
     }
 }
