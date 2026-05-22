@@ -2584,6 +2584,15 @@ pub fn check_forbidden_node_config_args<S: AsRef<str>>(args: &[S]) -> Result<(),
             }
         }
 
+        // Glued short form `-cvalue` (e.g. `-cevil.js`). Not `-c=` (handled
+        // above), not `--`, and must carry a value after `-c`.
+        if a.starts_with("-c") && !a.starts_with("-c=") && !a.starts_with("--") && a.len() > 2 {
+            let value = &a[2..];
+            if config_value_is_executed_module(value) {
+                return Err(node_deny_message(a));
+            }
+        }
+
         i += 1;
     }
     Ok(())
@@ -2690,6 +2699,8 @@ mod secure_node_tests {
         assert!(check_forbidden_node_config_args(&["--config=evil.js"]).is_err());
         assert!(check_forbidden_node_config_args(&["-c", "evil.js"]).is_err());
         assert!(check_forbidden_node_config_args(&["-c=evil.js"]).is_err());
+        // Glued short form `-cvalue`.
+        assert!(check_forbidden_node_config_args(&["-cevil.js"]).is_err());
         assert!(check_forbidden_node_config_args(&["--config", "/tmp/evil.ts"]).is_err());
         assert!(check_forbidden_node_config_args(&["--config", "./e.cjs"]).is_err());
         assert!(check_forbidden_node_config_args(&["--config", "../e.mjs"]).is_err());
@@ -2708,6 +2719,8 @@ mod secure_node_tests {
         assert!(check_forbidden_node_config_args(&["--config=config/eslint.json"]).is_ok());
         assert!(check_forbidden_node_config_args(&["--config", "prettier.yaml"]).is_ok());
         assert!(check_forbidden_node_config_args(&["-c", ".prettierrc.yml"]).is_ok());
+        // Glued short form with a data-only config — must pass.
+        assert!(check_forbidden_node_config_args(&["-cconfig.json"]).is_ok());
     }
 
     #[test]
@@ -3295,10 +3308,13 @@ pub fn check_forbidden_rake_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
     for arg in args {
         let a = arg.as_ref();
 
-        // -r / --require <lib>
+        // -r / --require <lib> — exact, glued `-r/path`, `-r=`, `--require=`.
+        // Ruby's OptionParser accepts glued short options, so `-r/tmp/evil.rb`
+        // must be caught too. Guard `!--` so the short-glued branch can't
+        // swallow `--require` (which is handled by its own exact/`=` arms).
         if a == "-r"
             || a == "--require"
-            || a.starts_with("-r=")
+            || (a.starts_with("-r") && !a.starts_with("--"))
             || a.starts_with("--require=")
         {
             return Err(pyrbjvm_deny_message_with_issue(
@@ -3309,10 +3325,10 @@ pub fn check_forbidden_rake_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
             ));
         }
 
-        // -R / --libdir <dir>
+        // -R / --libdir <dir> — exact, glued `-R/path`, `-R=`, `--libdir=`.
         if a == "-R"
             || a == "--libdir"
-            || a.starts_with("-R=")
+            || (a.starts_with("-R") && !a.starts_with("--"))
             || a.starts_with("--libdir=")
         {
             return Err(pyrbjvm_deny_message_with_issue(
@@ -3333,10 +3349,10 @@ pub fn check_forbidden_rake_args<S: AsRef<str>>(args: &[S]) -> Result<(), String
             ));
         }
 
-        // -f / --rakefile <path>
+        // -f / --rakefile <path> — exact, glued `-f/path`, `-f=`, `--rakefile=`.
         if a == "-f"
             || a == "--rakefile"
-            || a.starts_with("-f=")
+            || (a.starts_with("-f") && !a.starts_with("--"))
             || a.starts_with("--rakefile=")
         {
             return Err(pyrbjvm_deny_message_with_issue(
@@ -3986,6 +4002,8 @@ mod secure_pyrbjvmdotnet_tests {
         assert!(check_forbidden_rake_args(&["--require", "/tmp/evil.rb"]).is_err());
         assert!(check_forbidden_rake_args(&["-r=evil"]).is_err());
         assert!(check_forbidden_rake_args(&["--require=evil"]).is_err());
+        // Glued short form — Ruby's OptionParser accepts `-r/tmp/evil.rb`.
+        assert!(check_forbidden_rake_args(&["-r/tmp/evil.rb"]).is_err());
     }
 
     #[test]
@@ -3994,6 +4012,8 @@ mod secure_pyrbjvmdotnet_tests {
         assert!(check_forbidden_rake_args(&["--libdir", "/tmp/evil"]).is_err());
         assert!(check_forbidden_rake_args(&["-R=/tmp/evil"]).is_err());
         assert!(check_forbidden_rake_args(&["--libdir=/tmp/evil"]).is_err());
+        // Glued short form.
+        assert!(check_forbidden_rake_args(&["-R/tmp/evil"]).is_err());
     }
 
     #[test]
@@ -4011,6 +4031,8 @@ mod secure_pyrbjvmdotnet_tests {
         assert!(check_forbidden_rake_args(&["--rakefile", "/tmp/evil.rake"]).is_err());
         assert!(check_forbidden_rake_args(&["-f=/tmp/evil.rake"]).is_err());
         assert!(check_forbidden_rake_args(&["--rakefile=/tmp/evil.rake"]).is_err());
+        // Glued short form — the headline RCE bypass.
+        assert!(check_forbidden_rake_args(&["-f/tmp/evil.rake"]).is_err());
     }
 
     #[test]
