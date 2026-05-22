@@ -306,7 +306,18 @@ pub fn split_on_operators(cmd: &str, stop_at_pipe: bool) -> Vec<&str> {
     results
 }
 
-#[cfg(test)]
+/// Strip a single layer of matching surrounding quotes from a token.
+///
+/// Used by token-aware permission matching so that `"push"` and `push`
+/// compare equal. Only strips when the first and last char are the same
+/// quote character; mismatched or unquoted strings are returned unchanged.
+///
+/// Note: `shell_split` already consumes the outer quote layer when it
+/// tokenises a command, so a token reaching here is normally unquoted.
+/// This "one layer" of stripping therefore runs *on top of* what
+/// `shell_split` removed — it catches a residual quote layer (e.g. from
+/// a quote nested inside the layer `shell_split` stripped), not the
+/// original outer quoting.
 pub fn strip_quotes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() >= 2
@@ -354,6 +365,210 @@ pub fn shell_split(input: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+/// A command substitution payload extracted from a command string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Substitution {
+    /// The inner command text (e.g. `rm -rf /x` from `$(rm -rf /x)`).
+    pub inner: String,
+    /// True when the construct was malformed (unbalanced) and the inner
+    /// text could not be reliably bounded. Callers MUST treat this as
+    /// fail-closed: an un-evaluatable substitution may hide anything.
+    pub malformed: bool,
+}
+
+/// Extract command-substitution payloads from a shell command string.
+///
+/// Recognises, outside of single/double quotes:
+/// - `$(...)`  — modern command substitution
+/// - `` `...` `` — legacy backtick substitution
+/// - `<(...)` / `>(...)` — process substitution
+///
+/// Returns one [`Substitution`] per construct found, recursing into
+/// nested substitutions so `$(echo $(rm -rf /x))` yields both the outer
+/// and inner payloads. Parenthesis nesting is balanced. An unterminated
+/// construct yields a `malformed` entry so callers can fail closed.
+///
+/// Single-quoted regions are skipped entirely (no expansion in bash).
+/// Backtick substitution inside double quotes IS still active in bash,
+/// so double-quoted regions are scanned; only `$(...)`/process-subst
+/// require an unquoted context.
+pub fn extract_substitutions(cmd: &str) -> Vec<Substitution> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '\\' && !in_single {
+            i += 2; // skip escaped char
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_double && c == '\'' {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+
+        // `$(...)` is active unquoted or inside double quotes; `<(...)` /
+        // `>(...)` process substitution only in an unquoted context.
+        // (Single-quoted regions were already skipped above.)
+        let next_is_open = i + 1 < chars.len() && chars[i + 1] == '(';
+        let is_dollar_paren = c == '$' && next_is_open;
+        let is_process_subst = (c == '<' || c == '>') && next_is_open && !in_double;
+        let paren_subst = (is_dollar_paren || is_process_subst).then_some(i + 2);
+
+        if let Some(open) = paren_subst {
+            // Arithmetic expansion `$((expr))` is NOT command execution —
+            // bash evaluates the inner as arithmetic, never as a command.
+            // Detect the `$((` form (char after `$(` is another `(`) and
+            // skip it entirely, emitting no Substitution. If unbalanced,
+            // fail closed like any other malformed construct.
+            if is_dollar_paren && open < chars.len() && chars[open] == '(' {
+                match find_matching_paren(&chars, open) {
+                    Some(close) => {
+                        // `find_matching_paren` counts the inner `(` at
+                        // `open` as an extra depth level, so the index it
+                        // returns is the OUTER `)` that closes `$((`.
+                        i = close + 1;
+                    }
+                    None => {
+                        let inner: String = chars[open..].iter().collect();
+                        out.push(Substitution {
+                            inner,
+                            malformed: true,
+                        });
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            match find_matching_paren(&chars, open) {
+                Some(close) => {
+                    let inner: String = chars[open..close].iter().collect();
+                    // Recurse first so nested payloads are also captured.
+                    out.extend(extract_substitutions(&inner));
+                    out.push(Substitution {
+                        inner,
+                        malformed: false,
+                    });
+                    i = close + 1;
+                }
+                None => {
+                    // Unbalanced — fail closed.
+                    let inner: String = chars[open..].iter().collect();
+                    out.push(Substitution {
+                        inner,
+                        malformed: true,
+                    });
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Backtick substitution — active even inside double quotes.
+        if c == '`' {
+            let start = i + 1;
+            let mut j = start;
+            let mut found = false;
+            while j < chars.len() {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '`' {
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            let inner: String = if found {
+                chars[start..j].iter().collect()
+            } else {
+                chars[start..].iter().collect()
+            };
+            out.extend(extract_substitutions(&inner));
+            out.push(Substitution {
+                inner,
+                malformed: !found,
+            });
+            if found {
+                i = j + 1;
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
+/// Find the index of the `)` matching the `(` whose body starts at `open`.
+///
+/// Tracks single/double quote regions so a `)` inside a quoted string does
+/// not close the substitution. Returns `None` if unbalanced.
+fn find_matching_paren(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 1i32;
+    let mut i = open;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1029,5 +1244,91 @@ mod tests {
     fn test_split_on_operators_empty() {
         assert!(split_on_operators("", false).is_empty());
         assert!(split_on_operators("  ", true).is_empty());
+    }
+
+    // --- extract_substitutions (SEC-C2) ---
+
+    #[test]
+    fn test_extract_dollar_paren() {
+        let subs = extract_substitutions("echo $(rm -rf /x)");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+        assert!(!subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_backtick() {
+        let subs = extract_substitutions("echo `rm -rf /x`");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+        assert!(!subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_process_substitution() {
+        let subs = extract_substitutions("cat <(rm -rf /x)");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+
+        let subs = extract_substitutions("cat >(rm -rf /x)");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+    }
+
+    #[test]
+    fn test_extract_nested() {
+        let subs = extract_substitutions("echo $(echo $(rm -rf /x))");
+        // Inner first (recursion), then outer.
+        assert!(subs.iter().any(|s| s.inner == "rm -rf /x"));
+        assert!(subs.iter().any(|s| s.inner == "echo $(rm -rf /x)"));
+    }
+
+    #[test]
+    fn test_extract_none_when_plain() {
+        assert!(extract_substitutions("echo hello").is_empty());
+    }
+
+    #[test]
+    fn test_extract_skips_single_quoted() {
+        // Single quotes suppress substitution in bash.
+        assert!(extract_substitutions("echo '$(rm -rf /x)'").is_empty());
+    }
+
+    #[test]
+    fn test_extract_unbalanced_is_malformed() {
+        let subs = extract_substitutions("echo $(rm -rf /x");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_arithmetic_expansion_no_substitution() {
+        // `$((expr))` is arithmetic, not command execution — no Substitution.
+        assert!(extract_substitutions("echo $((2+2))").is_empty());
+        assert!(extract_substitutions("echo $((COUNT+1))").is_empty());
+    }
+
+    #[test]
+    fn test_extract_arithmetic_then_real_subst() {
+        // Arithmetic skipped, but a following real substitution still caught.
+        let subs = extract_substitutions("echo $((1+1)) $(rm -rf /x)");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, "rm -rf /x");
+        assert!(!subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_unbalanced_arithmetic_fails_closed() {
+        let subs = extract_substitutions("echo $((COUNT+1");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].malformed);
+    }
+
+    #[test]
+    fn test_extract_paren_inside_quotes_not_closing() {
+        // The `)` inside the double-quoted arg must not close the subst early.
+        let subs = extract_substitutions(r#"echo $(rm -rf "/x )y")"#);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].inner, r#"rm -rf "/x )y""#);
     }
 }
