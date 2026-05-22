@@ -425,6 +425,15 @@ mod tests {
             "tail read must not exceed cap: got {} bytes",
             out.len()
         );
+        // Guard against a degenerate zero-byte read passing the `<= cap`
+        // check: the file is far larger than the cap, so the tail must be
+        // approximately `cap`-sized, not near-empty.
+        assert!(
+            out.len() as u64 >= cap - 1024,
+            "tail read must be approximately cap-sized: got {} bytes (cap {})",
+            out.len(),
+            cap
+        );
         assert!(
             out.ends_with("TAIL-MARKER\n"),
             "tail read must include the end of the file"

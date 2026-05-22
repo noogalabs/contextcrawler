@@ -812,6 +812,14 @@ fn parse_iso8601(s: &str) -> Result<DateTime<Utc>, String> {
             // `Z` and re-append (that masked malformed input). The string
             // must not already carry a timezone designator.
             let t = s.trim();
+            // This guard rejects strings that already carry a `Z` or a `+HH:MM`
+            // offset (re-appending `Z` would mask malformed input). It does NOT
+            // need to test for `-HH:MM` negative offsets: a well-formed negative
+            // offset is parsed by the primary `parse_from_rfc3339` above and
+            // never reaches this retry. A malformed string with a `-` that
+            // slips through gets `Z` appended, producing invalid RFC3339 (two
+            // timezone designators) that `parse_from_rfc3339` rejects — so the
+            // gap fails closed. The guard gap is harmless.
             if t.ends_with('Z') || t.contains('+') {
                 Err("malformed timestamp".to_string())
             } else {
@@ -1112,6 +1120,13 @@ pub fn check(cmd: &str) -> Verdict {
                     continue;
                 }
             };
+            // SEC-I2: a registry-metadata call can itself take seconds. Re-check
+            // the budget immediately after it so a single slow network call
+            // cannot push us past the deadline before the next loop top.
+            if budget_exceeded() {
+                budget_blown = true;
+                break;
+            }
             // Clamp negative ages (registry/publisher clock skew, or a
             // genuinely future-dated entry) to zero so they always fall
             // below the cooldown threshold instead of skating past both
@@ -1143,6 +1158,13 @@ pub fn check(cmd: &str) -> Verdict {
                     }
                 }
             }
+            // SEC-I2: an osv_query can take up to ~8s. Re-check the budget
+            // right after it so the deadline cannot be overrun by a full slow
+            // OSV call per package before the loop top is reached again.
+            if budget_exceeded() {
+                budget_blown = true;
+                break;
+            }
         }
     }
 
@@ -1155,10 +1177,25 @@ pub fn check(cmd: &str) -> Verdict {
     // SEC-I2: the wall-clock budget ran out before every package was vetted.
     // The remainder is unvetted, so fail closed rather than waving it through.
     if budget_blown {
-        return Verdict::Unavailable(format!(
+        let budget_msg = format!(
             "vetting budget exceeded ({}s) — install not fully vetted",
             CHECK_WALL_BUDGET.as_secs()
-        ));
+        );
+        // If we already accumulated Ask findings (e.g. an unvettable lockfile
+        // install) before the budget expired, do not discard them: surface
+        // them as Ask so the user sees the real concern, with an extra
+        // finding noting the budget was exceeded so later packages went
+        // unvetted. Block still outranks this (handled above).
+        if !ask_findings.is_empty() {
+            ask_findings.push(Finding {
+                package: "<vetting budget exceeded>".to_string(),
+                ecosystem: "*".to_string(),
+                reason: FindingReason::UnvettableInstall { detail: budget_msg },
+                severity: Severity::Medium,
+            });
+            return Verdict::Ask(ask_findings);
+        }
+        return Verdict::Unavailable(budget_msg);
     }
     if let Some(e) = transient_err {
         return Verdict::Unavailable(e);
