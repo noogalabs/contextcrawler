@@ -32,7 +32,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -455,9 +455,15 @@ impl Tracker {
         let _ = conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;");
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
+        // Order matters: busy_timeout MUST register before the WAL switch.
+        // `PRAGMA journal_mode=WAL` requires an exclusive lock and can return
+        // SQLITE_BUSY if a peer holds the DB; with busy_timeout already armed,
+        // SQLite waits out the peer instead of failing immediately. Peer-
+        // review #150 (agy) — the multi-thread boundary test surfaced this
+        // ordering as a flakiness vector under high CPU contention.
         let _ = conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;",
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;",
         );
         conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
@@ -523,6 +529,20 @@ impl Tracker {
             [],
         )?;
 
+        // Release boundaries: one row per `contextcrawler --version` change
+        // observed. Written by `ensure_release_boundary()` on first invocation
+        // after a binary upgrade. `gain --weak-filters` slices by the latest
+        // boundary timestamp so newly-released filter behaviour isn't masked
+        // by months of accumulated pre-upgrade leakage.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS release_boundaries (
+                id INTEGER PRIMARY KEY,
+                version TEXT NOT NULL,
+                installed_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         // One-time migration for legacy DBs: `auto_vacuum=INCREMENTAL` set
         // above is a no-op on a DB created in mode 0 (full/none). A single
         // full VACUUM rewrites the file and commits it to incremental mode,
@@ -537,7 +557,55 @@ impl Tracker {
             let _ = conn.execute_batch("VACUUM;");
         }
 
-        Ok(Self { conn })
+        let tracker = Self { conn };
+        // Best-effort: never fail tracker construction on a boundary insert
+        // problem (downstream record() still works without it).
+        let _ = tracker.ensure_release_boundary();
+        Ok(tracker)
+    }
+
+    /// Write a new release-boundary row if the installed binary version
+    /// differs from the most recent one recorded in the DB. Called once at
+    /// tracker construction; cost is one INSERT-WHERE per invocation (no
+    /// follow-up SELECT in steady-state — the WHERE clause evaluates to
+    /// zero rows when the version already matches, so SQLite skips the
+    /// INSERT atomically).
+    ///
+    /// The INSERT ... SELECT ... WHERE pattern collapses the previous
+    /// read-then-write into a single atomic statement. Without this, two
+    /// concurrent contextcrawler processes hitting a fresh-upgrade DB
+    /// would both observe the old latest-version, both pass the Rust-side
+    /// check, and both insert a duplicate boundary row (peer-review #150
+    /// finding, Codex + agy).
+    fn ensure_release_boundary(&self) -> Result<()> {
+        const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO release_boundaries (version, installed_at)
+             SELECT ?1, ?2
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM release_boundaries
+                 WHERE version = ?1
+                   AND id = (SELECT MAX(id) FROM release_boundaries)
+             )",
+            params![CURRENT_VERSION, now],
+        )?;
+        Ok(())
+    }
+
+    /// Timestamp of the most recent release boundary, in RFC-3339 / ISO-8601
+    /// form. `None` if no boundary has been recorded yet (fresh DB on a
+    /// pre-feature binary, or in-memory test tracker). Callers should treat
+    /// `None` as "no slice, fall back to lifetime".
+    pub fn latest_boundary_timestamp(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT installed_at FROM release_boundaries ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Create an isolated in-memory tracker for tests.
@@ -588,6 +656,16 @@ impl Tracker {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+            [],
+        )?;
+        // Mirror production: release_boundaries table for version-aware
+        // weak-filter analytics. See block at L526 for details.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS release_boundaries (
+                id INTEGER PRIMARY KEY,
+                version TEXT NOT NULL,
+                installed_at TEXT NOT NULL
+            )",
             [],
         )?;
         Ok(())
@@ -903,15 +981,24 @@ impl Tracker {
     /// model unfiltered, and sorts highest-leak first. Passthrough rows
     /// (0 input) contribute nothing and drop out — so a command that is
     /// always passthrough never appears.
-    pub fn get_weak_filters(&self, project_path: Option<&str>) -> Result<Vec<WeakFilter>> {
+    pub fn get_weak_filters(
+        &self,
+        project_path: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<WeakFilter>> {
         let (project_exact, project_glob) = project_filter_params(project_path);
+        // `since` defaults to NULL (no slice) when caller passes None — same
+        // pattern as project_path. The boundary timestamp is RFC-3339 / ISO-
+        // 8601 and command timestamps are also ISO-8601, so lexicographic
+        // comparison is correct.
         let mut stmt = self.conn.prepare(
             "SELECT rtk_cmd, COUNT(*), SUM(input_tokens), SUM(saved_tokens)
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+               AND (?3 IS NULL OR timestamp >= ?3)
              GROUP BY rtk_cmd",
         )?;
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+        let rows = stmt.query_map(params![project_exact, project_glob, since], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as usize,
@@ -2238,7 +2325,16 @@ mod tests {
                 Some(v) => std::env::set_var("RTK_DB_PATH", v),
                 None => std::env::remove_var("RTK_DB_PATH"),
             }
+            // Remove the .db file plus the WAL sidecars. Without `-wal`/`-shm`
+            // cleanup, WAL-mode connections leave them behind on abnormal exit
+            // (e.g. a worker thread panic) and pollute $HOME across runs.
+            // Peer-review #150 (agy) found.
             let _ = std::fs::remove_file(&self.path);
+            for suffix in ["-wal", "-shm"] {
+                let mut s = self.path.clone().into_os_string();
+                s.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(s));
+            }
         }
     }
 
@@ -2789,7 +2885,7 @@ mod tests {
             .expect("record passthrough");
 
         let weak = tracker
-            .get_weak_filters(None)
+            .get_weak_filters(None, None)
             .expect("Failed to load weak filters");
 
         // read leaks 3 × (1000 input − 100 saved) = 2700; cargo leaks 50.
@@ -2806,6 +2902,234 @@ mod tests {
         assert!(
             !weak.iter().any(|w| w.tool.starts_with("git")),
             "a passthrough-only tool (0 input) must be excluded"
+        );
+    }
+
+    // ─── Release-boundary slicing ──────────────────────────────────────────
+
+    #[test]
+    fn ensure_release_boundary_writes_first_row_on_fresh_db() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        // new_in_memory() does not call ensure_release_boundary() (production
+        // path does, but the test constructor mirrors only the schema). Call
+        // it explicitly to validate the insert path.
+        tracker
+            .ensure_release_boundary()
+            .expect("boundary insert");
+        let ts = tracker
+            .latest_boundary_timestamp()
+            .expect("read boundary")
+            .expect("boundary row must exist");
+        assert!(
+            !ts.is_empty(),
+            "stored timestamp must be a non-empty RFC-3339 string"
+        );
+    }
+
+    #[test]
+    fn ensure_release_boundary_is_idempotent_on_same_version() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        tracker.ensure_release_boundary().expect("first insert");
+        tracker.ensure_release_boundary().expect("no-op call");
+        tracker.ensure_release_boundary().expect("no-op call");
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(
+            n, 1,
+            "same-version call must not append duplicate boundary rows"
+        );
+    }
+
+    #[test]
+    fn get_weak_filters_since_excludes_older_rows() {
+        // Use `+00:00` suffix to match production `Utc::now().to_rfc3339()`
+        // output — lexicographic ISO-8601 comparison requires consistent
+        // suffix shape across all rows. Peer-review #150 (agy) finding.
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        // Two rows: one before, one after the cutoff.
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands
+                 (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens,
+                  saved_tokens, savings_pct, exec_time_ms, project_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    "2026-01-01T00:00:00+00:00",
+                    "read /old",
+                    "contextcrawler read /old",
+                    1000,
+                    100,
+                    900,
+                    90.0,
+                    0,
+                    ""
+                ],
+            )
+            .expect("insert old row");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands
+                 (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens,
+                  saved_tokens, savings_pct, exec_time_ms, project_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    "2026-06-01T00:00:00+00:00",
+                    "read /new",
+                    "contextcrawler read /new",
+                    2000,
+                    400,
+                    1600,
+                    80.0,
+                    0,
+                    ""
+                ],
+            )
+            .expect("insert new row");
+        let all = tracker
+            .get_weak_filters(None, None)
+            .expect("all-time query");
+        let read_all = all.iter().find(|w| w.tool == "read").expect("read entry");
+        assert_eq!(read_all.runs, 2);
+        assert_eq!(read_all.input_tokens, 3000);
+
+        let sliced = tracker
+            .get_weak_filters(None, Some("2026-03-01T00:00:00+00:00"))
+            .expect("since query");
+        let read_sliced = sliced
+            .iter()
+            .find(|w| w.tool == "read")
+            .expect("read entry after slice");
+        assert_eq!(read_sliced.runs, 1, "old row must be excluded");
+        assert_eq!(read_sliced.input_tokens, 2000);
+    }
+
+    // ─── Peer-review #150 follow-up coverage (agy) ─────────────────────────
+
+    #[test]
+    fn latest_boundary_timestamp_is_none_on_empty_table() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        let ts = tracker
+            .latest_boundary_timestamp()
+            .expect("read boundary on empty table");
+        assert!(
+            ts.is_none(),
+            "no boundary rows must yield None (callers fall back to lifetime)"
+        );
+    }
+
+    #[test]
+    fn ensure_release_boundary_appends_row_on_version_change() {
+        // Simulate the binary moving from a prior version to the current one:
+        // pre-seed a boundary row for some old version, then call ensure_*
+        // and confirm a new row is appended (not deduplicated against the
+        // OLD entry — only against the LATEST one).
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO release_boundaries (version, installed_at)
+                 VALUES (?1, ?2)",
+                params!["0.0.0-test-prior", "2026-01-01T00:00:00+00:00"],
+            )
+            .expect("seed prior-version row");
+        tracker
+            .ensure_release_boundary()
+            .expect("boundary on version change");
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(n, 2, "a version change must append a new boundary row");
+        // The latest row must carry the CURRENT compile-time version, not
+        // the seeded prior one.
+        let latest_version: String = tracker
+            .conn
+            .query_row(
+                "SELECT version FROM release_boundaries ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read latest version");
+        assert_eq!(latest_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn ensure_release_boundary_is_idempotent_on_tight_loop() {
+        // Same-connection idempotency: repeated calls on one Tracker must
+        // not append duplicate rows. This is the cheap baseline check
+        // that the WHERE-NOT-EXISTS guard fires correctly. The real
+        // multi-connection race is exercised by the test below.
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        for _ in 0..10 {
+            tracker.ensure_release_boundary().expect("repeated call");
+        }
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(n, 1, "tight-loop calls must not append duplicate rows");
+    }
+
+    #[test]
+    fn ensure_release_boundary_no_duplicates_under_real_concurrency() {
+        // Round-2 peer-review (Codex + agy) asked for a real multi-thread
+        // race against a file-backed DB — the single-connection idempotency
+        // test above doesn't exercise SQLite's write-locking behaviour.
+        //
+        // Strategy: pin a private file-backed DB via the PinnedDb RAII
+        // helper, then spawn 8 threads that each call `Tracker::new()`.
+        // Every Tracker::new() runs `ensure_release_boundary()` on its own
+        // sqlite Connection — exactly the production race shape (two
+        // contextcrawler processes starting concurrently after a binary
+        // upgrade). The atomic INSERT...WHERE NOT EXISTS guarantees that
+        // only the first one to acquire the SQLITE write lock inserts;
+        // the others find the row already there and no-op.
+        //
+        // Holding ENV_LOCK serialises with other RTK_DB_PATH-touching
+        // tests in the same process, not with our own spawned threads —
+        // they share the same path env-var.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _db = PinnedDb::new("rtk_boundary_concurrency");
+
+        const N_THREADS: usize = 8;
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for _ in 0..N_THREADS {
+            handles.push(std::thread::spawn(|| {
+                Tracker::new().expect("tracker construction in worker thread");
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let tracker = Tracker::new().expect("verifier tracker");
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(
+            n, 1,
+            "atomic INSERT...WHERE NOT EXISTS must dedupe across N concurrent connections"
         );
     }
 }
