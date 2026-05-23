@@ -306,32 +306,36 @@ lazy_static! {
     // Collapsed to a single space before install detection. Covers POSIX
     // (`\n`), Windows (`\r\n`), AND legacy Mac (`\r` alone).
     static ref LINE_CONT_RE: Regex = Regex::new(r"\\(?:\r\n|\n|\r)\s*").unwrap();
+    // Verb subcommand wrapped in `['"]?…['"]?` — closes the BLOCKER both
+    // reviewers flagged on #146: `npm 'install' lodash` / `pip "install" x`
+    // would otherwise bypass (regex doesn't match the quoted subcommand,
+    // and the bare-install scan sees `lodash` as a package → silent skip).
     static ref NPM_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:npm)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:npm)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:i|install|add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref PNPM_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pnpm)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pnpm)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:i|install|add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref YARN_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:yarn)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?i:add)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:yarn)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref PIP_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pip\d*(?:\.\d+)*)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?i:install)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pip\d*(?:\.\d+)*)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:install)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref UV_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:uv)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?:(?i:pip)\s+)?(?i:install|add)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:uv)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?:['"]?(?i:pip)['"]?\s+)?['"]?(?i:install|add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref POETRY_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:poetry)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?i:add)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:poetry)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref PIPX_RE: Regex = Regex::new(
-        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pipx)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?i:install)\s+([^|;&<>\r\n]+)"#
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pipx)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:install)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
 }
@@ -643,19 +647,50 @@ fn extract_recursion_segments(cmd: &str) -> Vec<String> {
         i += 1;
     }
 
-    // `sh -c <arg>` / `bash -c <arg>`: pull the argument that follows `-c`.
-    // Walk the token stream rather than the raw bytes so the argument's
-    // surrounding quotes are already stripped.
+    // `sh -c <arg>` / `bash -c <arg>` (and friends): pull the argument that
+    // follows the `-c` option. Combined short-option clusters like `-lc`,
+    // `-xc`, `-x -c`, and POSIX-legal orderings like `bash -c -e '<cmd>'`
+    // were a confirmed bypass (agy + Codex HIGH on #146): the original
+    // exact-`-c` match missed every form except the canonical one.
+    //
+    // Strategy: locate a shell head (`sh`/`bash`/`zsh`/`dash`/`ksh`), then
+    // scan forward through short-option clusters for one whose final
+    // character is `c`. The next token after the matching cluster is the
+    // command body. A long option (`--`) or non-option token before `-c`
+    // ends the scan without recursion.
     let toks = shell_tokens(cmd);
     let mut idx = 0;
-    while idx + 2 < toks.len() {
-        let head = installer_basename(toks[idx].1.as_str());
-        if (head == "sh" || head == "bash" || head == "zsh" || head == "dash")
-            && toks[idx + 1].1 == "-c"
-        {
-            out.push(toks[idx + 2].1.clone());
-            idx += 3;
-            continue;
+    while idx < toks.len() {
+        let head = installer_basename(toks[idx].1.as_str()).to_ascii_lowercase();
+        if matches!(head.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+            // Scan forward for a short-option cluster ending in `c`.
+            let mut scan = idx + 1;
+            let mut body_idx: Option<usize> = None;
+            while scan < toks.len() {
+                let t = toks[scan].1.as_str();
+                if t.starts_with("--") {
+                    // Long option: stop without recursion.
+                    break;
+                }
+                if t.starts_with('-') && t.len() >= 2 && t.ends_with('c') {
+                    body_idx = Some(scan + 1);
+                    break;
+                }
+                if !t.starts_with('-') {
+                    // Non-option token before `-c`: this isn't a `-c` form
+                    // (e.g. `bash script.sh` — a script-file invocation,
+                    // not in scope for body extraction).
+                    break;
+                }
+                scan += 1;
+            }
+            if let Some(b) = body_idx {
+                if b < toks.len() {
+                    out.push(toks[b].1.clone());
+                }
+                idx = b + 1;
+                continue;
+            }
         }
         idx += 1;
     }
@@ -844,10 +879,22 @@ fn dedup_installs(items: &mut Vec<ParsedInstall>) {
 }
 
 fn installs_equivalent(a: &ParsedInstall, b: &ParsedInstall) -> bool {
-    a.ecosystem == b.ecosystem
-        && a.has_editable == b.has_editable
-        && a.unvettable == b.unvettable
-        && a.packages == b.packages
+    if a.ecosystem != b.ecosystem
+        || a.has_editable != b.has_editable
+        || a.unvettable != b.unvettable
+        || a.packages.len() != b.packages.len()
+    {
+        return false;
+    }
+    // Order-independent package-set compare (agy LOW on #146): two installs
+    // listing `[a, b]` and `[b, a]` semantically install the same set and
+    // must collapse. We sort cheap clones rather than mutate inputs so the
+    // original ordering (which has display value) is preserved for callers.
+    let mut a_pkgs = a.packages.clone();
+    let mut b_pkgs = b.packages.clone();
+    a_pkgs.sort();
+    b_pkgs.sort();
+    a_pkgs == b_pkgs
 }
 
 /// Recursion-bounded core of [`detect_installs`]. `depth` guards against a
@@ -939,14 +986,29 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
     // Recurse into shell-wrapped install shells: `sh -c '<install>'`,
     // `$(<install>)`, backticks. Each inner command is treated as its own
     // top-level command — claimed-span dedup is local to a single string,
-    // so duplicates between layers are not a concern. `MAX_RECURSION_DEPTH`
-    // is the only stop condition; an adversary nesting more than that is
-    // silently dropped (failing closed at the caller, which still sees the
-    // outer command).
+    // so duplicates between layers are not a concern.
+    //
+    // Depth limit (Codex + agy BLOCKER on #146): at `MAX_RECURSION_DEPTH`
+    // the recursion stops. The original implementation silently dropped
+    // any installs at depths beyond the cap — fail-OPEN. A nested payload
+    // (`sh -c "$(sh -c "$(sh -c '...')")"`) that exceeds the cap would
+    // then auto-allow at the gate. The fix: at the cap, if there are still
+    // unresolved recursion segments, surface a synthetic Unvettable
+    // ParsedInstall so the caller fails CLOSED (Verdict::Ask) instead.
     if depth < MAX_RECURSION_DEPTH {
         for inner in extract_recursion_segments(cmd) {
             detect_installs_into(&inner, depth + 1, out);
         }
+    } else if !extract_recursion_segments(cmd).is_empty() {
+        out.push(ParsedInstall {
+            ecosystem: Ecosystem::Npm, // ecosystem-agnostic; pick one
+            packages: Vec::new(),
+            has_editable: false,
+            unvettable: Some(format!(
+                "recursion depth limit ({}) reached — nested shell payload exceeds vetting capacity, treat as unvettable",
+                MAX_RECURSION_DEPTH
+            )),
+        });
     }
 }
 
@@ -3034,6 +3096,112 @@ mod tests {
                 .any(|i| i.packages.iter().any(|(n, _)| n == "foo")),
             "inner install package must be named, got: {:?}",
             v
+        );
+    }
+
+    // ─── PR #146 peer-review follow-ups ──────────────────────────────────
+    //
+    // Both Codex and agy reviewed PR #146 (head 32fb6b2) and surfaced
+    // 2 BLOCKERs + 1 HIGH + 1 LOW. Pinned below to prevent regression.
+
+    #[test]
+    fn quoted_install_verb_detected() {
+        // BLOCKER (both reviewers, #146): `npm 'install' lodash` and
+        // `pip "install" requests` were silently dropped — the regex did
+        // not allow quotes around the SUBCOMMAND, so it missed; the bare
+        // scan then saw a package after the quoted verb and flipped
+        // has_package=true. Fix: optional `['"]?` around the subcommand.
+        let v = detect_installs(r#"npm 'install' lodash"#);
+        assert_eq!(v.len(), 1, "npm 'install' lodash must be detected: {v:?}");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert!(
+            v[0].packages.iter().any(|(n, _)| n == "lodash"),
+            "must capture lodash"
+        );
+    }
+
+    #[test]
+    fn double_quoted_install_verb_detected() {
+        let v = detect_installs(r#"pip "install" requests"#);
+        assert_eq!(v.len(), 1, r#"pip "install" requests must be detected"#);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].packages.iter().any(|(n, _)| n == "requests"));
+    }
+
+    #[test]
+    fn quoted_install_verb_combined_with_quoted_head() {
+        let v = detect_installs(r#"'npm' 'install' lodash"#);
+        assert_eq!(v.len(), 1, "both head and verb quoted must still detect");
+        assert!(v[0].packages.iter().any(|(n, _)| n == "lodash"));
+    }
+
+    #[test]
+    fn bash_lc_combined_option_install_detected() {
+        // HIGH (agy + Codex, #146): combined short options like `bash -lc`
+        // skipped recursion because the original exact-`-c` match only
+        // matched the canonical form. Now any `-[chars]c` cluster fires.
+        let v = detect_installs(r#"bash -lc 'npm install evil'"#);
+        assert!(
+            v.iter().any(|i| i.packages.iter().any(|(n, _)| n == "evil")),
+            "bash -lc must recurse: {v:?}"
+        );
+    }
+
+    #[test]
+    fn bash_xc_combined_option_install_detected() {
+        let v = detect_installs(r#"bash -xc 'npm install nasty'"#);
+        assert!(
+            v.iter().any(|i| i.packages.iter().any(|(n, _)| n == "nasty")),
+            "bash -xc must recurse: {v:?}"
+        );
+    }
+
+    #[test]
+    fn bash_separate_options_install_detected() {
+        // `bash -x -c '<install>'` — option before `-c`, separate tokens.
+        let v = detect_installs(r#"bash -x -c 'npm install sep'"#);
+        assert!(
+            v.iter().any(|i| i.packages.iter().any(|(n, _)| n == "sep")),
+            "bash -x -c (separate options) must recurse: {v:?}"
+        );
+    }
+
+    #[test]
+    fn recursion_depth_limit_surfaces_unvettable_not_skip() {
+        // BLOCKER (agy + Codex, #146): the original `if depth < MAX_RECURSION_DEPTH`
+        // silently dropped recursion segments at depth >= 6. This
+        // fail-OPEN behaviour meant a 7-deep nest could auto-allow.
+        // Now: at the cap, if recursion segments still exist, surface an
+        // Unvettable so the caller fails CLOSED.
+        // Build a payload nested 7 deep — each `sh -c "$(…)"` layer
+        // contributes depth.
+        let mut payload = "npm install deeply-nested".to_string();
+        for _ in 0..7 {
+            payload = format!(r#"sh -c "$({})""#, payload);
+        }
+        let v = detect_installs(&payload);
+        assert!(
+            !v.is_empty(),
+            "depth-cap must surface at least one ParsedInstall (Unvettable), not silently Skip"
+        );
+        // At least one item must be the Unvettable depth-cap marker.
+        assert!(
+            v.iter().any(|i| i.unvettable.as_deref().is_some_and(|s| s.contains("recursion depth limit"))),
+            "depth-cap Unvettable marker missing: {v:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_collapses_reordered_package_lists() {
+        // LOW (agy, #146): dedup compared package lists with order-strict
+        // `==`. Sort-before-compare collapses semantically identical
+        // installs. Pin: `npm install a b && npm install b a` should
+        // dedupe to one ParsedInstall.
+        let v = detect_installs("npm install a b && npm install b a");
+        assert_eq!(
+            v.len(),
+            1,
+            "reordered duplicate must collapse to one detection: {v:?}"
         );
     }
 
