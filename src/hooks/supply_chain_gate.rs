@@ -663,7 +663,7 @@ fn extract_recursion_segments(cmd: &str) -> Vec<String> {
     while idx < toks.len() {
         let head = installer_basename(toks[idx].1.as_str()).to_ascii_lowercase();
         if matches!(head.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
-            // Scan forward for a short-option cluster ending in `c`.
+            // Scan forward for a short-option cluster containing `c`.
             let mut scan = idx + 1;
             let mut body_idx: Option<usize> = None;
             while scan < toks.len() {
@@ -672,7 +672,7 @@ fn extract_recursion_segments(cmd: &str) -> Vec<String> {
                     // Long option: stop without recursion.
                     break;
                 }
-                if t.starts_with('-') && t.len() >= 2 && t.ends_with('c') {
+                if t.starts_with('-') && t.len() >= 2 && t.contains('c') {
                     body_idx = Some(scan + 1);
                     break;
                 }
@@ -684,7 +684,10 @@ fn extract_recursion_segments(cmd: &str) -> Vec<String> {
                 }
                 scan += 1;
             }
-            if let Some(b) = body_idx {
+            if let Some(mut b) = body_idx {
+                if b < toks.len() && toks[b].1 == "--" {
+                    b += 1;
+                }
                 if b < toks.len() {
                     out.push(toks[b].1.clone());
                 }
@@ -3219,6 +3222,15 @@ mod tests {
             "nested sh -c install must be detected, got: {:?}",
             v
         );
+    }
+
+    #[test]
+    fn bash_c_double_dash_install_detected() {
+        let v = detect_installs("bash -c -- 'cd /tmp && sh -c \"npm install\"'");
+        assert!(!v.is_empty(), "nested bare install under double dash -- must be detected: {v:?}");
+
+        let v2 = detect_installs("bash -cce 'npm install lodash'");
+        assert!(!v2.is_empty(), "bash -cce must be detected: {v2:?}");
     }
 
     #[test]
