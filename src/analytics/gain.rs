@@ -36,6 +36,7 @@ pub fn run(
     all: bool,
     format: &str,
     failures: bool,
+    weak_filters: bool,
     reset: bool,
     yes: bool,
     _verbose: u8,
@@ -57,6 +58,10 @@ pub fn run(
 
     if failures {
         return show_failures(&tracker);
+    }
+
+    if weak_filters {
+        return show_weak_filters(&tracker, project_scope.as_deref());
     }
 
     // Handle export formats
@@ -710,6 +715,49 @@ fn check_rtk_disabled_bypass() -> Option<String> {
     } else {
         None
     }
+}
+
+/// Render `gain --weak-filters`: tools ranked by leaked tokens, so the
+/// reader can see where a better or new filter would recover the most.
+fn show_weak_filters(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+    let weak = tracker
+        .get_weak_filters(project_scope)
+        .context("Failed to load weak-filter data")?;
+
+    println!(
+        "{}",
+        styled("ContextCrawler Weak Filters — where tokens leak", true)
+    );
+    println!("{}", "═".repeat(64));
+    println!();
+
+    if weak.is_empty() {
+        println!("No command data recorded yet — run some commands first.");
+        return Ok(());
+    }
+
+    println!("Tools ranked by leaked tokens (input that reached the model");
+    println!("unfiltered). High leak + low savings% = a filter worth building");
+    println!("or improving.");
+    println!();
+    println!(
+        "  {:<3} {:<18} {:>7} {:>10} {:>10} {:>9}",
+        "#", "Tool", "Runs", "Input", "Leaked", "Savings"
+    );
+    println!("  {}", "─".repeat(60));
+    for (idx, w) in weak.iter().take(15).enumerate() {
+        println!(
+            "  {:<3} {:<18} {:>7} {:>10} {:>10} {:>8.1}%",
+            format!("{}.", idx + 1),
+            truncate(&w.tool, 18),
+            w.runs,
+            format_tokens(w.input_tokens),
+            format_tokens(w.leaked_tokens),
+            w.savings_pct,
+        );
+    }
+    println!();
+    Ok(())
 }
 
 fn show_failures(tracker: &Tracker) -> Result<()> {
