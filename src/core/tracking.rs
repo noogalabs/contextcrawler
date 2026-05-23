@@ -455,9 +455,15 @@ impl Tracker {
         let _ = conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;");
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
+        // Order matters: busy_timeout MUST register before the WAL switch.
+        // `PRAGMA journal_mode=WAL` requires an exclusive lock and can return
+        // SQLITE_BUSY if a peer holds the DB; with busy_timeout already armed,
+        // SQLite waits out the peer instead of failing immediately. Peer-
+        // review #150 (agy) — the multi-thread boundary test surfaced this
+        // ordering as a flakiness vector under high CPU contention.
         let _ = conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;",
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;",
         );
         conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
@@ -2319,7 +2325,16 @@ mod tests {
                 Some(v) => std::env::set_var("RTK_DB_PATH", v),
                 None => std::env::remove_var("RTK_DB_PATH"),
             }
+            // Remove the .db file plus the WAL sidecars. Without `-wal`/`-shm`
+            // cleanup, WAL-mode connections leave them behind on abnormal exit
+            // (e.g. a worker thread panic) and pollute $HOME across runs.
+            // Peer-review #150 (agy) found.
             let _ = std::fs::remove_file(&self.path);
+            for suffix in ["-wal", "-shm"] {
+                let mut s = self.path.clone().into_os_string();
+                s.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(s));
+            }
         }
     }
 
