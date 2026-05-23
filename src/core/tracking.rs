@@ -3051,12 +3051,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_release_boundary_handles_concurrent_safely() {
-        // Approximation of the TOCTOU concern: simulate two back-to-back
-        // calls on the same connection (the original Rust-side check would
-        // race two SQLite connections; this exercises the atomic INSERT-
-        // WHERE-NOT-EXISTS path on a single connection to confirm it is
-        // idempotent even when called rapidly.).
+    fn ensure_release_boundary_is_idempotent_on_tight_loop() {
+        // Same-connection idempotency: repeated calls on one Tracker must
+        // not append duplicate rows. This is the cheap baseline check
+        // that the WHERE-NOT-EXISTS guard fires correctly. The real
+        // multi-connection race is exercised by the test below.
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
         for _ in 0..10 {
             tracker.ensure_release_boundary().expect("repeated call");
@@ -3070,5 +3069,52 @@ mod tests {
             )
             .expect("count rows");
         assert_eq!(n, 1, "tight-loop calls must not append duplicate rows");
+    }
+
+    #[test]
+    fn ensure_release_boundary_no_duplicates_under_real_concurrency() {
+        // Round-2 peer-review (Codex + agy) asked for a real multi-thread
+        // race against a file-backed DB — the single-connection idempotency
+        // test above doesn't exercise SQLite's write-locking behaviour.
+        //
+        // Strategy: pin a private file-backed DB via the PinnedDb RAII
+        // helper, then spawn 8 threads that each call `Tracker::new()`.
+        // Every Tracker::new() runs `ensure_release_boundary()` on its own
+        // sqlite Connection — exactly the production race shape (two
+        // contextcrawler processes starting concurrently after a binary
+        // upgrade). The atomic INSERT...WHERE NOT EXISTS guarantees that
+        // only the first one to acquire the SQLITE write lock inserts;
+        // the others find the row already there and no-op.
+        //
+        // Holding ENV_LOCK serialises with other RTK_DB_PATH-touching
+        // tests in the same process, not with our own spawned threads —
+        // they share the same path env-var.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _db = PinnedDb::new("rtk_boundary_concurrency");
+
+        const N_THREADS: usize = 8;
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for _ in 0..N_THREADS {
+            handles.push(std::thread::spawn(|| {
+                Tracker::new().expect("tracker construction in worker thread");
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let tracker = Tracker::new().expect("verifier tracker");
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(
+            n, 1,
+            "atomic INSERT...WHERE NOT EXISTS must dedupe across N concurrent connections"
+        );
     }
 }
