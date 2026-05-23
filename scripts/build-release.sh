@@ -129,8 +129,27 @@ EOF
 fi
 
 if [[ $INSTALL -eq 1 ]]; then
+    DEST="$HOME/.local/bin/contextcrawler"
     mkdir -p "$HOME/.local/bin"
-    cp "$BIN" "$HOME/.local/bin/contextcrawler"
+    cp "$BIN" "$DEST"
+
+    # macOS Apple Silicon: a plain `cp` of an ad-hoc-linker-signed binary
+    # produces a destination that AMFI rejects at exec with
+    # `load code signature error 2` / `ASP: Security policy would not allow
+    # process`, killing the process with SIGKILL (exit 137). Re-applying the
+    # ad-hoc signature on the copied file fixes it. `cargo install` does this
+    # itself; our `cp` does not, so we do it here.
+    #
+    # This is a no-op on Linux (no codesign binary, no AMFI). The macOS
+    # check is conservative — codesign exists on every modern macOS install,
+    # so we only need to gate on uname.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if command -v codesign >/dev/null 2>&1; then
+            codesign --force --sign - "$DEST" 2>&1 | sed 's/^/[build-release] codesign: /'
+        else
+            echo "[build-release] warning: codesign not found, install may fail AMFI on launch" >&2
+        fi
+    fi
     echo "[build-release] installed to ~/.local/bin/contextcrawler"
 fi
 
