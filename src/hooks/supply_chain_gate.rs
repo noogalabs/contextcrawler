@@ -278,21 +278,28 @@ impl Ecosystem {
     }
 }
 
+// The prefix anchor `(?:^|[\s;/\\]|&&|\|\|)` treats whitespace, `;`, `&&`,
+// `||`, `/`, and `\` as command-start delimiters. `/` and `\` close the
+// absolute / relative path bypass observed on 2026-05-23 — invoking the
+// package manager via `/Users/.../bin/npm install foo` or `./bin/pnpm i x`
+// must not slip past the gate just because the byte before the verb is a
+// path separator. See abs_path_*_detected tests for the regression guard.
 lazy_static! {
     static ref NPM_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)npm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)npm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
     static ref PNPM_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pnpm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)pnpm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
     static ref YARN_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)yarn\s+add\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)yarn\s+add\s+([^|;&<>]+)").unwrap();
     static ref PIP_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)(?:pip|pip3)\s+install\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?:pip|pip3)\s+install\s+([^|;&<>]+)").unwrap();
     static ref UV_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)uv\s+(?:pip\s+)?(?:install|add)\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)uv\s+(?:pip\s+)?(?:install|add)\s+([^|;&<>]+)")
+            .unwrap();
     static ref POETRY_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)poetry\s+add\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)poetry\s+add\s+([^|;&<>]+)").unwrap();
     static ref PIPX_RE: Regex =
-        Regex::new(r"(?m)(?:^|\s|;|&&|\|\|)pipx\s+install\s+([^|;&<>]+)").unwrap();
+        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)pipx\s+install\s+([^|;&<>]+)").unwrap();
 }
 
 /// Tokenise a shell command into (offset, token) pairs, treating the shell
@@ -416,6 +423,14 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     out
 }
 
+/// Last path component of a token, stripping both POSIX (`/`) and Windows
+/// (`\`) separators. Used to normalise an installer command head before
+/// matching `"npm"` / `"pnpm"` / `"yarn"`, so `/Users/x/.nvm/.../bin/npm`
+/// classifies as `npm`. Returns `tok` unchanged for plain tokens.
+fn installer_basename(tok: &str) -> &str {
+    tok.rsplit(['/', '\\']).next().unwrap_or(tok)
+}
+
 /// Scan the shell token stream for npm/pnpm/yarn install verbs that resolve
 /// their package set from a lockfile (no package-name token follows). A
 /// package name is a bare token that is neither a flag (`-`-prefixed) nor a
@@ -430,7 +445,13 @@ fn detect_bare_lockfile_installs(
     let tokens = shell_tokens(cmd);
     let mut idx = 0;
     while idx < tokens.len() {
-        let (start, tok) = (&tokens[idx].0, tokens[idx].1.as_str());
+        let (start, raw_tok) = (&tokens[idx].0, tokens[idx].1.as_str());
+        // Basename-normalise the head token before matching. Without this,
+        // `/Users/.../bin/npm install` slips past because the literal token
+        // is the absolute path, not `"npm"`. Closes the abs/relative-path
+        // bypass observed on 2026-05-23. (Path separators handled: `/` for
+        // POSIX, `\` for Windows.)
+        let tok = installer_basename(raw_tok);
         // Identify an install-verb head: `npm`/`pnpm`/`yarn` plus the verb
         // token(s). Bare `yarn` (no sub-command) is itself an install.
         let (verb_span_end_idx, is_bare_install_verb) = match tok {
@@ -1376,6 +1397,100 @@ mod tests {
     fn detect_compound_install() {
         let v = detect_installs("cd foo && npm install x && pip install y");
         assert_eq!(v.len(), 2);
+    }
+
+    // ─── Absolute / relative path bypass regression ────────────────────────
+    //
+    // Invoking the package manager via an absolute or relative path —
+    // `/Users/x/.nvm/.../bin/npm install foo`, `./bin/pnpm install bar` —
+    // must NOT slip past the gate. The path separator before the install
+    // verb has to count as a command-start delimiter (same role as a space
+    // or `&&`). Empirically observed bypass on 2026-05-23; see the harden
+    // commit. These tests pin the closure.
+
+    #[test]
+    fn abs_path_npm_install_detected() {
+        let v = detect_installs(
+            "/Users/x/.nvm/versions/node/v25.0.0/bin/npm install @earendil-works/pi-coding-agent",
+        );
+        assert_eq!(v.len(), 1, "abs-path npm install must be detected");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(v[0].packages[0].0, "@earendil-works/pi-coding-agent");
+    }
+
+    #[test]
+    fn abs_path_pnpm_install_detected() {
+        let v = detect_installs("/usr/local/bin/pnpm install lodash");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn abs_path_yarn_add_detected() {
+        let v = detect_installs("/opt/homebrew/bin/yarn add react");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["react"]);
+    }
+
+    #[test]
+    fn abs_path_pip_install_detected() {
+        let v = detect_installs("/usr/bin/pip install requests");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn abs_path_uv_install_detected() {
+        let v = detect_installs("/Users/me/.cargo/bin/uv pip install requests");
+        assert_eq!(v.len(), 1, "abs-path uv must be claimed by UV pattern");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+    }
+
+    #[test]
+    fn abs_path_poetry_add_detected() {
+        let v = detect_installs("/opt/python/bin/poetry add httpx");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["httpx"]);
+    }
+
+    #[test]
+    fn abs_path_pipx_install_detected() {
+        let v = detect_installs("/usr/local/bin/pipx install poetry");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["poetry"]);
+    }
+
+    #[test]
+    fn relative_path_npm_install_detected() {
+        let v = detect_installs("./node_modules/.bin/npm install left-pad");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["left-pad"]);
+    }
+
+    #[test]
+    fn abs_path_bare_npm_install_detected() {
+        // Bare lockfile install via abs path — should still be classified as
+        // an Unvettable npm install (see detect_bare_lockfile_installs).
+        let v = detect_installs("/Users/x/.nvm/versions/node/v25/bin/npm install");
+        assert_eq!(v.len(), 1, "bare abs-path npm install must be detected");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert!(
+            v[0].unvettable.is_some(),
+            "bare install has no named package, must surface as unvettable"
+        );
+    }
+
+    #[test]
+    fn abs_path_does_not_double_match_mid_path_substring() {
+        // Defensive: `/some/random/path/install/notnpm.txt` mentions
+        // "install" but contains no install verb. Must produce zero hits.
+        let v = detect_installs("/some/random/path/install/notnpm.txt");
+        assert!(v.is_empty(), "no install verb here, got: {:?}", v);
     }
 
     #[test]
