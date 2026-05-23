@@ -1046,7 +1046,7 @@ const MAX_RECURSION_DEPTH: u8 = 6;
 
 fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
     // #141: mask any segment whose head verb is a data-consuming utility
-    // (echo, printf, cat, grep, rg, awk, sed, …). The masked string has the
+    // (echo, printf, cat, grep, jq, base64, …). The masked string has the
     // SAME byte offsets — bytes inside masked segments are turned into
     // spaces — so all downstream regex anchors, the `claimed` index
     // bookkeeping, AND `mask_quoted_operators` (which also produces a
@@ -3465,9 +3465,11 @@ mod tests {
     // just data printed to stdout, but the gate treated the substring as a
     // real install verb and blocked.
     //
-    // Fix: head-verb allowlist (echo, printf, cat, tac, grep, egrep, fgrep,
-    // rg, awk, gawk, sed, head, tail, tee, nl). When the head of a command
-    // segment basename-normalises to one of these, the segment bytes are
+    // Fix: head-verb allowlist (echo, printf, cat, tac, tee, grep, egrep,
+    // fgrep, head, tail, nl, base64, xxd, od, hexdump, jq — all execution-
+    // incapable; rg/awk/gawk/sed deliberately excluded, see #148). When the
+    // head of a command segment basename-normalises to one of these, the
+    // segment bytes are
     // overwritten with ASCII spaces in a same-length working copy before the
     // install-detection regexes run. Byte offsets are preserved so the
     // existing regex prefix-anchors and `claimed`-span dedup keep working.
@@ -3584,6 +3586,57 @@ mod tests {
     fn hexdump_with_install_substring_is_not_an_install() {
         let v = detect_installs(r#"hexdump -C /tmp/payload"#);
         assert!(v.is_empty(), "hexdump is data, not install: {v:?}");
+    }
+
+    // ─── #148 round-3 (agy) — explicit masking coverage for the rest of
+    //     DATA_CONSUMING_UTILITIES (tac, tee, egrep, fgrep, head, tail, nl).
+    //     Round-2 only pinned the exec-capable removals and the high-traffic
+    //     data utilities. These seven were silently relying on indirect
+    //     coverage; pin them here so future trims of the allowlist surface as
+    //     an obvious test failure.
+
+    #[test]
+    fn tac_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"tac /tmp/log # contains 'npm install foo'"#);
+        assert!(v.is_empty(), "tac is reverse-cat, pure data: {v:?}");
+    }
+
+    #[test]
+    fn tee_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"echo data | tee /tmp/out # 'pip install x' in body"#);
+        // `tee` is the head of the post-pipe segment; both `echo` and `tee`
+        // are data utilities, so neither segment must trigger detection.
+        assert!(v.is_empty(), "tee writes stdin to file+stdout, no exec: {v:?}");
+    }
+
+    #[test]
+    fn egrep_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"egrep "npm install|pip install" /tmp/notes"#);
+        assert!(v.is_empty(), "egrep is grep -E, no exec: {v:?}");
+    }
+
+    #[test]
+    fn fgrep_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"fgrep "npm install foo" /tmp/notes"#);
+        assert!(v.is_empty(), "fgrep is grep -F, no exec: {v:?}");
+    }
+
+    #[test]
+    fn head_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"head -20 /tmp/install-instructions.md"#);
+        assert!(v.is_empty(), "head prints first N lines, no exec: {v:?}");
+    }
+
+    #[test]
+    fn tail_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"tail -f /var/log/npm-install.log"#);
+        assert!(v.is_empty(), "tail prints last N lines, no exec: {v:?}");
+    }
+
+    #[test]
+    fn nl_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"nl /tmp/notes # numbered 'npm install foo'"#);
+        assert!(v.is_empty(), "nl numbers lines, no exec: {v:?}");
     }
 
     #[test]
