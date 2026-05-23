@@ -817,9 +817,27 @@ fn is_shell_operator(tok: &str) -> bool {
 /// or SEARCH their argv as data. Stateful utilities like `cd`, `env`,
 /// `xargs`, `sudo`, `nohup` are NOT on the list — they invoke a subsequent
 /// command and that command is the real head.
+///
+/// **EXCLUDED (deliberately) — execution-capable utilities** (agy BLOCKER
+/// on PR #148): `awk` / `gawk` / `mawk` / `sed` are Turing-complete and
+/// have native command-execution primitives:
+///   - `awk 'BEGIN { system("npm install evil") }'`
+///   - GNU `sed 's/.*/npm install .../e'`
+/// Masking these would create a silent bypass class — the entire point of
+/// allowlisting is that the matched utility cannot spawn an install. If
+/// you ever want to handle them, route through `extract_recursion_segments`
+/// to walk the script body, NOT through the data-utility allowlist.
 const DATA_CONSUMING_UTILITIES: &[&str] = &[
-    "echo", "printf", "cat", "tac", "grep", "egrep", "fgrep", "rg",
-    "awk", "gawk", "sed", "head", "tail", "tee", "nl",
+    // Emit-as-data
+    "echo", "printf", "cat", "tac", "tee",
+    // Search-as-data
+    "grep", "egrep", "fgrep", "rg",
+    // Slice / trim-as-data
+    "head", "tail", "nl",
+    // Encode / decode (cannot execute)
+    "base64", "xxd", "od", "hexdump",
+    // Structured-text parse (jq has no shell-out; `--exec`-style flags do not exist)
+    "jq",
 ];
 
 /// True iff the first non-whitespace token of `segment`, basename-normalised,
@@ -3489,6 +3507,75 @@ mod tests {
             "cat reading a file with install-shaped content must not trigger, got: {:?}",
             v
         );
+    }
+
+    // ─── #148 round-1 BLOCKER (agy) — execution-capable utilities excluded ─
+
+    #[test]
+    fn awk_system_call_install_must_be_detected_not_masked() {
+        // `awk 'BEGIN { system("...") }'` is a real command-execution path.
+        // If awk were in DATA_CONSUMING_UTILITIES, the entire segment would
+        // be masked to spaces and the install would silently bypass. This
+        // test pins awk OUT of the allowlist.
+        let v = detect_installs(r#"awk 'BEGIN { system("npm install evil") }'"#);
+        assert!(
+            !v.is_empty(),
+            "awk segment must NOT be masked — system() can spawn an install: {v:?}"
+        );
+    }
+
+    #[test]
+    fn gawk_system_call_install_must_be_detected_not_masked() {
+        let v = detect_installs(r#"gawk 'BEGIN { system("pip install bad") }'"#);
+        assert!(
+            !v.is_empty(),
+            "gawk system() install must not be masked: {v:?}"
+        );
+    }
+
+    #[test]
+    fn sed_exec_flag_install_must_be_detected_not_masked() {
+        // GNU sed's `s///e` flag executes the replacement as a shell command.
+        let v = detect_installs(r#"sed 's/.*/npm install nasty/e' /tmp/x"#);
+        assert!(
+            !v.is_empty(),
+            "sed `e` flag install must not be masked — sed can spawn shell: {v:?}"
+        );
+    }
+
+    // ─── #148 round-1 MEDIUM (agy) — allowlist coverage additions ──────────
+
+    #[test]
+    fn jq_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"jq '.scripts | select(. == "npm install foo")' package.json"#);
+        assert!(v.is_empty(), "jq filter is data processing, not install: {v:?}");
+    }
+
+    #[test]
+    fn base64_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"base64 -d <<< "bnBtIGluc3RhbGwgZm9v""#);
+        assert!(v.is_empty(), "base64 decode is data, not install: {v:?}");
+    }
+
+    #[test]
+    fn xxd_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"xxd /tmp/notes # echoes hex of 'pip install x'"#);
+        assert!(v.is_empty(), "xxd is data, not install: {v:?}");
+    }
+
+    #[test]
+    fn od_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"od -c /tmp/log | grep 'npm install'"#);
+        assert!(
+            v.is_empty(),
+            "od piped to grep — both data utilities, not an install: {v:?}"
+        );
+    }
+
+    #[test]
+    fn hexdump_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"hexdump -C /tmp/payload"#);
+        assert!(v.is_empty(), "hexdump is data, not install: {v:?}");
     }
 
     #[test]
