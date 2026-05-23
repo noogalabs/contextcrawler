@@ -384,6 +384,43 @@ fn is_shell_operator(tok: &str) -> bool {
     )
 }
 
+/// Detect package-manager install invocations in a shell command.
+///
+/// ## Scope (codified after Codex + agy peer review on #143)
+///
+/// The gate is intentionally limited to the install-shaped surfaces below.
+/// Anything outside this list returns [`Verdict::Skip`] — that is not a
+/// silent miss, it is a documented scope boundary. Expansion candidates
+/// (bun, pdm, pipenv, conda, mamba, brew, plus `pnpm update`,
+/// `poetry update`, etc.) are tracked in
+/// [issue #144](https://github.com/thehoff/contextcrawler/issues/144).
+///
+/// **In scope** (package-bearing, via regex):
+/// - `npm install <pkg>` / `npm i <pkg>` / `npm add <pkg>`
+/// - `pnpm install <pkg>` / `pnpm i <pkg>` / `pnpm add <pkg>`
+/// - `yarn add <pkg>`
+/// - `pip install <pkg>` / `pip3 install <pkg>` / `pip3.12.exe install <pkg>` etc.
+/// - `uv install <pkg>` / `uv add <pkg>` / `uv pip install <pkg>`
+/// - `poetry add <pkg>`
+/// - `pipx install <pkg>`
+///
+/// **In scope** (bare lockfile / always-bare, via token walk):
+/// - `npm install` / `npm i` / `npm ci`
+/// - `pnpm install` / `pnpm i` / `pnpm ci`
+/// - `yarn install` / bare `yarn`
+/// - `poetry install` (always bare, all args are flags)
+/// - `uv sync` / `uv pip sync` (always bare, all args are flags)
+///
+/// **Deliberately out of scope** (maintenance / lockfile-only / non-install):
+/// - `npm rebuild`, `npm dedupe`, `npm update`
+/// - `uv lock`, `poetry lock`
+/// - `yarn --version`, `yarn -v`, `yarn --help`, `yarn -h`
+///   (filtered explicitly in the bare-yarn arm)
+///
+/// All path forms (POSIX abs, POSIX rel, Windows `\` paths, `.cmd`/`.exe`/
+/// `.bat` launcher suffixes, chained extensions, all case variants) are
+/// normalised by [`installer_basename`] and the regex anchor before the
+/// match arms see the token.
 fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     // Collapse shell line-continuation (`\` + newline + indent) into a single
     // space BEFORE detection. Without this, the `\r\n` guard added in PR #142
@@ -467,6 +504,15 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
 /// `npm.cmd.exe`) classify as `npm`. Returns the original-cased subslice
 /// so callers can still see the source casing if needed — match arms
 /// should compare with `eq_ignore_ascii_case` or lowercase first.
+/// Is this token one of the canonical Yarn diagnostic flags that should NOT
+/// be classified as a bare-install verb? `yarn --version`, `yarn -v`,
+/// `yarn --help`, `yarn -h` are query-style invocations — they read state
+/// and exit without touching the dependency tree. Codex peer-review LOW on
+/// #143 flagged the bare-yarn rule's over-match for these.
+fn is_yarn_help_or_version_flag(tok: &str) -> bool {
+    matches!(tok, "--version" | "-v" | "--help" | "-h")
+}
+
 fn installer_basename(tok: &str) -> &str {
     let mut base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
     // Loop: strip the longest matching suffix until none match.
@@ -556,8 +602,16 @@ fn detect_bare_lockfile_installs(
             "yarn" => match next_lower(idx + 1).as_deref() {
                 // `yarn install` never takes a positional package.
                 Some("install") => (idx + 1, Some(Ecosystem::Npm), false),
-                // Bare `yarn` or `yarn` followed by a flag / operator is an
-                // install — never takes a positional.
+                // Bare `yarn` or `yarn` followed by a shell operator IS an
+                // install (no sub-command = `yarn install` shorthand).
+                // BUT `yarn --version`, `yarn -v`, `yarn --help`, `yarn -h`
+                // are diagnostic invocations that do NOT install anything.
+                // Codex peer review on #143 flagged the bare over-match;
+                // exclude the known help/version flags here.
+                Some(next) if is_yarn_help_or_version_flag(next) => {
+                    idx += 1;
+                    continue;
+                }
                 Some(next) if next.starts_with('-') || is_shell_operator(next) => {
                     (idx, Some(Ecosystem::Npm), false)
                 }
@@ -1884,6 +1938,36 @@ mod tests {
         let pkgs: Vec<&str> = v[0].packages.iter().map(|(n, _)| n.as_str()).collect();
         assert!(pkgs.contains(&"left-pad"), "missing left-pad in {pkgs:?}");
         assert!(pkgs.contains(&"lodash"), "missing lodash in {pkgs:?}");
+    }
+
+    #[test]
+    fn yarn_version_flag_not_a_bare_install() {
+        // Codex LOW on #143: `yarn --version` is a diagnostic invocation;
+        // the bare-yarn rule used to over-match any dash-prefixed next-token.
+        let v = detect_installs("yarn --version");
+        assert!(v.is_empty(), "yarn --version must NOT classify as install: {v:?}");
+    }
+
+    #[test]
+    fn yarn_help_flag_not_a_bare_install() {
+        let v = detect_installs("yarn --help");
+        assert!(v.is_empty(), "yarn --help must NOT classify as install");
+    }
+
+    #[test]
+    fn yarn_short_version_not_a_bare_install() {
+        let v = detect_installs("yarn -v");
+        assert!(v.is_empty(), "yarn -v must NOT classify as install");
+    }
+
+    #[test]
+    fn yarn_with_other_flag_still_bare_install() {
+        // Sanity: a non-diagnostic flag (`--frozen-lockfile`) should still
+        // be treated as a bare yarn install (this is the shorthand form
+        // `yarn install --frozen-lockfile`).
+        let v = detect_installs("yarn --frozen-lockfile");
+        assert_eq!(v.len(), 1, "yarn --frozen-lockfile is still a bare install");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
     }
 
     #[test]
