@@ -818,20 +818,28 @@ fn is_shell_operator(tok: &str) -> bool {
 /// `xargs`, `sudo`, `nohup` are NOT on the list — they invoke a subsequent
 /// command and that command is the real head.
 ///
-/// **EXCLUDED (deliberately) — execution-capable utilities** (agy BLOCKER
-/// on PR #148): `awk` / `gawk` / `mawk` / `sed` are Turing-complete and
-/// have native command-execution primitives:
-///   - `awk 'BEGIN { system("npm install evil") }'`
-///   - GNU `sed 's/.*/npm install .../e'`
-/// Masking these would create a silent bypass class — the entire point of
-/// allowlisting is that the matched utility cannot spawn an install. If
-/// you ever want to handle them, route through `extract_recursion_segments`
-/// to walk the script body, NOT through the data-utility allowlist.
+/// **EXCLUDED (deliberately) — execution-capable utilities** (agy + Codex
+/// BLOCKERs on PR #148): tools that can execute arbitrary shell as a
+/// side effect of normal flags do NOT belong on a "data only" allowlist,
+/// because masking their segment hides any install verb from the gate
+/// while the runtime still spawns it.
+///
+/// Confirmed execution-capable, NEVER mask:
+///   - `awk` / `gawk` / `mawk` — Turing-complete with `system()`:
+///     `awk 'BEGIN { system("npm install evil") }'`
+///   - GNU `sed` — `s///e` flag runs the replacement as a shell command:
+///     `sed 's/.*/npm install .../e'`
+///   - `rg` (ripgrep) — `--pre <executable>` runs the preprocessor on
+///     each file (Codex BLOCKER): `rg --pre /tmp/script.sh pattern .`
+///
+/// If you ever want to surface real installs invoked through these
+/// utilities, walk the script body via `extract_recursion_segments` — do
+/// NOT add them back to the allowlist.
 const DATA_CONSUMING_UTILITIES: &[&str] = &[
     // Emit-as-data
     "echo", "printf", "cat", "tac", "tee",
-    // Search-as-data
-    "grep", "egrep", "fgrep", "rg",
+    // Search-as-data (grep family — no `--pre`-style executable flag)
+    "grep", "egrep", "fgrep",
     // Slice / trim-as-data
     "head", "tail", "nl",
     // Encode / decode (cannot execute)
@@ -3579,12 +3587,18 @@ mod tests {
     }
 
     #[test]
-    fn rg_with_install_substring_is_not_an_install() {
-        let v = detect_installs(r#"rg "npm install" src/"#);
+    fn rg_pre_install_must_be_detected_not_masked() {
+        // Codex BLOCKER on #148: `rg --pre <executable>` runs the named
+        // executable as a preprocessor on every file. If `rg` were on the
+        // allowlist, the segment would be masked and the install hidden.
+        // `rg` is OUT of DATA_CONSUMING_UTILITIES for this reason.
+        // (A plain `rg "<pattern>" src/` is also no longer masked — that
+        //  produces a false-positive Ask in the rare case the pattern is
+        //  install-shaped. Net: better to over-Ask than under-detect.)
+        let v = detect_installs(r#"rg --pre /tmp/installer.sh 'npm install evil'"#);
         assert!(
-            v.is_empty(),
-            "rg searching for an install pattern must not trigger, got: {:?}",
-            v
+            !v.is_empty(),
+            "rg --pre install must NOT be masked — preprocessor can spawn shell: {v:?}"
         );
     }
 
