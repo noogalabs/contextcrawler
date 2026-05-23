@@ -803,6 +803,143 @@ fn is_shell_operator(tok: &str) -> bool {
     )
 }
 
+/// Data-consuming utilities — their argv is data, not a command-of-commands.
+/// When the head verb of a command segment is one of these, install-shaped
+/// substrings inside that segment are treated as plain data (not real install
+/// invocations) and the gate suppresses detection for that segment.
+///
+/// This is the #141 pragmatic bandaid (approach 1 of three): a head-verb
+/// allowlist. Approaches (2) "token-position constraint" and (3) "quote-
+/// context exclusion" remain the more principled fixes; this list should
+/// shrink (or retire) once they ship.
+///
+/// Kept deliberately narrow: only utilities whose canonical role is to EMIT
+/// or SEARCH their argv as data. Stateful utilities like `cd`, `env`,
+/// `xargs`, `sudo`, `nohup` are NOT on the list — they invoke a subsequent
+/// command and that command is the real head.
+///
+/// **EXCLUDED (deliberately) — execution-capable utilities** (agy + Codex
+/// BLOCKERs on PR #148): tools that can execute arbitrary shell as a
+/// side effect of normal flags do NOT belong on a "data only" allowlist,
+/// because masking their segment hides any install verb from the gate
+/// while the runtime still spawns it.
+///
+/// Confirmed execution-capable, NEVER mask:
+///   - `awk` / `gawk` / `mawk` — Turing-complete with `system()`:
+///     `awk 'BEGIN { system("npm install evil") }'`
+///   - GNU `sed` — `s///e` flag runs the replacement as a shell command:
+///     `sed 's/.*/npm install .../e'`
+///   - `rg` (ripgrep) — `--pre <executable>` runs the preprocessor on
+///     each file (Codex BLOCKER): `rg --pre /tmp/script.sh pattern .`
+///
+/// If you ever want to surface real installs invoked through these
+/// utilities, walk the script body via `extract_recursion_segments` — do
+/// NOT add them back to the allowlist.
+const DATA_CONSUMING_UTILITIES: &[&str] = &[
+    // Emit-as-data
+    "echo", "printf", "cat", "tac", "tee",
+    // Search-as-data (grep family — no `--pre`-style executable flag)
+    "grep", "egrep", "fgrep",
+    // Slice / trim-as-data
+    "head", "tail", "nl",
+    // Encode / decode (cannot execute)
+    "base64", "xxd", "od", "hexdump",
+    // Structured-text parse (jq has no shell-out; `--exec`-style flags do not exist)
+    "jq",
+];
+
+/// True iff the first non-whitespace token of `segment`, basename-normalised,
+/// matches a known data-consuming utility (see [`DATA_CONSUMING_UTILITIES`]).
+///
+/// Basename normalisation handles `/bin/echo`, `./echo`, `/usr/bin/grep` etc.
+/// — the same path-bypass concern that #139 closed for installer heads
+/// applies symmetrically here.
+///
+/// Returns `false` on an empty / whitespace-only segment, on segments that
+/// begin with a shell operator, and on any unknown head.
+#[allow(dead_code)] // exercised by tests + reserved for principled-path follow-up
+fn command_head_is_data_utility(segment: &str) -> bool {
+    let tokens = shell_tokens(segment);
+    let head = match tokens.first() {
+        Some((_, t)) => t.as_str(),
+        None => return false,
+    };
+    // A leading shell operator (e.g. trailing chain fragment with no head)
+    // is not a data utility — it's just empty.
+    if is_shell_operator(head) {
+        return false;
+    }
+    let basename = installer_basename(head);
+    DATA_CONSUMING_UTILITIES.contains(&basename)
+}
+
+/// Mask command segments whose head verb is a data-consuming utility (see
+/// [`command_head_is_data_utility`]). Returns a string of the same byte
+/// length as `cmd` — bytes inside masked segments are replaced with ASCII
+/// spaces, chain operators and unmasked segments are preserved verbatim.
+///
+/// Preserving byte offsets matters: the regex prefix-anchor in NPM_RE /
+/// PIP_RE / etc. relies on the boundary char immediately before the install
+/// verb (space, `&&`, `||`, `;`, `/`, `\`), and the downstream `claimed`
+/// dedup uses absolute indices into the command. Replacing with spaces
+/// (not deleting) keeps both invariants intact.
+///
+/// Segment boundaries are shell operator tokens (`;`, `|`, `||`, `&`, `&&`,
+/// `>`, `>>`, `<`, `<<`) as produced by [`shell_tokens`]. Each segment's
+/// head is the first non-operator token; the segment span is `[head_off,
+/// next_op_off)` — using the next operator's source offset as the segment
+/// end avoids the trap that `shell_tokens` strips quote characters from
+/// token payloads (so `tok.len()` no longer equals the source-span length
+/// for a quoted token).
+fn mask_data_utility_segments(cmd: &str) -> String {
+    let tokens = shell_tokens(cmd);
+    let bytes = cmd.as_bytes();
+    let mut out: Vec<u8> = bytes.to_vec();
+
+    let mask_range = |buf: &mut Vec<u8>, start: usize, end: usize| {
+        for b in buf.iter_mut().take(end).skip(start) {
+            // Preserve newlines so any multi-line invariants survive; we
+            // are not currently aware of one, but it costs nothing.
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+    };
+
+    let mut seg_head_off: Option<usize> = None;
+    let mut seg_head_is_data_util = false;
+
+    for (off, tok) in &tokens {
+        if is_shell_operator(tok) {
+            // Close the in-flight segment at the operator's source offset.
+            if let (Some(start), true) = (seg_head_off, seg_head_is_data_util) {
+                mask_range(&mut out, start, *off);
+            }
+            seg_head_off = None;
+            seg_head_is_data_util = false;
+            continue;
+        }
+        // First word of a fresh segment establishes the head.
+        if seg_head_off.is_none() {
+            seg_head_off = Some(*off);
+            let basename = installer_basename(tok);
+            seg_head_is_data_util = DATA_CONSUMING_UTILITIES.contains(&basename);
+        }
+    }
+    // Flush the final segment — it runs to end-of-string.
+    if let (Some(start), true) = (seg_head_off, seg_head_is_data_util) {
+        mask_range(&mut out, start, bytes.len());
+    }
+
+    // Safety: we only overwrite ASCII word bytes with ASCII spaces — ASCII
+    // space is never a UTF-8 continuation byte, so multi-byte sequences
+    // inside masked spans get replaced byte-by-byte with valid UTF-8. The
+    // result is therefore valid UTF-8 and `from_utf8` cannot fail in
+    // practice; fall back to the original `cmd` on the impossible case
+    // rather than panic, honouring the gate's no-panic contract.
+    String::from_utf8(out).unwrap_or_else(|_| cmd.to_string())
+}
+
 /// Detect package-manager install invocations in a shell command.
 ///
 /// ## Scope (codified after Codex + agy peer review on #143)
@@ -908,6 +1045,30 @@ fn installs_equivalent(a: &ParsedInstall, b: &ParsedInstall) -> bool {
 const MAX_RECURSION_DEPTH: u8 = 6;
 
 fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
+    // #141: mask any segment whose head verb is a data-consuming utility
+    // (echo, printf, cat, grep, jq, base64, …). The masked string has the
+    // SAME byte offsets — bytes inside masked segments are turned into
+    // spaces — so all downstream regex anchors, the `claimed` index
+    // bookkeeping, AND `mask_quoted_operators` (which also produces a
+    // same-length string) compose cleanly.
+    //
+    // Applied at every recursion depth — wrappers like `sh -c 'echo "npm
+    // install foo"'` extract the inner `echo "..."` payload via
+    // `extract_recursion_segments` and recurse here; the inner head is also
+    // a data utility and must be masked at the inner depth, not just at the
+    // top level.
+    //
+    // Crucially, the recursion sweep below runs against the ORIGINAL
+    // `cmd_raw` (NOT the masked copy). Substitution bodies inside a masked
+    // data-utility segment still surface for recursion — masking only
+    // suppresses the surface-level regex pass for that segment, not the
+    // recursion sweep. This is intentional: `echo "$(npm install foo)"`
+    // does execute the substitution at runtime, so the gate must still vet
+    // its body.
+    let cmd_raw = cmd;
+    let masked_data = mask_data_utility_segments(cmd_raw);
+    let cmd: &str = masked_data.as_str();
+
     // Run UV before PIP so `uv pip install foo` is claimed by the UV pattern
     // and PIP_RE matching the inner `pip install foo` substring is suppressed
     // for that span.
@@ -999,10 +1160,13 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
     // unresolved recursion segments, surface a synthetic Unvettable
     // ParsedInstall so the caller fails CLOSED (Verdict::Ask) instead.
     if depth < MAX_RECURSION_DEPTH {
-        for inner in extract_recursion_segments(cmd) {
+        // Recurse against the original (unmasked) cmd: a substitution body
+        // nested inside a data-utility segment still executes at runtime
+        // (`echo "$(npm install foo)"`) and must be vetted.
+        for inner in extract_recursion_segments(cmd_raw) {
             detect_installs_into(&inner, depth + 1, out);
         }
-    } else if !extract_recursion_segments(cmd).is_empty() {
+    } else if !extract_recursion_segments(cmd_raw).is_empty() {
         out.push(ParsedInstall {
             ecosystem: Ecosystem::Npm, // ecosystem-agnostic; pick one
             packages: Vec::new(),
@@ -3291,5 +3455,308 @@ mod tests {
             "&& inside single quotes must not split, got: {:?}",
             texts
         );
+    }
+
+    // ─── #141: plaintext false-positive guard (data-utility allowlist) ──────
+    //
+    // The supply-chain regexes match install-shaped substrings anywhere in a
+    // command, including inside the ARGUMENTS of ordinary data-consuming
+    // utilities. Hit live on 2026-05-23: `echo "/usr/bin/npm install foo"` is
+    // just data printed to stdout, but the gate treated the substring as a
+    // real install verb and blocked.
+    //
+    // Fix: head-verb allowlist (echo, printf, cat, tac, tee, grep, egrep,
+    // fgrep, head, tail, nl, base64, xxd, od, hexdump, jq — all execution-
+    // incapable; rg/awk/gawk/sed deliberately excluded, see #148). When the
+    // head of a command segment basename-normalises to one of these, the
+    // segment bytes are
+    // overwritten with ASCII spaces in a same-length working copy before the
+    // install-detection regexes run. Byte offsets are preserved so the
+    // existing regex prefix-anchors and `claimed`-span dedup keep working.
+    //
+    // Re-implementation of #141 on top of develop @ c4f6e55, composing
+    // cleanly with the now-merged #142/#143/#146 changes (line-continuation
+    // preprocess, quote-aware tokeniser, recursion + depth-cap).
+
+    #[test]
+    fn echo_with_install_substring_is_not_an_install() {
+        // The classic FP — observed in live peer review on 2026-05-23.
+        let v = detect_installs(r#"echo "/usr/bin/npm install foo""#);
+        assert!(
+            v.is_empty(),
+            "echo printing an install-shaped string must not trigger the gate, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn grep_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"grep "/opt/bin/pip install" README.md"#);
+        assert!(
+            v.is_empty(),
+            "grep searching for an install-shaped pattern must not trigger the gate, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn printf_format_is_not_an_install() {
+        let v = detect_installs(r#"printf '%s\n' "npm install lodash""#);
+        assert!(
+            v.is_empty(),
+            "printf data argument must not trigger the gate, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn cat_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"cat /tmp/notes.txt # contains npm install foo"#);
+        assert!(
+            v.is_empty(),
+            "cat reading a file with install-shaped content must not trigger, got: {:?}",
+            v
+        );
+    }
+
+    // ─── #148 round-1 BLOCKER (agy) — execution-capable utilities excluded ─
+
+    #[test]
+    fn awk_system_call_install_must_be_detected_not_masked() {
+        // `awk 'BEGIN { system("...") }'` is a real command-execution path.
+        // If awk were in DATA_CONSUMING_UTILITIES, the entire segment would
+        // be masked to spaces and the install would silently bypass. This
+        // test pins awk OUT of the allowlist.
+        let v = detect_installs(r#"awk 'BEGIN { system("npm install evil") }'"#);
+        assert!(
+            !v.is_empty(),
+            "awk segment must NOT be masked — system() can spawn an install: {v:?}"
+        );
+    }
+
+    #[test]
+    fn gawk_system_call_install_must_be_detected_not_masked() {
+        let v = detect_installs(r#"gawk 'BEGIN { system("pip install bad") }'"#);
+        assert!(
+            !v.is_empty(),
+            "gawk system() install must not be masked: {v:?}"
+        );
+    }
+
+    #[test]
+    fn sed_exec_flag_install_must_be_detected_not_masked() {
+        // GNU sed's `s///e` flag executes the replacement as a shell command.
+        let v = detect_installs(r#"sed 's/.*/npm install nasty/e' /tmp/x"#);
+        assert!(
+            !v.is_empty(),
+            "sed `e` flag install must not be masked — sed can spawn shell: {v:?}"
+        );
+    }
+
+    // ─── #148 round-1 MEDIUM (agy) — allowlist coverage additions ──────────
+
+    #[test]
+    fn jq_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"jq '.scripts | select(. == "npm install foo")' package.json"#);
+        assert!(v.is_empty(), "jq filter is data processing, not install: {v:?}");
+    }
+
+    #[test]
+    fn base64_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"base64 -d <<< "bnBtIGluc3RhbGwgZm9v""#);
+        assert!(v.is_empty(), "base64 decode is data, not install: {v:?}");
+    }
+
+    #[test]
+    fn xxd_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"xxd /tmp/notes # echoes hex of 'pip install x'"#);
+        assert!(v.is_empty(), "xxd is data, not install: {v:?}");
+    }
+
+    #[test]
+    fn od_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"od -c /tmp/log | grep 'npm install'"#);
+        assert!(
+            v.is_empty(),
+            "od piped to grep — both data utilities, not an install: {v:?}"
+        );
+    }
+
+    #[test]
+    fn hexdump_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"hexdump -C /tmp/payload"#);
+        assert!(v.is_empty(), "hexdump is data, not install: {v:?}");
+    }
+
+    // ─── #148 round-3 (agy) — explicit masking coverage for the rest of
+    //     DATA_CONSUMING_UTILITIES (tac, tee, egrep, fgrep, head, tail, nl).
+    //     Round-2 only pinned the exec-capable removals and the high-traffic
+    //     data utilities. These seven were silently relying on indirect
+    //     coverage; pin them here so future trims of the allowlist surface as
+    //     an obvious test failure.
+
+    #[test]
+    fn tac_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"tac /tmp/log # contains 'npm install foo'"#);
+        assert!(v.is_empty(), "tac is reverse-cat, pure data: {v:?}");
+    }
+
+    #[test]
+    fn tee_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"echo data | tee /tmp/out # 'pip install x' in body"#);
+        // `tee` is the head of the post-pipe segment; both `echo` and `tee`
+        // are data utilities, so neither segment must trigger detection.
+        assert!(v.is_empty(), "tee writes stdin to file+stdout, no exec: {v:?}");
+    }
+
+    #[test]
+    fn egrep_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"egrep "npm install|pip install" /tmp/notes"#);
+        assert!(v.is_empty(), "egrep is grep -E, no exec: {v:?}");
+    }
+
+    #[test]
+    fn fgrep_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"fgrep "npm install foo" /tmp/notes"#);
+        assert!(v.is_empty(), "fgrep is grep -F, no exec: {v:?}");
+    }
+
+    #[test]
+    fn head_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"head -20 /tmp/install-instructions.md"#);
+        assert!(v.is_empty(), "head prints first N lines, no exec: {v:?}");
+    }
+
+    #[test]
+    fn tail_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"tail -f /var/log/npm-install.log"#);
+        assert!(v.is_empty(), "tail prints last N lines, no exec: {v:?}");
+    }
+
+    #[test]
+    fn nl_with_install_substring_is_not_an_install() {
+        let v = detect_installs(r#"nl /tmp/notes # numbered 'npm install foo'"#);
+        assert!(v.is_empty(), "nl numbers lines, no exec: {v:?}");
+    }
+
+    #[test]
+    fn rg_pre_install_must_be_detected_not_masked() {
+        // Codex BLOCKER on #148: `rg --pre <executable>` runs the named
+        // executable as a preprocessor on every file. If `rg` were on the
+        // allowlist, the segment would be masked and the install hidden.
+        // `rg` is OUT of DATA_CONSUMING_UTILITIES for this reason.
+        // (A plain `rg "<pattern>" src/` is also no longer masked — that
+        //  produces a false-positive Ask in the rare case the pattern is
+        //  install-shaped. Net: better to over-Ask than under-detect.)
+        let v = detect_installs(r#"rg --pre /tmp/installer.sh 'npm install evil'"#);
+        assert!(
+            !v.is_empty(),
+            "rg --pre install must NOT be masked — preprocessor can spawn shell: {v:?}"
+        );
+    }
+
+    // ─── #141: positive guards — these MUST NOT regress ─────────────────────
+
+    #[test]
+    fn plain_npm_install_still_detected_141() {
+        // Sanity: the data-utility guard must not break the base case.
+        let v = detect_installs("npm install foo");
+        assert_eq!(v.len(), 1, "vanilla npm install must still be detected");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn abs_path_npm_install_still_detected_141() {
+        // The absolute-path bypass closed by #139 must remain closed —
+        // the guard must not regress it.
+        let v = detect_installs("/usr/local/bin/npm install foo");
+        assert_eq!(v.len(), 1, "abs-path npm install must still be detected");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn chain_after_data_utility_still_detected_141() {
+        // `cd` is not in the data-utility list (cd is a stateful builtin,
+        // not data-printing). The second segment after `&&` MUST be
+        // evaluated independently.
+        let v = detect_installs("cd foo && npm install bar");
+        assert_eq!(v.len(), 1, "install after && must still be detected");
+        assert_eq!(names(&v[0]), vec!["bar"]);
+    }
+
+    #[test]
+    fn echo_chained_with_real_install_still_detects_install_141() {
+        // Tricky chain: the LEFT segment is suppressed (echo head), the
+        // RIGHT segment is a real install and must be detected.
+        let v = detect_installs(r#"echo "x" && npm install foo"#);
+        assert_eq!(
+            v.len(),
+            1,
+            "real install after && must survive even when left segment is suppressed, got: {:?}",
+            v
+        );
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pipe_into_install_is_detected_141() {
+        // `echo foo | npm install bar` — npm is the head of the right-hand
+        // pipe segment (it's being invoked, with `foo` piped into stdin),
+        // so the install MUST be detected.
+        let v = detect_installs("echo foo | npm install bar");
+        assert_eq!(
+            v.len(),
+            1,
+            "npm as RHS-of-pipe head must still be detected, got: {:?}",
+            v
+        );
+        assert_eq!(names(&v[0]), vec!["bar"]);
+    }
+
+    #[test]
+    fn semicolon_chain_with_data_utility_141() {
+        // `;` is a segment boundary, same as `&&`.
+        let v = detect_installs(r#"echo "npm install foo" ; npm install real"#);
+        assert_eq!(
+            v.len(),
+            1,
+            "echo suppressed, second segment must detect, got: {:?}",
+            v
+        );
+        assert_eq!(names(&v[0]), vec!["real"]);
+    }
+
+    #[test]
+    fn data_utility_with_abs_path_head_is_suppressed_141() {
+        // The head check must basename-normalise — `/bin/echo "..."` is
+        // still an echo head.
+        let v = detect_installs(r#"/bin/echo "/usr/bin/npm install foo""#);
+        assert!(
+            v.is_empty(),
+            "abs-path echo head must still be recognised as a data utility, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn command_head_is_data_utility_unit() {
+        // Direct unit test on the helper, in case it's reused.
+        assert!(command_head_is_data_utility("echo foo"));
+        assert!(command_head_is_data_utility("  echo foo"));
+        assert!(command_head_is_data_utility("printf '%s' x"));
+        assert!(command_head_is_data_utility("grep pattern file"));
+        assert!(command_head_is_data_utility("/bin/echo hi"));
+        assert!(command_head_is_data_utility("/usr/bin/cat foo"));
+
+        assert!(!command_head_is_data_utility("npm install foo"));
+        assert!(!command_head_is_data_utility("/usr/bin/npm install foo"));
+        assert!(!command_head_is_data_utility("pip install x"));
+        assert!(!command_head_is_data_utility(""));
+        assert!(!command_head_is_data_utility("   "));
+        // `cd` is a stateful builtin, not a data utility — its segment is
+        // benign because it has no install verb, but it must not be on
+        // the allowlist (otherwise `cd && npm install` semantics get
+        // muddied if cd ever gains install-shaped argv).
+        assert!(!command_head_is_data_utility("cd foo"));
     }
 }
