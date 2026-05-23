@@ -15,13 +15,17 @@ use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND,
     LEGACY_CURSOR_HOOK_COMMAND,
     GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
-    HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY,
-    REWRITE_HOOK_FILE, SETTINGS_JSON,
+    HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR,
+    PI_AGENT_SUBDIR, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_EXTENSION_FILE,
+    PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 
 // Embedded OpenCode plugin (auto-rewrite)
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
+
+// Embedded Pi extension (auto-rewrite via createBashTool spawnHook)
+const PI_EXTENSION: &str = include_str!("../../hooks/pi/rtk-extension.ts");
 
 // ─── Unified guidance ──────────────────────────────────────────────────────
 //
@@ -47,6 +51,7 @@ const AGENT_HERMES: &str = "hermes";
 const AGENT_GEMINI: &str = "gemini";
 const AGENT_COPILOT: &str = "copilot";
 const AGENT_OPENCODE: &str = "opencode";
+const AGENT_PIDEV: &str = "pidev";
 
 /// Return the per-harness ContextCrawler guidance document.
 ///
@@ -77,6 +82,7 @@ fn agent_guidance(agent: &str) -> Result<String> {
         AGENT_GEMINI     => "Gemini CLI",
         AGENT_COPILOT    => "GitHub Copilot",
         AGENT_OPENCODE   => "OpenCode",
+        AGENT_PIDEV      => "Pi",
         other => anyhow::bail!("agent_guidance: unknown agent key '{other}'"),
     };
 
@@ -117,8 +123,8 @@ fn agent_guidance(agent: &str) -> Result<String> {
             "If no, rewrite it.",
         ),
 
-        // PLUGIN agents: OpenCode and Hermes use a plugin, not a shell hook.
-        AGENT_OPENCODE | AGENT_HERMES => concat!(
+        // PLUGIN agents: OpenCode, Hermes, and Pi use a plugin/extension, not a shell hook.
+        AGENT_OPENCODE | AGENT_HERMES | AGENT_PIDEV => concat!(
             "## How commands are rewritten\n",
             "\n",
             "A ContextCrawler plugin rewrites shell commands automatically — ",
@@ -3353,6 +3359,133 @@ fn remove_opencode_plugin(ctx: InitContext) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+// ─── Pi (pi.dev) support ──────────────────────────────────────────────
+
+/// Resolve `~/.pi/agent/` — Pi's per-user agent directory. Pi auto-loads
+/// `AGENTS.md` from here, parent dirs, and the cwd; extensions are TypeScript
+/// modules auto-discovered from `~/.pi/agent/extensions/`.
+fn resolve_pidev_agent_dir() -> Result<PathBuf> {
+    Ok(resolve_home_subdir(PI_DIR)?.join(PI_AGENT_SUBDIR))
+}
+
+fn pidev_extension_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_EXTENSION_FILE)
+}
+
+fn pidev_agents_md_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(AGENTS_MD)
+}
+
+pub fn run_pidev_mode(ctx: InitContext) -> Result<()> {
+    let agent_dir = resolve_pidev_agent_dir()?;
+    run_pidev_mode_at(&agent_dir, ctx)
+}
+
+fn run_pidev_mode_at(agent_dir: &Path, ctx: InitContext) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+
+    let extensions_dir = agent_dir.join(PI_EXTENSIONS_SUBDIR);
+    if !dry_run {
+        fs::create_dir_all(&extensions_dir).with_context(|| {
+            format!(
+                "Failed to create Pi extensions directory: {}",
+                extensions_dir.display()
+            )
+        })?;
+    }
+
+    let extension_path = pidev_extension_path(agent_dir);
+    write_if_changed(&extension_path, PI_EXTENSION, "Pi extension", ctx)?;
+
+    // Upsert guidance as a marked block into ~/.pi/agent/AGENTS.md.
+    // Pi auto-loads AGENTS.md at session start from this directory; only the
+    // marked block is touched, user content in AGENTS.md is preserved.
+    let agents_md_path = pidev_agents_md_path(agent_dir);
+    write_rtk_block(
+        &agents_md_path,
+        &agent_guidance_block(AGENT_PIDEV)?,
+        "Pi guidance",
+        "contextcrawler init --agent pidev",
+        ctx,
+    )?;
+
+    if dry_run {
+        print_dry_run_footer();
+    } else {
+        println!("\nContextCrawler configured for Pi (pi.dev).\n");
+        println!("  Extension: {}", extension_path.display());
+        println!("  Guidance:  {}", agents_md_path.display());
+        println!("  Pi auto-loads the extension on the next session.");
+        println!("  Restart pi. Test with: git status\n");
+    }
+
+    Ok(())
+}
+
+pub fn uninstall_pidev(ctx: InitContext) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    let agent_dir = resolve_pidev_agent_dir()?;
+    let removed = uninstall_pidev_at(&agent_dir, ctx)?;
+
+    if removed.is_empty() {
+        println!("ContextCrawler Pi support was not installed (nothing to remove)");
+    } else {
+        let header = if dry_run {
+            "[dry-run] would uninstall ContextCrawler for Pi:"
+        } else {
+            "ContextCrawler uninstalled for Pi:"
+        };
+        println!("{}", header);
+        for item in removed {
+            println!("  - {}", item);
+        }
+    }
+
+    if dry_run {
+        print_dry_run_footer();
+    }
+
+    Ok(())
+}
+
+fn uninstall_pidev_at(agent_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
+    let InitContext { verbose, dry_run } = ctx;
+    let mut removed = Vec::new();
+
+    // Strip the RTK guidance block from ~/.pi/agent/AGENTS.md.
+    // User content in AGENTS.md is preserved.
+    let agents_md_path = pidev_agents_md_path(agent_dir);
+    if let Some(desc) = strip_rtk_block_from_file(&agents_md_path, "Pi guidance", ctx)? {
+        removed.push(desc);
+    }
+
+    // Remove the extension file. The extensions/ directory itself is left
+    // intact — the user may have other Pi extensions in there.
+    let extension_path = pidev_extension_path(agent_dir);
+    if extension_path.exists() {
+        if dry_run {
+            println!(
+                "[dry-run] would remove Pi extension: {}",
+                extension_path.display()
+            );
+        } else {
+            // nosemgrep: filesystem-deletion -- uninstall intentionally removes only ContextCrawler's Pi extension file.
+            fs::remove_file(&extension_path).with_context(|| {
+                format!(
+                    "Failed to remove Pi extension: {}",
+                    extension_path.display()
+                )
+            })?;
+            if verbose > 0 {
+                eprintln!("Removed Pi extension: {}", extension_path.display());
+            }
+        }
+        removed.push(format!("Pi extension: {}", extension_path.display()));
+    }
+
+    Ok(removed)
+}
+
 // ─── Cursor Agent support ─────────────────────────────────────────────
 
 fn resolve_cursor_dir() -> Result<PathBuf> {
@@ -4683,6 +4816,14 @@ mod tests {
     }
 
     #[test]
+    fn test_guidance_drift_guard_pidev() {
+        assert_guidance_invariants(
+            AGENT_PIDEV,
+            &agent_guidance(AGENT_PIDEV).expect("pidev guidance"),
+        );
+    }
+
+    #[test]
     fn test_guidance_unknown_agent_returns_error() {
         // RTK no-panic rule: an unknown key surfaces as Err, not a panic.
         let err = agent_guidance("not-a-real-agent").unwrap_err();
@@ -4698,7 +4839,7 @@ mod tests {
         let agents = [
             AGENT_CLAUDE, AGENT_CODEX, AGENT_CURSOR, AGENT_WINDSURF, AGENT_CLINE,
             AGENT_KILOCODE, AGENT_ANTIGRAVITY, AGENT_HERMES, AGENT_GEMINI,
-            AGENT_COPILOT, AGENT_OPENCODE,
+            AGENT_COPILOT, AGENT_OPENCODE, AGENT_PIDEV,
         ];
         let titles: Vec<String> = agents
             .iter()
@@ -4899,6 +5040,102 @@ mod tests {
         assert!(after.contains("# Project notes"));
         assert!(after.contains("User text."));
         assert!(!after.contains(RTK_BLOCK_START));
+    }
+
+    #[test]
+    fn test_pidev_mode_writes_extension_and_agents_md() {
+        // Install: extension file lands in <agent_dir>/extensions/, AGENTS.md
+        // block is upserted, both idempotently, and user content survives.
+        let temp = TempDir::new().unwrap();
+        let agent_dir = temp.path().join("pi-agent");
+
+        // Pre-seed AGENTS.md with user content the install must not clobber.
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            pidev_agents_md_path(&agent_dir),
+            "# My Pi project notes\n\nUser text.\n",
+        )
+        .unwrap();
+
+        // First install.
+        run_pidev_mode_at(&agent_dir, InitContext::default()).unwrap();
+
+        let extension_path = pidev_extension_path(&agent_dir);
+        assert!(extension_path.exists(), "extension file must be written");
+        assert_eq!(
+            fs::read_to_string(&extension_path).unwrap(),
+            PI_EXTENSION,
+            "extension file content must equal the embedded TS source"
+        );
+
+        let agents_md_path = pidev_agents_md_path(&agent_dir);
+        let first = fs::read_to_string(&agents_md_path).unwrap();
+        assert!(first.contains("# My Pi project notes"), "user content preserved");
+        assert!(first.contains("User text."), "user content preserved");
+        assert!(first.contains("# ContextCrawler (Pi)"), "block has Pi title");
+        assert_eq!(
+            first.matches(RTK_BLOCK_START).count(),
+            1,
+            "exactly one marked block after first install"
+        );
+
+        // Re-install: must be idempotent.
+        run_pidev_mode_at(&agent_dir, InitContext::default()).unwrap();
+        let second = fs::read_to_string(&agents_md_path).unwrap();
+        assert_eq!(first, second, "run_pidev_mode_at must be idempotent");
+    }
+
+    #[test]
+    fn test_pidev_uninstall_strips_block_and_removes_extension() {
+        let temp = TempDir::new().unwrap();
+        let agent_dir = temp.path().join("pi-agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            pidev_agents_md_path(&agent_dir),
+            "# User notes\n\nKeep me.\n",
+        )
+        .unwrap();
+
+        // Install, then uninstall.
+        run_pidev_mode_at(&agent_dir, InitContext::default()).unwrap();
+        let removed = uninstall_pidev_at(&agent_dir, InitContext::default()).unwrap();
+
+        // Both artifacts reported as removed.
+        assert!(
+            removed.iter().any(|r| r.contains("Pi guidance")),
+            "uninstall must report stripping the guidance block: {removed:?}"
+        );
+        assert!(
+            removed.iter().any(|r| r.contains("Pi extension")),
+            "uninstall must report removing the extension file: {removed:?}"
+        );
+
+        // Extension file is gone.
+        assert!(
+            !pidev_extension_path(&agent_dir).exists(),
+            "extension file must be removed"
+        );
+
+        // AGENTS.md still has the user content; the marked block is gone.
+        let after = fs::read_to_string(pidev_agents_md_path(&agent_dir)).unwrap();
+        assert!(after.contains("# User notes"), "user content preserved");
+        assert!(after.contains("Keep me."), "user content preserved");
+        assert!(
+            !after.contains(RTK_BLOCK_START),
+            "RTK marker must be gone after uninstall"
+        );
+    }
+
+    #[test]
+    fn test_pidev_uninstall_noop_when_not_installed() {
+        // Uninstall on a clean agent_dir: nothing to remove, no error.
+        let temp = TempDir::new().unwrap();
+        let agent_dir = temp.path().join("pi-agent");
+        let removed = uninstall_pidev_at(&agent_dir, InitContext::default()).unwrap();
+        assert!(
+            removed.is_empty(),
+            "no-op uninstall on a clean dir must report nothing removed: {removed:?}"
+        );
     }
 
     #[test]

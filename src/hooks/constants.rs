@@ -34,3 +34,11 @@ pub const HERMES_PLUGINS_SUBDIR: &str = "plugins";
 pub const HERMES_PLUGIN_NAME: &str = "rtk-rewrite";
 pub const HERMES_PLUGIN_INIT_FILE: &str = "__init__.py";
 pub const HERMES_PLUGIN_MANIFEST_FILE: &str = "plugin.yaml";
+
+/// Pi coding agent (pi.dev). Pi auto-loads AGENTS.md from `~/.pi/agent/`,
+/// parent dirs, and cwd; extensions are TypeScript modules auto-discovered
+/// from `~/.pi/agent/extensions/`.
+pub const PI_DIR: &str = ".pi";
+pub const PI_AGENT_SUBDIR: &str = "agent";
+pub const PI_EXTENSIONS_SUBDIR: &str = "extensions";
+pub const PI_EXTENSION_FILE: &str = "contextcrawler.ts";
