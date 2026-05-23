@@ -40,6 +40,7 @@ pub fn run(
     reset: bool,
     yes: bool,
     _verbose: u8,
+    all_time: bool, // added: bypass release-boundary slicing for weak-filters
 ) -> Result<()> {
     let tracker = Tracker::new().context("Failed to initialize tracking database")?;
     let project_scope = resolve_project_scope(project)?; // added: resolve project path
@@ -61,7 +62,7 @@ pub fn run(
     }
 
     if weak_filters {
-        return show_weak_filters(&tracker, project_scope.as_deref());
+        return show_weak_filters(&tracker, project_scope.as_deref(), all_time);
     }
 
     // Handle export formats
@@ -719,9 +720,24 @@ fn check_rtk_disabled_bypass() -> Option<String> {
 
 /// Render `gain --weak-filters`: tools ranked by leaked tokens, so the
 /// reader can see where a better or new filter would recover the most.
-fn show_weak_filters(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+fn show_weak_filters(
+    tracker: &Tracker,
+    project_scope: Option<&str>,
+    all_time: bool,
+) -> Result<()> {
+    // Default: slice from the latest release boundary so we measure the
+    // *current* binary's filter quality, not months of pre-upgrade history.
+    // `--all-time` bypasses the slice for cross-version analysis.
+    let boundary = if all_time {
+        None
+    } else {
+        tracker
+            .latest_boundary_timestamp()
+            .context("Failed to read latest release boundary")?
+    };
+
     let weak = tracker
-        .get_weak_filters(project_scope)
+        .get_weak_filters(project_scope, boundary.as_deref())
         .context("Failed to load weak-filter data")?;
 
     println!(
@@ -730,6 +746,16 @@ fn show_weak_filters(tracker: &Tracker, project_scope: Option<&str>) -> Result<(
     );
     println!("{}", "═".repeat(64));
     println!();
+    if let Some(since) = boundary.as_deref() {
+        println!(
+            "Window: since latest release boundary ({}). Use `--all-time` for lifetime.",
+            since
+        );
+        println!();
+    } else if all_time {
+        println!("Window: lifetime (all-time).");
+        println!();
+    }
 
     if weak.is_empty() {
         println!("No command data recorded yet — run some commands first.");

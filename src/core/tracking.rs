@@ -32,7 +32,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -523,6 +523,20 @@ impl Tracker {
             [],
         )?;
 
+        // Release boundaries: one row per `contextcrawler --version` change
+        // observed. Written by `ensure_release_boundary()` on first invocation
+        // after a binary upgrade. `gain --weak-filters` slices by the latest
+        // boundary timestamp so newly-released filter behaviour isn't masked
+        // by months of accumulated pre-upgrade leakage.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS release_boundaries (
+                id INTEGER PRIMARY KEY,
+                version TEXT NOT NULL,
+                installed_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         // One-time migration for legacy DBs: `auto_vacuum=INCREMENTAL` set
         // above is a no-op on a DB created in mode 0 (full/none). A single
         // full VACUUM rewrites the file and commits it to incremental mode,
@@ -537,7 +551,50 @@ impl Tracker {
             let _ = conn.execute_batch("VACUUM;");
         }
 
-        Ok(Self { conn })
+        let tracker = Self { conn };
+        // Best-effort: never fail tracker construction on a boundary insert
+        // problem (downstream record() still works without it).
+        let _ = tracker.ensure_release_boundary();
+        Ok(tracker)
+    }
+
+    /// Write a new release-boundary row if the installed binary version
+    /// differs from the most recent one recorded in the DB. Called once at
+    /// tracker construction; cost is one SELECT plus, on the upgrade tick
+    /// only, one INSERT.
+    fn ensure_release_boundary(&self) -> Result<()> {
+        const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT version FROM release_boundaries ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if last.as_deref() != Some(CURRENT_VERSION) {
+            let now = Utc::now().to_rfc3339();
+            self.conn.execute(
+                "INSERT INTO release_boundaries (version, installed_at) VALUES (?1, ?2)",
+                params![CURRENT_VERSION, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Timestamp of the most recent release boundary, in RFC-3339 / ISO-8601
+    /// form. `None` if no boundary has been recorded yet (fresh DB on a
+    /// pre-feature binary, or in-memory test tracker). Callers should treat
+    /// `None` as "no slice, fall back to lifetime".
+    pub fn latest_boundary_timestamp(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT installed_at FROM release_boundaries ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Create an isolated in-memory tracker for tests.
@@ -588,6 +645,16 @@ impl Tracker {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+            [],
+        )?;
+        // Mirror production: release_boundaries table for version-aware
+        // weak-filter analytics. See block at L526 for details.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS release_boundaries (
+                id INTEGER PRIMARY KEY,
+                version TEXT NOT NULL,
+                installed_at TEXT NOT NULL
+            )",
             [],
         )?;
         Ok(())
@@ -903,15 +970,24 @@ impl Tracker {
     /// model unfiltered, and sorts highest-leak first. Passthrough rows
     /// (0 input) contribute nothing and drop out — so a command that is
     /// always passthrough never appears.
-    pub fn get_weak_filters(&self, project_path: Option<&str>) -> Result<Vec<WeakFilter>> {
+    pub fn get_weak_filters(
+        &self,
+        project_path: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<WeakFilter>> {
         let (project_exact, project_glob) = project_filter_params(project_path);
+        // `since` defaults to NULL (no slice) when caller passes None — same
+        // pattern as project_path. The boundary timestamp is RFC-3339 / ISO-
+        // 8601 and command timestamps are also ISO-8601, so lexicographic
+        // comparison is correct.
         let mut stmt = self.conn.prepare(
             "SELECT rtk_cmd, COUNT(*), SUM(input_tokens), SUM(saved_tokens)
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+               AND (?3 IS NULL OR timestamp >= ?3)
              GROUP BY rtk_cmd",
         )?;
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+        let rows = stmt.query_map(params![project_exact, project_glob, since], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as usize,
@@ -2789,7 +2865,7 @@ mod tests {
             .expect("record passthrough");
 
         let weak = tracker
-            .get_weak_filters(None)
+            .get_weak_filters(None, None)
             .expect("Failed to load weak filters");
 
         // read leaks 3 × (1000 input − 100 saved) = 2700; cargo leaks 50.
@@ -2807,5 +2883,108 @@ mod tests {
             !weak.iter().any(|w| w.tool.starts_with("git")),
             "a passthrough-only tool (0 input) must be excluded"
         );
+    }
+
+    // ─── Release-boundary slicing ──────────────────────────────────────────
+
+    #[test]
+    fn ensure_release_boundary_writes_first_row_on_fresh_db() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        // new_in_memory() does not call ensure_release_boundary() (production
+        // path does, but the test constructor mirrors only the schema). Call
+        // it explicitly to validate the insert path.
+        tracker
+            .ensure_release_boundary()
+            .expect("boundary insert");
+        let ts = tracker
+            .latest_boundary_timestamp()
+            .expect("read boundary")
+            .expect("boundary row must exist");
+        assert!(
+            !ts.is_empty(),
+            "stored timestamp must be a non-empty RFC-3339 string"
+        );
+    }
+
+    #[test]
+    fn ensure_release_boundary_is_idempotent_on_same_version() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        tracker.ensure_release_boundary().expect("first insert");
+        tracker.ensure_release_boundary().expect("no-op call");
+        tracker.ensure_release_boundary().expect("no-op call");
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(
+            n, 1,
+            "same-version call must not append duplicate boundary rows"
+        );
+    }
+
+    #[test]
+    fn get_weak_filters_since_excludes_older_rows() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        // Two rows: one before, one after the cutoff.
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands
+                 (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens,
+                  saved_tokens, savings_pct, exec_time_ms, project_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    "2026-01-01T00:00:00Z",
+                    "read /old",
+                    "contextcrawler read /old",
+                    1000,
+                    100,
+                    900,
+                    90.0,
+                    0,
+                    ""
+                ],
+            )
+            .expect("insert old row");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands
+                 (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens,
+                  saved_tokens, savings_pct, exec_time_ms, project_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    "2026-06-01T00:00:00Z",
+                    "read /new",
+                    "contextcrawler read /new",
+                    2000,
+                    400,
+                    1600,
+                    80.0,
+                    0,
+                    ""
+                ],
+            )
+            .expect("insert new row");
+        let all = tracker
+            .get_weak_filters(None, None)
+            .expect("all-time query");
+        let read_all = all.iter().find(|w| w.tool == "read").expect("read entry");
+        assert_eq!(read_all.runs, 2);
+        assert_eq!(read_all.input_tokens, 3000);
+
+        let sliced = tracker
+            .get_weak_filters(None, Some("2026-03-01T00:00:00Z"))
+            .expect("since query");
+        let read_sliced = sliced
+            .iter()
+            .find(|w| w.tool == "read")
+            .expect("read entry after slice");
+        assert_eq!(read_sliced.runs, 1, "old row must be excluded");
+        assert_eq!(read_sliced.input_tokens, 2000);
     }
 }

@@ -457,6 +457,10 @@ enum Commands {
         /// Rank tools by leaked tokens — where a better filter would help most
         #[arg(short = 'W', long = "weak-filters")]
         weak_filters: bool,
+        /// For --weak-filters: include rows from before the latest release
+        /// boundary (default: slice from latest contextcrawler version install).
+        #[arg(long = "all-time")]
+        all_time: bool,
         /// Reset all token savings stats to zero
         #[arg(long)]
         reset: bool,
@@ -3578,6 +3582,7 @@ fn run_cli() -> Result<i32> {
             format,
             failures,
             weak_filters,
+            all_time,
             reset,
             yes,
         } => {
@@ -3597,6 +3602,7 @@ fn run_cli() -> Result<i32> {
                 reset,
                 yes,
                 cli.verbose,
+                all_time,
             )?;
             0
         }
