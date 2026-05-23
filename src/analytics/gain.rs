@@ -758,6 +758,26 @@ fn show_weak_filters(
     }
 
     if weak.is_empty() {
+        // Peer-review #150 (agy): on a pre-existing DB the first invocation
+        // of a new binary version writes a boundary row that excludes ALL
+        // prior history. The user sees an empty leaderboard despite
+        // months of data sitting one --all-time flag away. Surface that.
+        if boundary.is_some() {
+            let lifetime_runs = tracker
+                .get_weak_filters(project_scope, None)
+                .map(|w| w.iter().map(|f| f.runs).sum::<usize>())
+                .unwrap_or(0);
+            if lifetime_runs > 0 {
+                println!(
+                    "No commands recorded since the latest release boundary."
+                );
+                println!(
+                    "Run some commands or use `--all-time` to see the lifetime view ({} historical runs).",
+                    lifetime_runs
+                );
+                return Ok(());
+            }
+        }
         println!("No command data recorded yet — run some commands first.");
         return Ok(());
     }

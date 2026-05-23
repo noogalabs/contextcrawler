@@ -560,25 +560,30 @@ impl Tracker {
 
     /// Write a new release-boundary row if the installed binary version
     /// differs from the most recent one recorded in the DB. Called once at
-    /// tracker construction; cost is one SELECT plus, on the upgrade tick
-    /// only, one INSERT.
+    /// tracker construction; cost is one INSERT-WHERE per invocation (no
+    /// follow-up SELECT in steady-state — the WHERE clause evaluates to
+    /// zero rows when the version already matches, so SQLite skips the
+    /// INSERT atomically).
+    ///
+    /// The INSERT ... SELECT ... WHERE pattern collapses the previous
+    /// read-then-write into a single atomic statement. Without this, two
+    /// concurrent contextcrawler processes hitting a fresh-upgrade DB
+    /// would both observe the old latest-version, both pass the Rust-side
+    /// check, and both insert a duplicate boundary row (peer-review #150
+    /// finding, Codex + agy).
     fn ensure_release_boundary(&self) -> Result<()> {
         const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-        let last: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT version FROM release_boundaries ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if last.as_deref() != Some(CURRENT_VERSION) {
-            let now = Utc::now().to_rfc3339();
-            self.conn.execute(
-                "INSERT INTO release_boundaries (version, installed_at) VALUES (?1, ?2)",
-                params![CURRENT_VERSION, now],
-            )?;
-        }
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO release_boundaries (version, installed_at)
+             SELECT ?1, ?2
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM release_boundaries
+                 WHERE version = ?1
+                   AND id = (SELECT MAX(id) FROM release_boundaries)
+             )",
+            params![CURRENT_VERSION, now],
+        )?;
         Ok(())
     }
 
@@ -2928,6 +2933,9 @@ mod tests {
 
     #[test]
     fn get_weak_filters_since_excludes_older_rows() {
+        // Use `+00:00` suffix to match production `Utc::now().to_rfc3339()`
+        // output — lexicographic ISO-8601 comparison requires consistent
+        // suffix shape across all rows. Peer-review #150 (agy) finding.
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
         // Two rows: one before, one after the cutoff.
         tracker
@@ -2938,7 +2946,7 @@ mod tests {
                   saved_tokens, savings_pct, exec_time_ms, project_path)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
-                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00+00:00",
                     "read /old",
                     "contextcrawler read /old",
                     1000,
@@ -2958,7 +2966,7 @@ mod tests {
                   saved_tokens, savings_pct, exec_time_ms, project_path)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
-                    "2026-06-01T00:00:00Z",
+                    "2026-06-01T00:00:00+00:00",
                     "read /new",
                     "contextcrawler read /new",
                     2000,
@@ -2978,7 +2986,7 @@ mod tests {
         assert_eq!(read_all.input_tokens, 3000);
 
         let sliced = tracker
-            .get_weak_filters(None, Some("2026-03-01T00:00:00Z"))
+            .get_weak_filters(None, Some("2026-03-01T00:00:00+00:00"))
             .expect("since query");
         let read_sliced = sliced
             .iter()
@@ -2986,5 +2994,81 @@ mod tests {
             .expect("read entry after slice");
         assert_eq!(read_sliced.runs, 1, "old row must be excluded");
         assert_eq!(read_sliced.input_tokens, 2000);
+    }
+
+    // ─── Peer-review #150 follow-up coverage (agy) ─────────────────────────
+
+    #[test]
+    fn latest_boundary_timestamp_is_none_on_empty_table() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        let ts = tracker
+            .latest_boundary_timestamp()
+            .expect("read boundary on empty table");
+        assert!(
+            ts.is_none(),
+            "no boundary rows must yield None (callers fall back to lifetime)"
+        );
+    }
+
+    #[test]
+    fn ensure_release_boundary_appends_row_on_version_change() {
+        // Simulate the binary moving from a prior version to the current one:
+        // pre-seed a boundary row for some old version, then call ensure_*
+        // and confirm a new row is appended (not deduplicated against the
+        // OLD entry — only against the LATEST one).
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO release_boundaries (version, installed_at)
+                 VALUES (?1, ?2)",
+                params!["0.0.0-test-prior", "2026-01-01T00:00:00+00:00"],
+            )
+            .expect("seed prior-version row");
+        tracker
+            .ensure_release_boundary()
+            .expect("boundary on version change");
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(n, 2, "a version change must append a new boundary row");
+        // The latest row must carry the CURRENT compile-time version, not
+        // the seeded prior one.
+        let latest_version: String = tracker
+            .conn
+            .query_row(
+                "SELECT version FROM release_boundaries ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read latest version");
+        assert_eq!(latest_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn ensure_release_boundary_handles_concurrent_safely() {
+        // Approximation of the TOCTOU concern: simulate two back-to-back
+        // calls on the same connection (the original Rust-side check would
+        // race two SQLite connections; this exercises the atomic INSERT-
+        // WHERE-NOT-EXISTS path on a single connection to confirm it is
+        // idempotent even when called rapidly.).
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        for _ in 0..10 {
+            tracker.ensure_release_boundary().expect("repeated call");
+        }
+        let n: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_boundaries",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(n, 1, "tight-loop calls must not append duplicate rows");
     }
 }
