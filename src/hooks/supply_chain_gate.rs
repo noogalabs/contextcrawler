@@ -278,60 +278,92 @@ impl Ecosystem {
     }
 }
 
-// The prefix anchor `(?:^|[\s;/\\]|&&|\|\|)` treats whitespace, `;`, `&&`,
-// `||`, `/`, and `\` as command-start delimiters. `/` and `\` close the
-// absolute / relative path bypass observed on 2026-05-23. The optional
-// `(?:\.(?i:cmd|exe|bat))*` suffix lets Windows launchers (`npm.cmd`,
-// `pip.exe`, `yarn.cmd`, mixed-case `NPM.CMD`) match. Verb tokens use
-// `(?i:…)` so `NPM`, `Npm` etc. classify as `npm` — Windows file systems
-// are case-preserving but case-insensitive. The pip verb also covers
-// versioned launchers (`pip3.12`, `pip3.12.exe`) — `pip\d*(?:\.\d+)*`
+// Combined regex contract — both #143 (develop) and #140 layered:
+//
+// Prefix anchor `(?:^|[\s;/\\'"]|&&|\|\|)` treats whitespace, `;`, `&&`,
+// `||`, `/`, `\`, `'`, and `"` as command-start delimiters:
+//   - `/` and `\` close the absolute / relative path bypass (#139).
+//   - `'` and `"` close the quoted-head bypass (#140) — `'npm' install x`
+//     / `"pip" install x` are detected via the quote-as-anchor + an
+//     optional closing quote after the verb (`['"]?` immediately after).
+//
+// Verb tokens use `(?i:…)` so `NPM`, `Npm` etc. classify alongside `npm`.
+// The pip verb also covers versioned launchers — `pip\d*(?:\.\d+)*`
 // matches `pip`, `pip3`, `pip3.12`, etc.
+//
+// After the verb (and optional closing quote) `(?:\.(?i:cmd|exe|bat))*`
+// absorbs Windows launchers (`npm.cmd`, `npm.cmd.exe`, `NPM.CMD`) —
+// chained extensions collapse for free.
 //
 // The capture group excludes `\r\n` so a multi-line script does not
 // chain-swallow the next line. Line-continuation backslashes are
-// collapsed BEFORE matching by `LINE_CONT_RE` in `detect_installs`,
-// so `npm install \<nl> foo` is normalised to a single line first.
+// collapsed BEFORE matching by `LINE_CONT_RE` in `detect_installs`. The
+// outer command is also pre-masked by `mask_quoted_operators` so a
+// literal `&` / `|` / `;` inside a quoted flag value does not truncate
+// the package scan.
 lazy_static! {
     // Backslash + line-ending + any whitespace = shell line-continuation.
     // Collapsed to a single space before install detection. Covers POSIX
-    // (`\n`), Windows (`\r\n`), AND legacy Mac (`\r` alone) — the bare-`\r`
-    // form was flagged as a BLOCKER by agy peer review (#143).
+    // (`\n`), Windows (`\r\n`), AND legacy Mac (`\r` alone).
     static ref LINE_CONT_RE: Regex = Regex::new(r"\\(?:\r\n|\n|\r)\s*").unwrap();
+    // Verb subcommand wrapped in `['"]?…['"]?` — closes the BLOCKER both
+    // reviewers flagged on #146: `npm 'install' lodash` / `pip "install" x`
+    // would otherwise bypass (regex doesn't match the quoted subcommand,
+    // and the bare-install scan sees `lodash` as a package → silent skip).
     static ref NPM_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:npm)(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:npm)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:i|install|add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref PNPM_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:pnpm)(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pnpm)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:i|install|add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref YARN_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:yarn)(?:\.(?i:cmd|exe|bat))*\s+(?i:add)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:yarn)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref PIP_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:pip\d*(?:\.\d+)*)(?:\.(?i:cmd|exe|bat))*\s+(?i:install)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pip\d*(?:\.\d+)*)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:install)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref UV_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:uv)(?:\.(?i:cmd|exe|bat))*\s+(?:(?i:pip)\s+)?(?i:install|add)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:uv)['"]?(?:\.(?i:cmd|exe|bat))*\s+(?:['"]?(?i:pip)['"]?\s+)?['"]?(?i:install|add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref POETRY_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:poetry)(?:\.(?i:cmd|exe|bat))*\s+(?i:add)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:poetry)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:add)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
     static ref PIPX_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:pipx)(?:\.(?i:cmd|exe|bat))*\s+(?i:install)\s+([^|;&<>\r\n]+)"
+        r#"(?m)(?:^|[\s;/\\'"]|&&|\|\|)(?i:pipx)['"]?(?:\.(?i:cmd|exe|bat))*\s+['"]?(?i:install)['"]?\s+([^|;&<>\r\n]+)"#
     )
     .unwrap();
 }
 
-/// Tokenise a shell command into (offset, token) pairs, treating the shell
-/// operators `&&`, `||`, `;`, `|`, `>`, `>>`, `<`, `<<` as standalone tokens.
-/// This is deliberately simple — it does not honour quoting — but it is
-/// enough to classify install verbs and tell a flag from a package name.
+/// Tokenise a shell command into (offset, token-text) pairs.
+///
+/// Shell operators `&&`, `||`, `;`, `|`, `>`, `>>`, `<`, `<<` become their
+/// own tokens — but only when seen OUTSIDE quotes. Inside `'…'`, `"…"`, or
+/// `$'…'` the operator characters are part of the surrounding word.
+///
+/// The token text is the *literal payload* with surrounding quote characters
+/// stripped — `'npm'` becomes `npm`, `"pip"` becomes `pip`. This lets the
+/// bare-install scan in [`detect_bare_lockfile_installs`] match a quoted
+/// install head against `"npm"` / `"pnpm"` / `"yarn"` without special casing.
+///
+/// Command-substitution payloads (`$(…)`, backticks) are NOT emitted as
+/// tokens here — they are extracted separately by
+/// [`extract_recursion_segments`] so [`detect_installs`] can recurse into
+/// them. The substitution body still consumes its source span so subsequent
+/// tokens align on byte offsets in the *original* command.
+///
+/// Unmatched quotes are tolerated: the unclosed run is consumed to end-of-input
+/// as a single token. The gate's fallback contract is no-panic; an unmatched
+/// quote at worst yields a noisy token that the regex pass ignores.
+///
+/// ANSI-C `$'…'` quotes are treated as single quotes for tokenising — we
+/// do not interpret `\n`/`\t` escapes because the gate only needs the verb
+/// surface, not the byte-perfect payload.
 fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let bytes = cmd.as_bytes();
@@ -342,7 +374,7 @@ fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
             i += 1;
             continue;
         }
-        // Shell operators become their own tokens.
+        // Shell operators become their own tokens — outside quotes only.
         if c == ';' || c == '|' || c == '&' || c == '>' || c == '<' {
             let start = i;
             let mut j = i + 1;
@@ -354,26 +386,413 @@ fn shell_tokens(cmd: &str) -> Vec<(usize, String)> {
             i = j;
             continue;
         }
-        // Ordinary word: run until whitespace or operator char.
+        // Ordinary word: run until whitespace or an *unquoted* operator,
+        // accumulating the literal payload (quotes stripped, substitution
+        // bodies copied verbatim so the offset arithmetic in callers stays
+        // honest).
         let start = i;
+        let mut payload = String::new();
         let mut j = i;
         while j < bytes.len() {
             let cj = bytes[j] as char;
-            if cj.is_whitespace()
-                || cj == ';'
-                || cj == '|'
-                || cj == '&'
-                || cj == '>'
-                || cj == '<'
+            if cj.is_whitespace() || cj == ';' || cj == '|' || cj == '&' || cj == '>' || cj == '<'
             {
                 break;
             }
+            // Single quote: literal — no expansion, no escape, ends at next `'`.
+            if cj == '\'' {
+                let q_start = j + 1;
+                let mut k = q_start;
+                while k < bytes.len() && (bytes[k] as char) != '\'' {
+                    k += 1;
+                }
+                payload.push_str(&cmd[q_start..k.min(bytes.len())]);
+                // Step past the closing quote if present; otherwise consume
+                // to end-of-input (unmatched quote — best effort, no panic).
+                j = if k < bytes.len() { k + 1 } else { k };
+                continue;
+            }
+            // ANSI-C $'…' quote: same shape as single quote for our purposes.
+            if cj == '$' && j + 1 < bytes.len() && (bytes[j + 1] as char) == '\'' {
+                let q_start = j + 2;
+                let mut k = q_start;
+                while k < bytes.len() && (bytes[k] as char) != '\'' {
+                    // Honour `\'` escape so the inner quote does not terminate.
+                    if (bytes[k] as char) == '\\' && k + 1 < bytes.len() {
+                        k += 2;
+                        continue;
+                    }
+                    k += 1;
+                }
+                payload.push_str(&cmd[q_start..k.min(bytes.len())]);
+                j = if k < bytes.len() { k + 1 } else { k };
+                continue;
+            }
+            // Double quote: no operator splitting, no expansion. `\"` is the
+            // only escape we honour (the only one that matters for finding
+            // the closing quote). `$(…)` and backticks INSIDE a double-quoted
+            // string still execute, so we copy the body verbatim — the
+            // top-level recursion sweep finds substitutions anywhere in the
+            // command, including inside double quotes.
+            if cj == '"' {
+                let q_start = j + 1;
+                let mut k = q_start;
+                while k < bytes.len() {
+                    let cc = bytes[k] as char;
+                    if cc == '\\' && k + 1 < bytes.len() {
+                        k += 2;
+                        continue;
+                    }
+                    if cc == '"' {
+                        break;
+                    }
+                    k += 1;
+                }
+                payload.push_str(&cmd[q_start..k.min(bytes.len())]);
+                j = if k < bytes.len() { k + 1 } else { k };
+                continue;
+            }
+            // Command substitution `$(…)`: consume balanced. The body is
+            // exposed via extract_recursion_segments, not as a token here —
+            // but the source span still has to be skipped so word boundaries
+            // align with the original command.
+            if cj == '$' && j + 1 < bytes.len() && (bytes[j + 1] as char) == '(' {
+                let body_start = j + 2;
+                let k = scan_balanced_paren(cmd, body_start);
+                // Copy body verbatim into the payload so any package-name
+                // text that lives at the same shell-word level (e.g. an
+                // adversary writing `npm$(echo )install foo`) does not
+                // disappear from the regex pass.
+                payload.push_str(&cmd[body_start..k.min(bytes.len())]);
+                j = if k < bytes.len() { k + 1 } else { k };
+                continue;
+            }
+            // Backtick substitution: same role as `$(…)`, single-level only.
+            if cj == '`' {
+                let body_start = j + 1;
+                let mut k = body_start;
+                while k < bytes.len() && (bytes[k] as char) != '`' {
+                    if (bytes[k] as char) == '\\' && k + 1 < bytes.len() {
+                        k += 2;
+                        continue;
+                    }
+                    k += 1;
+                }
+                payload.push_str(&cmd[body_start..k.min(bytes.len())]);
+                j = if k < bytes.len() { k + 1 } else { k };
+                continue;
+            }
+            // Backslash escape outside quotes: skip one char.
+            if cj == '\\' && j + 1 < bytes.len() {
+                payload.push(bytes[j + 1] as char);
+                j += 2;
+                continue;
+            }
+            payload.push(cj);
             j += 1;
         }
-        out.push((start, cmd[start..j].to_string()));
+        out.push((start, payload));
         i = j;
     }
     out
+}
+
+/// Scan forward from `start` (which should point just past the opening `(`)
+/// to the matching closing `)`. Returns the index of that `)`, or
+/// `cmd.len()` if no match was found (unmatched — best effort, no panic).
+/// Nested `(` increment the depth; quoted regions are honoured so a `)`
+/// inside `'…'` or `"…"` does not close the substitution.
+fn scan_balanced_paren(cmd: &str, start: usize) -> usize {
+    let bytes = cmd.as_bytes();
+    let mut k = start;
+    let mut depth: i32 = 1;
+    while k < bytes.len() {
+        let c = bytes[k] as char;
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return k;
+                }
+            }
+            '\'' => {
+                k += 1;
+                while k < bytes.len() && (bytes[k] as char) != '\'' {
+                    k += 1;
+                }
+            }
+            '"' => {
+                k += 1;
+                while k < bytes.len() {
+                    let cc = bytes[k] as char;
+                    if cc == '\\' && k + 1 < bytes.len() {
+                        k += 2;
+                        continue;
+                    }
+                    if cc == '"' {
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+            '\\' if k + 1 < bytes.len() => {
+                k += 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    bytes.len()
+}
+
+/// Extract recursion segments: payloads of `sh -c <arg>` / `bash -c <arg>`,
+/// command-substitution bodies `$(…)`, and backtick bodies. Returned strings
+/// are the *literal inner command text* — the caller re-runs the full
+/// install detector on each one to close the wrapped-install bypass class.
+///
+/// Representation choice: a flat `Vec<String>` of inner commands rather than
+/// in-band tokens. This keeps the offset/dedup contract of `shell_tokens`
+/// intact (offsets always refer to the original cmd) and isolates recursion
+/// to a single explicit pass in `detect_installs`. Each segment is treated as
+/// an independent command — no offset is needed because spans in the inner
+/// command would not align with the outer claimed-span dedup anyway.
+fn extract_recursion_segments(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // `$(…)` substitution.
+        if c == '$' && i + 1 < bytes.len() && (bytes[i + 1] as char) == '(' {
+            let body_start = i + 2;
+            let end = scan_balanced_paren(cmd, body_start);
+            if end > body_start && end <= bytes.len() {
+                out.push(cmd[body_start..end].to_string());
+            }
+            i = if end < bytes.len() { end + 1 } else { end };
+            continue;
+        }
+        // Backtick substitution.
+        if c == '`' {
+            let body_start = i + 1;
+            let mut k = body_start;
+            while k < bytes.len() && (bytes[k] as char) != '`' {
+                if (bytes[k] as char) == '\\' && k + 1 < bytes.len() {
+                    k += 2;
+                    continue;
+                }
+                k += 1;
+            }
+            if k > body_start && k <= bytes.len() {
+                out.push(cmd[body_start..k.min(bytes.len())].to_string());
+            }
+            i = if k < bytes.len() { k + 1 } else { k };
+            continue;
+        }
+        // Single-quoted: skip without recursion (no expansion happens inside).
+        if c == '\'' {
+            let mut k = i + 1;
+            while k < bytes.len() && (bytes[k] as char) != '\'' {
+                k += 1;
+            }
+            i = if k < bytes.len() { k + 1 } else { k };
+            continue;
+        }
+        // Double-quoted: recurse for `$(…)` / backticks inside (they DO
+        // execute inside `"…"`), but the literal characters between are not
+        // word-split — we still scan for substitutions.
+        if c == '"' {
+            let mut k = i + 1;
+            while k < bytes.len() {
+                let cc = bytes[k] as char;
+                if cc == '\\' && k + 1 < bytes.len() {
+                    k += 2;
+                    continue;
+                }
+                if cc == '"' {
+                    break;
+                }
+                // Surface substitutions inside double quotes.
+                if cc == '$' && k + 1 < bytes.len() && (bytes[k + 1] as char) == '(' {
+                    let body_start = k + 2;
+                    let end = scan_balanced_paren(cmd, body_start);
+                    if end > body_start && end <= bytes.len() {
+                        out.push(cmd[body_start..end].to_string());
+                    }
+                    k = if end < bytes.len() { end + 1 } else { end };
+                    continue;
+                }
+                if cc == '`' {
+                    let body_start = k + 1;
+                    let mut m = body_start;
+                    while m < bytes.len() && (bytes[m] as char) != '`' {
+                        if (bytes[m] as char) == '\\' && m + 1 < bytes.len() {
+                            m += 2;
+                            continue;
+                        }
+                        m += 1;
+                    }
+                    if m > body_start && m <= bytes.len() {
+                        out.push(cmd[body_start..m.min(bytes.len())].to_string());
+                    }
+                    k = if m < bytes.len() { m + 1 } else { m };
+                    continue;
+                }
+                k += 1;
+            }
+            i = if k < bytes.len() { k + 1 } else { k };
+            continue;
+        }
+        i += 1;
+    }
+
+    // `sh -c <arg>` / `bash -c <arg>` (and friends): pull the argument that
+    // follows the `-c` option. Combined short-option clusters like `-lc`,
+    // `-xc`, `-x -c`, and POSIX-legal orderings like `bash -c -e '<cmd>'`
+    // were a confirmed bypass (agy + Codex HIGH on #146): the original
+    // exact-`-c` match missed every form except the canonical one.
+    //
+    // Strategy: locate a shell head (`sh`/`bash`/`zsh`/`dash`/`ksh`), then
+    // scan forward through short-option clusters for one whose final
+    // character is `c`. The next token after the matching cluster is the
+    // command body. A long option (`--`) or non-option token before `-c`
+    // ends the scan without recursion.
+    let toks = shell_tokens(cmd);
+    let mut idx = 0;
+    while idx < toks.len() {
+        let head = installer_basename(toks[idx].1.as_str()).to_ascii_lowercase();
+        if matches!(head.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+            // Scan forward for a short-option cluster containing `c`.
+            let mut scan = idx + 1;
+            let mut body_idx: Option<usize> = None;
+            while scan < toks.len() {
+                let t = toks[scan].1.as_str();
+                if t.starts_with("--") {
+                    // Long option: stop without recursion.
+                    break;
+                }
+                if t.starts_with('-') && t.len() >= 2 && t.contains('c') {
+                    body_idx = Some(scan + 1);
+                    break;
+                }
+                if !t.starts_with('-') {
+                    // Non-option token before `-c`: this isn't a `-c` form
+                    // (e.g. `bash script.sh` — a script-file invocation,
+                    // not in scope for body extraction).
+                    break;
+                }
+                scan += 1;
+            }
+            if let Some(mut b) = body_idx {
+                if b < toks.len() && toks[b].1 == "--" {
+                    b += 1;
+                }
+                if b < toks.len() {
+                    out.push(toks[b].1.clone());
+                }
+                idx = b + 1;
+                continue;
+            }
+        }
+        idx += 1;
+    }
+
+    out
+}
+
+/// Return a same-length copy of `cmd` where shell operator characters
+/// (`&`, `|`, `;`, `>`, `<`) inside quoted regions are replaced by spaces.
+/// The package-list regexes use `[^|;&<>]+` to bound the package arg list;
+/// without masking, a literal `&` in `--description="install & test"` cuts
+/// the scan short and the package after the flag is lost.
+///
+/// Lengths are preserved byte-for-byte so any byte offsets produced from
+/// the masked string still align with the original `cmd` (no
+/// re-tokenisation needed downstream).
+fn mask_quoted_operators(cmd: &str) -> String {
+    let bytes = cmd.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '\'' {
+            out.push(b'\'');
+            i += 1;
+            while i < bytes.len() && (bytes[i] as char) != '\'' {
+                let ch = bytes[i];
+                out.push(if matches!(ch, b'&' | b'|' | b';' | b'>' | b'<') {
+                    b' '
+                } else {
+                    ch
+                });
+                i += 1;
+            }
+            if i < bytes.len() {
+                out.push(b'\'');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            out.push(b'"');
+            i += 1;
+            while i < bytes.len() {
+                let cc = bytes[i] as char;
+                if cc == '\\' && i + 1 < bytes.len() {
+                    out.push(bytes[i]);
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if cc == '"' {
+                    out.push(b'"');
+                    i += 1;
+                    break;
+                }
+                let ch = bytes[i];
+                out.push(if matches!(ch, b'&' | b'|' | b';' | b'>' | b'<') {
+                    b' '
+                } else {
+                    ch
+                });
+                i += 1;
+            }
+            continue;
+        }
+        // ANSI-C $'…': mask like single quotes.
+        if c == '$' && i + 1 < bytes.len() && (bytes[i + 1] as char) == '\'' {
+            out.push(b'$');
+            out.push(b'\'');
+            i += 2;
+            while i < bytes.len() && (bytes[i] as char) != '\'' {
+                if (bytes[i] as char) == '\\' && i + 1 < bytes.len() {
+                    out.push(bytes[i]);
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                let ch = bytes[i];
+                out.push(if matches!(ch, b'&' | b'|' | b';' | b'>' | b'<') {
+                    b' '
+                } else {
+                    ch
+                });
+                i += 1;
+            }
+            if i < bytes.len() {
+                out.push(b'\'');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Safety: we only ever copied valid UTF-8 bytes through (the masked
+    // chars are ASCII space). `from_utf8` cannot fail here, but we still
+    // fall back to `from_utf8_lossy` to honour the no-panic contract.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 /// True if a token is a shell operator delimiter (not a package name).
@@ -424,19 +843,75 @@ fn is_shell_operator(tok: &str) -> bool {
 /// match arms see the token.
 fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     // Collapse shell line-continuation (`\` + newline + indent) into a single
-    // space BEFORE detection. Without this, the `\r\n` guard added in PR #142
-    // truncated the arg-capture at the trailing `\` and packages on the next
-    // line went undetected — agy peer-review HIGH on #142. The normalised
-    // form re-anchors the entire install on one logical line, so the regex
-    // capture can absorb every package token.
+    // space BEFORE detection (#143 / agy HIGH). Without this, the `\r\n`
+    // guard in the regex capture truncates at the trailing `\` and packages
+    // on the next line escape detection. The normalised form re-anchors the
+    // entire install on one logical line so the regex absorbs every token.
     let normalised_cow = LINE_CONT_RE.replace_all(cmd, " ");
     let cmd: &str = normalised_cow.as_ref();
 
+    let mut out = Vec::new();
+    detect_installs_into(cmd, 0, &mut out);
+    // Cross-layer dedup. The outer regex pass + recursion into `sh -c`
+    // bodies / substitutions will both fire on the same install when the
+    // wrapper passes the verb through verbatim (e.g. `sh -c 'npm install
+    // foo'` matches NPM_RE via the `'` anchor AND the recursed body
+    // matches it again). Two ParsedInstalls with identical content
+    // collapse to one — we lose no information, but the gate stops
+    // double-vetting the same package set.
+    dedup_installs(&mut out);
+    out
+}
+
+/// Structural dedup: collapse `ParsedInstall`s that carry the same
+/// ecosystem + package set + editable + unvettable detail. Order of the
+/// first occurrence is preserved (stable).
+fn dedup_installs(items: &mut Vec<ParsedInstall>) {
+    let mut i = 0;
+    while i < items.len() {
+        let mut j = i + 1;
+        while j < items.len() {
+            if installs_equivalent(&items[i], &items[j]) {
+                items.remove(j);
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn installs_equivalent(a: &ParsedInstall, b: &ParsedInstall) -> bool {
+    if a.ecosystem != b.ecosystem
+        || a.has_editable != b.has_editable
+        || a.unvettable != b.unvettable
+        || a.packages.len() != b.packages.len()
+    {
+        return false;
+    }
+    // Order-independent package-set compare (agy LOW on #146): two installs
+    // listing `[a, b]` and `[b, a]` semantically install the same set and
+    // must collapse. We sort cheap clones rather than mutate inputs so the
+    // original ordering (which has display value) is preserved for callers.
+    let mut a_pkgs = a.packages.clone();
+    let mut b_pkgs = b.packages.clone();
+    a_pkgs.sort();
+    b_pkgs.sort();
+    a_pkgs == b_pkgs
+}
+
+/// Recursion-bounded core of [`detect_installs`]. `depth` guards against a
+/// pathological `$(${...})` nesting (or future bug) that would otherwise
+/// recurse without bound. Each `sh -c` / `$(…)` / backtick body recurses
+/// once at `depth + 1`, and `MAX_RECURSION_DEPTH` caps the total at a
+/// number well above any realistic shell-script shape.
+const MAX_RECURSION_DEPTH: u8 = 6;
+
+fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
     // Run UV before PIP so `uv pip install foo` is claimed by the UV pattern
     // and PIP_RE matching the inner `pip install foo` substring is suppressed
     // for that span.
     let mut claimed: Vec<(usize, usize)> = Vec::new();
-    let mut out = Vec::new();
 
     let ordered = [
         (&*UV_RE, Ecosystem::Pypi),
@@ -448,8 +923,16 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
         (&*PIPX_RE, Ecosystem::Pypi),
     ];
 
+    // Run the regex pass against a same-length copy of `cmd` where shell
+    // operators inside quotes are masked to spaces. This closes the
+    // false-negative class where `[^|;&<>]+` truncates at a literal `&`
+    // inside `--description="install & test"` and drops the package after
+    // the flag. Byte offsets in `masked` map 1:1 to `cmd`, so we slice
+    // arg-text from `cmd` itself (preserving the original characters).
+    let masked = mask_quoted_operators(cmd);
+
     for (re, eco) in ordered {
-        for m in re.find_iter(cmd) {
+        for m in re.find_iter(&masked) {
             let (start, end) = (m.start(), m.end());
             // Skip if any earlier (higher-priority) pattern already claimed this span.
             if claimed
@@ -459,8 +942,18 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
                 continue;
             }
             claimed.push((start, end));
-            let cap = re.captures_at(cmd, start).unwrap();
-            let arg_string = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let cap = match re.captures_at(&masked, start) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Re-slice the argument span out of the ORIGINAL command so the
+            // package names carry their real (unmasked) characters. The
+            // masking only ever rewrites bytes inside quoted regions to
+            // spaces, so the offsets are identical in both strings.
+            let arg_string = cap
+                .get(1)
+                .map(|m| &cmd[m.start()..m.end()])
+                .unwrap_or("");
             let (pkgs, has_editable, lockfile_source) = parse_package_args(arg_string);
             // An install verb was detected. If no package is nameable AND no
             // editable token is present, the install set is unvettable
@@ -491,9 +984,35 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     // regex anchored on `$`/delimiter is defeated by trailing flags such
     // as `npm ci --ignore-scripts` or `yarn install --immutable`, which
     // would then fall through as a silent Skip (#111 G1 follow-up).
-    detect_bare_lockfile_installs(cmd, &mut claimed, &mut out);
+    detect_bare_lockfile_installs(cmd, &mut claimed, out);
 
-    out
+    // Recurse into shell-wrapped install shells: `sh -c '<install>'`,
+    // `$(<install>)`, backticks. Each inner command is treated as its own
+    // top-level command — claimed-span dedup is local to a single string,
+    // so duplicates between layers are not a concern.
+    //
+    // Depth limit (Codex + agy BLOCKER on #146): at `MAX_RECURSION_DEPTH`
+    // the recursion stops. The original implementation silently dropped
+    // any installs at depths beyond the cap — fail-OPEN. A nested payload
+    // (`sh -c "$(sh -c "$(sh -c '...')")"`) that exceeds the cap would
+    // then auto-allow at the gate. The fix: at the cap, if there are still
+    // unresolved recursion segments, surface a synthetic Unvettable
+    // ParsedInstall so the caller fails CLOSED (Verdict::Ask) instead.
+    if depth < MAX_RECURSION_DEPTH {
+        for inner in extract_recursion_segments(cmd) {
+            detect_installs_into(&inner, depth + 1, out);
+        }
+    } else if !extract_recursion_segments(cmd).is_empty() {
+        out.push(ParsedInstall {
+            ecosystem: Ecosystem::Npm, // ecosystem-agnostic; pick one
+            packages: Vec::new(),
+            has_editable: false,
+            unvettable: Some(format!(
+                "recursion depth limit ({}) reached — nested shell payload exceeds vetting capacity, treat as unvettable",
+                MAX_RECURSION_DEPTH
+            )),
+        });
+    }
 }
 
 /// Last path component of a token, stripping POSIX (`/`) and Windows (`\`)
@@ -2457,5 +2976,320 @@ mod tests {
         // No severity info → default High (so it doesn't slip past a HIGH threshold).
         let v: Value = serde_json::from_str(r#"{"id":"OSV-2024"}"#).unwrap();
         assert_eq!(osv_severity(&v), Severity::High);
+    }
+
+    // ─── Shell-quote tokeniser bypass guards (#140) ────────────────────────
+    //
+    // Codex + Antigravity peer review of PR #139 flagged a HIGH bypass class:
+    // the naive tokeniser does not honour shell quoting, so several install
+    // shapes slip past the gate. These tests pin the closure.
+
+    #[test]
+    fn quoted_sh_c_install_detected() {
+        // `sh -c '<install>'` wraps an install in a quoted argument. The
+        // outer regex pass cannot see the verb because the quotes hide it
+        // (and `&&` inside the quotes would split the outer scan). The
+        // tokeniser must surface the inner command as a recursable segment.
+        let v = detect_installs(r#"sh -c 'npm install left-pad'"#);
+        assert_eq!(v.len(), 1, "sh -c '<install>' must be detected");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["left-pad"]);
+    }
+
+    #[test]
+    fn quoted_bash_c_install_detected() {
+        // Same shape, double quotes, `bash -c`.
+        let v = detect_installs(r#"bash -c "pip install requests==2.31.0""#);
+        assert_eq!(v.len(), 1, "bash -c \"<install>\" must be detected");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(v[0].packages[0].0, "requests");
+        assert_eq!(v[0].packages[0].1.as_deref(), Some("2.31.0"));
+    }
+
+    #[test]
+    fn command_substitution_install_detected() {
+        // `$(...)` evaluates its body. A reasonable adversary writes
+        // `eval "$(npm install evil)"` or similar. The gate must surface
+        // the substituted command so its install verb is vetted.
+        let v = detect_installs(r#"eval "$(npm install evil-pkg)""#);
+        assert!(
+            !v.is_empty(),
+            "$(npm install ...) substitution must surface the inner install"
+        );
+        assert!(
+            v.iter()
+                .any(|i| i.packages.iter().any(|(n, _)| n == "evil-pkg")),
+            "inner install must be detected, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn backtick_substitution_install_detected() {
+        // Backtick substitution is the older, still-valid form of $(...).
+        let v = detect_installs("echo `npm install left-pad`");
+        assert!(
+            !v.is_empty(),
+            "backtick substitution must surface the inner install"
+        );
+        assert!(
+            v.iter()
+                .any(|i| i.packages.iter().any(|(n, _)| n == "left-pad")),
+            "backtick inner install must be detected, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn quoted_head_install_detected() {
+        // The installer verb itself can be quoted: `'npm' install foo` is a
+        // valid invocation. The tokeniser must strip the quotes before the
+        // head is matched against `npm`/`pnpm`/`yarn`.
+        let v = detect_installs(r#"'npm' install lodash"#);
+        assert_eq!(v.len(), 1, "quoted-head install must be detected");
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+
+        let v = detect_installs(r#""pip" install requests"#);
+        assert_eq!(v.len(), 1, "double-quoted-head pip install must be detected");
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn quoted_operator_in_flag_value_does_not_truncate_scan() {
+        // The package-list regex `[^|;&<>]+` stops at the literal `&` in
+        // `--description="install & test"`. The quote-aware tokeniser must
+        // mask operators inside quoted regions so the package name `lodash`
+        // following the flag is still captured.
+        let v = detect_installs(
+            r#"npm install --description="install & test" lodash"#,
+        );
+        assert_eq!(v.len(), 1, "operator inside quotes must not truncate the scan");
+        assert!(
+            names(&v[0]).contains(&"lodash"),
+            "lodash should still be captured past the quoted operator, got: {:?}",
+            names(&v[0])
+        );
+    }
+
+    #[test]
+    fn ansi_c_quoted_install_detected() {
+        // `$'...'` is the ANSI-C quote form. Treat it like a single-quoted
+        // literal for tokenising — escape sequences are not expanded by the
+        // gate (close enough; we only need the verb to surface).
+        let v = detect_installs(r#"sh -c $'npm install lodash'"#);
+        assert_eq!(v.len(), 1, "ANSI-C $'...' wrapped install must be detected");
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn quoted_install_as_data_argument_still_flagged() {
+        // `echo "$(npm install foo)"` — the substitution payload is data
+        // here (echo prints whatever npm wrote to stdout), but the shell
+        // STILL runs the inner `npm install foo`. We choose to flag it
+        // because the install side-effect happens before echo runs.
+        // Documenting the decision: be conservative — the install ran.
+        let v = detect_installs(r#"echo "$(npm install foo)""#);
+        assert!(
+            !v.is_empty(),
+            "$(npm install foo) inside double quotes still executes the install \
+             and must be surfaced (conservative — fail closed)"
+        );
+        assert!(
+            v.iter()
+                .any(|i| i.packages.iter().any(|(n, _)| n == "foo")),
+            "inner install package must be named, got: {:?}",
+            v
+        );
+    }
+
+    // ─── PR #146 peer-review follow-ups ──────────────────────────────────
+    //
+    // Both Codex and agy reviewed PR #146 (head 32fb6b2) and surfaced
+    // 2 BLOCKERs + 1 HIGH + 1 LOW. Pinned below to prevent regression.
+
+    #[test]
+    fn quoted_install_verb_detected() {
+        // BLOCKER (both reviewers, #146): `npm 'install' lodash` and
+        // `pip "install" requests` were silently dropped — the regex did
+        // not allow quotes around the SUBCOMMAND, so it missed; the bare
+        // scan then saw a package after the quoted verb and flipped
+        // has_package=true. Fix: optional `['"]?` around the subcommand.
+        let v = detect_installs(r#"npm 'install' lodash"#);
+        assert_eq!(v.len(), 1, "npm 'install' lodash must be detected: {v:?}");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert!(
+            v[0].packages.iter().any(|(n, _)| n == "lodash"),
+            "must capture lodash"
+        );
+    }
+
+    #[test]
+    fn double_quoted_install_verb_detected() {
+        let v = detect_installs(r#"pip "install" requests"#);
+        assert_eq!(v.len(), 1, r#"pip "install" requests must be detected"#);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].packages.iter().any(|(n, _)| n == "requests"));
+    }
+
+    #[test]
+    fn quoted_install_verb_combined_with_quoted_head() {
+        let v = detect_installs(r#"'npm' 'install' lodash"#);
+        assert_eq!(v.len(), 1, "both head and verb quoted must still detect");
+        assert!(v[0].packages.iter().any(|(n, _)| n == "lodash"));
+    }
+
+    #[test]
+    fn bash_lc_combined_option_install_detected() {
+        // HIGH (agy + Codex, #146): combined short options like `bash -lc`
+        // skipped recursion because the original exact-`-c` match only
+        // matched the canonical form. Now any `-[chars]c` cluster fires.
+        let v = detect_installs(r#"bash -lc 'npm install evil'"#);
+        assert!(
+            v.iter().any(|i| i.packages.iter().any(|(n, _)| n == "evil")),
+            "bash -lc must recurse: {v:?}"
+        );
+    }
+
+    #[test]
+    fn bash_xc_combined_option_install_detected() {
+        let v = detect_installs(r#"bash -xc 'npm install nasty'"#);
+        assert!(
+            v.iter().any(|i| i.packages.iter().any(|(n, _)| n == "nasty")),
+            "bash -xc must recurse: {v:?}"
+        );
+    }
+
+    #[test]
+    fn bash_separate_options_install_detected() {
+        // `bash -x -c '<install>'` — option before `-c`, separate tokens.
+        let v = detect_installs(r#"bash -x -c 'npm install sep'"#);
+        assert!(
+            v.iter().any(|i| i.packages.iter().any(|(n, _)| n == "sep")),
+            "bash -x -c (separate options) must recurse: {v:?}"
+        );
+    }
+
+    #[test]
+    fn recursion_depth_limit_surfaces_unvettable_not_skip() {
+        // BLOCKER (agy + Codex, #146): the original `if depth < MAX_RECURSION_DEPTH`
+        // silently dropped recursion segments at depth >= 6. This
+        // fail-OPEN behaviour meant a 7-deep nest could auto-allow.
+        // Now: at the cap, if recursion segments still exist, surface an
+        // Unvettable so the caller fails CLOSED.
+        // Build a payload nested 7 deep — each `sh -c "$(…)"` layer
+        // contributes depth.
+        let mut payload = "npm install deeply-nested".to_string();
+        for _ in 0..7 {
+            payload = format!(r#"sh -c "$({})""#, payload);
+        }
+        let v = detect_installs(&payload);
+        assert!(
+            !v.is_empty(),
+            "depth-cap must surface at least one ParsedInstall (Unvettable), not silently Skip"
+        );
+        // At least one item must be the Unvettable depth-cap marker.
+        assert!(
+            v.iter().any(|i| i.unvettable.as_deref().is_some_and(|s| s.contains("recursion depth limit"))),
+            "depth-cap Unvettable marker missing: {v:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_collapses_reordered_package_lists() {
+        // LOW (agy, #146): dedup compared package lists with order-strict
+        // `==`. Sort-before-compare collapses semantically identical
+        // installs. Pin: `npm install a b && npm install b a` should
+        // dedupe to one ParsedInstall.
+        let v = detect_installs("npm install a b && npm install b a");
+        assert_eq!(
+            v.len(),
+            1,
+            "reordered duplicate must collapse to one detection: {v:?}"
+        );
+    }
+
+    #[test]
+    fn nested_sh_c_install_detected() {
+        // Defence in depth: nesting `sh -c` inside `bash -c` is a known
+        // adversarial shape (PR #139 review). The recursion must walk both
+        // layers.
+        let v = detect_installs(
+            r#"bash -c 'sh -c "npm install nested"'"#,
+        );
+        assert!(
+            v.iter()
+                .any(|i| i.packages.iter().any(|(n, _)| n == "nested")),
+            "nested sh -c install must be detected, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn bash_c_double_dash_install_detected() {
+        let v = detect_installs("bash -c -- 'cd /tmp && sh -c \"npm install\"'");
+        assert!(!v.is_empty(), "nested bare install under double dash -- must be detected: {v:?}");
+
+        let v2 = detect_installs("bash -cce 'npm install lodash'");
+        assert!(!v2.is_empty(), "bash -cce must be detected: {v2:?}");
+    }
+
+    #[test]
+    fn unmatched_quote_falls_back_safely() {
+        // A malformed command with an unmatched quote must not panic and
+        // must not silently swallow an install. Best effort: treat the
+        // remainder as one big quoted token. The result is allowed to be
+        // empty (no detection) — what matters is no panic.
+        let _ = detect_installs(r#"sh -c 'npm install foo"#);
+        let _ = detect_installs(r#"echo \"npm install foo"#);
+        // No assertion on contents — we only require this not to crash.
+    }
+
+    #[test]
+    fn shell_tokens_strips_single_quotes() {
+        // Direct tokeniser unit test: `'npm'` -> token text `npm`.
+        let toks = shell_tokens(r#"'npm' install"#);
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0].1, "npm");
+        assert_eq!(toks[1].1, "install");
+    }
+
+    #[test]
+    fn shell_tokens_strips_double_quotes() {
+        let toks = shell_tokens(r#""pip" install"#);
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0].1, "pip");
+        assert_eq!(toks[1].1, "install");
+    }
+
+    #[test]
+    fn shell_tokens_preserves_operators_in_unquoted_regions() {
+        // Regression guard: the operator-splitting behaviour must survive
+        // for unquoted regions. `npm install x && echo y` must still split
+        // the `&&` as its own token.
+        let toks = shell_tokens("npm install x && echo y");
+        let ops: Vec<&str> = toks.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(
+            ops.contains(&"&&"),
+            "unquoted && must split as its own token, got: {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn shell_tokens_keeps_operators_inside_quotes_attached() {
+        // `'a && b'` is one token whose text is `a && b`.
+        let toks = shell_tokens(r#"foo 'a && b' bar"#);
+        let texts: Vec<&str> = toks.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("&&")),
+            "operator inside single quotes must stay inside the token, got: {:?}",
+            texts
+        );
+        // And `&&` must NOT appear as its own token.
+        assert!(
+            !texts.contains(&"&&"),
+            "&& inside single quotes must not split, got: {:?}",
+            texts
+        );
     }
 }
