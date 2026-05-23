@@ -407,15 +407,16 @@ fn is_shell_operator(tok: &str) -> bool {
 /// **In scope** (bare lockfile / always-bare, via token walk):
 /// - `npm install` / `npm i` / `npm ci`
 /// - `pnpm install` / `pnpm i` / `pnpm ci`
-/// - `yarn install` / bare `yarn`
+/// - `yarn install`, bare `yarn`, and `yarn <install-flag>` (e.g.
+///   `yarn --frozen-lockfile`) — Yarn's shorthand for `yarn install`
 /// - `poetry install` (always bare, all args are flags)
 /// - `uv sync` / `uv pip sync` (always bare, all args are flags)
 ///
 /// **Deliberately out of scope** (maintenance / lockfile-only / non-install):
 /// - `npm rebuild`, `npm dedupe`, `npm update`
 /// - `uv lock`, `poetry lock`
-/// - `yarn --version`, `yarn -v`, `yarn --help`, `yarn -h`
-///   (filtered explicitly in the bare-yarn arm)
+/// - `yarn --version`, `yarn -v`, `yarn --help`, `yarn -h` — diagnostic
+///   forms; filtered by `is_yarn_help_or_version_flag` in the bare-yarn arm
 ///
 /// All path forms (POSIX abs, POSIX rel, Windows `\` paths, `.cmd`/`.exe`/
 /// `.bat` launcher suffixes, chained extensions, all case variants) are
