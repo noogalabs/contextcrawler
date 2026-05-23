@@ -293,9 +293,11 @@ impl Ecosystem {
 // collapsed BEFORE matching by `LINE_CONT_RE` in `detect_installs`,
 // so `npm install \<nl> foo` is normalised to a single line first.
 lazy_static! {
-    // Backslash + (CR)?LF + any whitespace = shell line-continuation.
-    // Collapsed to a single space before install detection.
-    static ref LINE_CONT_RE: Regex = Regex::new(r"\\\r?\n\s*").unwrap();
+    // Backslash + line-ending + any whitespace = shell line-continuation.
+    // Collapsed to a single space before install detection. Covers POSIX
+    // (`\n`), Windows (`\r\n`), AND legacy Mac (`\r` alone) — the bare-`\r`
+    // form was flagged as a BLOCKER by agy peer review (#143).
+    static ref LINE_CONT_RE: Regex = Regex::new(r"\\(?:\r\n|\n|\r)\s*").unwrap();
     static ref NPM_RE: Regex = Regex::new(
         r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:npm)(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"
     )
@@ -1882,6 +1884,19 @@ mod tests {
         let pkgs: Vec<&str> = v[0].packages.iter().map(|(n, _)| n.as_str()).collect();
         assert!(pkgs.contains(&"left-pad"), "missing left-pad in {pkgs:?}");
         assert!(pkgs.contains(&"lodash"), "missing lodash in {pkgs:?}");
+    }
+
+    #[test]
+    fn line_continuation_legacy_mac_cr_only_caught() {
+        // agy BLOCKER on #143: backslash + bare `\r` (legacy mac line ending)
+        // was not collapsed by the original `\\\r?\n\s*` regex, so a
+        // continuation line on a `\r`-only script bypassed detection. Now
+        // covered by `\\(?:\r\n|\n|\r)\s*`.
+        let v = detect_installs("npm install foo \\\r  bar");
+        assert_eq!(v.len(), 1, "bare \\r continuation must collapse like \\n");
+        let pkgs: Vec<&str> = v[0].packages.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(pkgs.contains(&"foo"), "missing foo in {pkgs:?}");
+        assert!(pkgs.contains(&"bar"), "missing bar in {pkgs:?}");
     }
 
     #[test]
