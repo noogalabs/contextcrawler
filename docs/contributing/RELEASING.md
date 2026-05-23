@@ -147,7 +147,14 @@ release page reads cleanly before publishing.
 scripts/build-release.sh --install
 ```
 
-Copies the path-cleaned binary to `~/.local/bin/contextcrawler`. Verify:
+Copies the path-cleaned binary to `~/.local/bin/contextcrawler`. On
+macOS the script re-applies an ad-hoc codesign on the destination —
+without that step Apple Silicon's AMFI rejects the copied binary with
+`load code signature error 2` and SIGKILLs it before `main()`. If you
+see exit 137 on launch with an old fork of the script, that's the
+cause; pull `develop` to get the fix.
+
+Verify:
 
 ```sh
 contextcrawler --version
