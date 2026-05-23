@@ -280,43 +280,48 @@ impl Ecosystem {
 
 // The prefix anchor `(?:^|[\s;/\\]|&&|\|\|)` treats whitespace, `;`, `&&`,
 // `||`, `/`, and `\` as command-start delimiters. `/` and `\` close the
-// absolute / relative path bypass observed on 2026-05-23 — invoking the
-// package manager via `/Users/.../bin/npm install foo` or `./bin/pnpm i x`
-// must not slip past the gate just because the byte before the verb is a
-// path separator. The optional `(?:\.(?:cmd|exe|bat))?` suffix lets
-// Windows launchers (`npm.cmd`, `pip.exe`, `yarn.cmd`) match without
-// requiring callers to strip those suffixes upstream. The capture group
-// excludes `\r\n` so a multi-line script like `npm install x\npip install y`
-// does not chain-swallow the next line (Antigravity peer-review BLOCKER).
-// See abs_path_*, newline_chain_*, and windows_launcher_* tests for the
-// regression guards.
+// absolute / relative path bypass observed on 2026-05-23. The optional
+// `(?:\.(?i:cmd|exe|bat))*` suffix lets Windows launchers (`npm.cmd`,
+// `pip.exe`, `yarn.cmd`, mixed-case `NPM.CMD`) match. Verb tokens use
+// `(?i:…)` so `NPM`, `Npm` etc. classify as `npm` — Windows file systems
+// are case-preserving but case-insensitive. The pip verb also covers
+// versioned launchers (`pip3.12`, `pip3.12.exe`) — `pip\d*(?:\.\d+)*`
+// matches `pip`, `pip3`, `pip3.12`, etc.
+//
+// The capture group excludes `\r\n` so a multi-line script does not
+// chain-swallow the next line. Line-continuation backslashes are
+// collapsed BEFORE matching by `LINE_CONT_RE` in `detect_installs`,
+// so `npm install \<nl> foo` is normalised to a single line first.
 lazy_static! {
+    // Backslash + (CR)?LF + any whitespace = shell line-continuation.
+    // Collapsed to a single space before install detection.
+    static ref LINE_CONT_RE: Regex = Regex::new(r"\\\r?\n\s*").unwrap();
     static ref NPM_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)npm(?:\.(?:cmd|exe|bat))?\s+(?:i|install|add)\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:npm)(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
     static ref PNPM_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)pnpm(?:\.(?:cmd|exe|bat))?\s+(?:i|install|add)\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:pnpm)(?:\.(?i:cmd|exe|bat))*\s+(?i:i|install|add)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
     static ref YARN_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)yarn(?:\.(?:cmd|exe|bat))?\s+add\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:yarn)(?:\.(?i:cmd|exe|bat))*\s+(?i:add)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
     static ref PIP_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?:pip|pip3)(?:\.(?:cmd|exe|bat))?\s+install\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:pip\d*(?:\.\d+)*)(?:\.(?i:cmd|exe|bat))*\s+(?i:install)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
     static ref UV_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)uv(?:\.(?:cmd|exe|bat))?\s+(?:pip\s+)?(?:install|add)\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:uv)(?:\.(?i:cmd|exe|bat))*\s+(?:(?i:pip)\s+)?(?i:install|add)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
     static ref POETRY_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)poetry(?:\.(?:cmd|exe|bat))?\s+add\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:poetry)(?:\.(?i:cmd|exe|bat))*\s+(?i:add)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
     static ref PIPX_RE: Regex = Regex::new(
-        r"(?m)(?:^|[\s;/\\]|&&|\|\|)pipx(?:\.(?:cmd|exe|bat))?\s+install\s+([^|;&<>\r\n]+)"
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?i:pipx)(?:\.(?i:cmd|exe|bat))*\s+(?i:install)\s+([^|;&<>\r\n]+)"
     )
     .unwrap();
 }
@@ -378,6 +383,15 @@ fn is_shell_operator(tok: &str) -> bool {
 }
 
 fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
+    // Collapse shell line-continuation (`\` + newline + indent) into a single
+    // space BEFORE detection. Without this, the `\r\n` guard added in PR #142
+    // truncated the arg-capture at the trailing `\` and packages on the next
+    // line went undetected — agy peer-review HIGH on #142. The normalised
+    // form re-anchors the entire install on one logical line, so the regex
+    // capture can absorb every package token.
+    let normalised_cow = LINE_CONT_RE.replace_all(cmd, " ");
+    let cmd: &str = normalised_cow.as_ref();
+
     // Run UV before PIP so `uv pip install foo` is claimed by the UV pattern
     // and PIP_RE matching the inner `pip install foo` substring is suppressed
     // for that span.
@@ -443,17 +457,33 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
 }
 
 /// Last path component of a token, stripping POSIX (`/`) and Windows (`\`)
-/// separators, then dropping a trailing Windows launcher extension
-/// (`.cmd` / `.exe` / `.bat`). Used to normalise an installer command head
-/// before matching `"npm"` / `"pnpm"` / `"yarn"` — both `/Users/.../bin/npm`
-/// and `C:\Tools\npm.cmd` classify as `npm`. Returns `tok` unchanged for
-/// plain tokens.
+/// separators, then dropping trailing Windows launcher extensions
+/// (`.cmd` / `.exe` / `.bat`) case-insensitively in a loop so chained
+/// extensions like `npm.cmd.exe` collapse to `npm`. Used to normalise an
+/// installer command head before matching `"npm"` / `"pnpm"` / `"yarn"` —
+/// both `/Users/.../bin/npm` and `C:\Tools\npm.cmd` (and `NPM.CMD`,
+/// `npm.cmd.exe`) classify as `npm`. Returns the original-cased subslice
+/// so callers can still see the source casing if needed — match arms
+/// should compare with `eq_ignore_ascii_case` or lowercase first.
 fn installer_basename(tok: &str) -> &str {
-    let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
-    base.strip_suffix(".cmd")
-        .or_else(|| base.strip_suffix(".exe"))
-        .or_else(|| base.strip_suffix(".bat"))
-        .unwrap_or(base)
+    let mut base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+    // Loop: strip the longest matching suffix until none match.
+    loop {
+        let mut stripped = false;
+        for suffix in [".cmd", ".exe", ".bat"] {
+            if base.len() >= suffix.len()
+                && base[base.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            {
+                base = &base[..base.len() - suffix.len()];
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    base
 }
 
 /// Scan the shell token stream for package-manager install verbs that
@@ -472,59 +502,90 @@ fn detect_bare_lockfile_installs(
     out: &mut Vec<ParsedInstall>,
 ) {
     let tokens = shell_tokens(cmd);
+    // Look-ahead helper that lowercases the Nth token relative to `idx` so
+    // verb sub-commands like `INSTALL`, `Ci`, `Sync` classify the same as
+    // their canonical lowercase form (Windows file-systems and shells are
+    // case-preserving but case-insensitive on the head; the gate must agree).
+    let next_lower = |i: usize| {
+        tokens
+            .get(i)
+            .map(|(_, t)| t.to_ascii_lowercase())
+    };
+
     let mut idx = 0;
     while idx < tokens.len() {
         let (start, raw_tok) = (&tokens[idx].0, tokens[idx].1.as_str());
-        // Basename-normalise the head token before matching. Without this,
-        // `/Users/.../bin/npm install` slips past because the literal token
-        // is the absolute path, not `"npm"`. Closes the abs/relative-path
-        // bypass observed on 2026-05-23. Also strips Windows launcher
-        // suffixes (`.cmd` / `.exe` / `.bat`) so `npm.cmd install` classifies.
-        let tok = installer_basename(raw_tok);
-        // Identify an install-verb head and the ecosystem it belongs to.
-        // `Some(eco)` ⇒ this is a bare lockfile-install verb.
-        let (verb_span_end_idx, bare_eco) = match tok {
+        // Basename-normalise the head token before matching. `installer_basename`
+        // strips POSIX/Windows path separators AND `.cmd`/`.exe`/`.bat`
+        // (case-insensitively, looping for `npm.cmd.exe`-style chains).
+        // Lowercase the result so `NPM`, `Npm`, `PNPM` etc. all classify
+        // alongside their canonical form. Closes the abs/relative-path
+        // bypass observed on 2026-05-23 plus Codex/agy peer-review HIGH on #142.
+        let tok_norm = installer_basename(raw_tok).to_ascii_lowercase();
+        // Identify an install-verb head and what it implies.
+        //   `bare_eco`        — ecosystem of this bare lockfile install.
+        //   `accepts_packages` — true if the verb may take a positional
+        //                       package (so a non-flag token after the verb
+        //                       means "not bare"). For verbs that *never*
+        //                       take a positional package (poetry install,
+        //                       uv sync, uv pip sync, npm ci, yarn install,
+        //                       bare yarn) this is false, and the package
+        //                       scan is skipped — closes the Codex+agy
+        //                       BLOCKER where `poetry install --with dev`
+        //                       (and `uv sync --extra dev`) misclassified
+        //                       `dev` as a package and silently Skipped.
+        let (verb_span_end_idx, bare_eco, accepts_packages) = match tok_norm.as_str() {
             "npm" | "pnpm" => {
-                match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
-                    Some("install") | Some("i") => (idx + 1, Some(Ecosystem::Npm)),
-                    // `npm ci` is npm-only but harmless to accept for pnpm too.
-                    Some("ci") => (idx + 1, Some(Ecosystem::Npm)),
+                match next_lower(idx + 1).as_deref() {
+                    // `npm install` / `pnpm install` / pnpm `i` *can* take a
+                    // package. Keep the scan to distinguish bare-vs-named —
+                    // though the named case is normally claimed upstream by
+                    // NPM_RE / PNPM_RE; this is the fallback.
+                    Some("install") | Some("i") => (idx + 1, Some(Ecosystem::Npm), true),
+                    // `npm ci` / `pnpm ci` never takes a package — value-
+                    // consuming flags don't apply, always bare.
+                    Some("ci") => (idx + 1, Some(Ecosystem::Npm), false),
                     _ => {
                         idx += 1;
                         continue;
                     }
                 }
             }
-            "yarn" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
-                Some("install") => (idx + 1, Some(Ecosystem::Npm)),
+            "yarn" => match next_lower(idx + 1).as_deref() {
+                // `yarn install` never takes a positional package.
+                Some("install") => (idx + 1, Some(Ecosystem::Npm), false),
                 // Bare `yarn` or `yarn` followed by a flag / operator is an
-                // install. `yarn add ...` / `yarn <other>` is not.
+                // install — never takes a positional.
                 Some(next) if next.starts_with('-') || is_shell_operator(next) => {
-                    (idx, Some(Ecosystem::Npm))
+                    (idx, Some(Ecosystem::Npm), false)
                 }
-                None => (idx, Some(Ecosystem::Npm)),
+                None => (idx, Some(Ecosystem::Npm), false),
                 _ => {
                     idx += 1;
                     continue;
                 }
             },
-            // `poetry install` resolves from pyproject.toml / poetry.lock —
-            // bare lockfile install in the PyPI ecosystem. `poetry add foo` is
-            // package-bearing and handled by POETRY_RE.
-            "poetry" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
-                Some("install") => (idx + 1, Some(Ecosystem::Pypi)),
+            // `poetry install` resolves from pyproject.toml / poetry.lock and
+            // takes ONLY flag arguments (`--with <group>`, `--without`,
+            // `--only`, `--no-root`, `--sync`, …). Never a positional
+            // package — `poetry add foo` is the package-bearing form,
+            // claimed by POETRY_RE upstream.
+            "poetry" => match next_lower(idx + 1).as_deref() {
+                Some("install") => (idx + 1, Some(Ecosystem::Pypi), false),
                 _ => {
                     idx += 1;
                     continue;
                 }
             },
-            // `uv sync` (and `uv pip sync`) resolves from uv.lock — bare
-            // lockfile install in PyPI. `uv install foo` / `uv add foo` /
-            // `uv pip install foo` are package-bearing and handled by UV_RE.
-            "uv" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
-                Some("sync") => (idx + 1, Some(Ecosystem::Pypi)),
-                Some("pip") if tokens.get(idx + 2).map(|(_, t)| t.as_str()) == Some("sync") => {
-                    (idx + 2, Some(Ecosystem::Pypi))
+            // `uv sync` (and `uv pip sync`) resolves from uv.lock. Takes
+            // only flag arguments (`--extra <name>`, `--group <name>`,
+            // `--no-extra`, `--no-group`, `--inexact`, …). Never a positional
+            // package — `uv install foo` / `uv add foo` / `uv pip install foo`
+            // are package-bearing and claimed by UV_RE upstream.
+            "uv" => match next_lower(idx + 1).as_deref() {
+                Some("sync") => (idx + 1, Some(Ecosystem::Pypi), false),
+                Some("pip") if next_lower(idx + 2).as_deref() == Some("sync") => {
+                    (idx + 2, Some(Ecosystem::Pypi), false)
                 }
                 _ => {
                     idx += 1;
@@ -542,22 +603,31 @@ fn detect_bare_lockfile_installs(
             continue;
         };
 
-        // Walk the tokens after the verb: stop at the first shell operator
-        // (end of this command). If a non-flag, non-operator token appears,
-        // it is a package name and this is NOT a bare lockfile install.
-        let mut has_package = false;
-        let mut scan = verb_span_end_idx + 1;
-        while scan < tokens.len() {
-            let t = tokens[scan].1.as_str();
-            if is_shell_operator(t) {
-                break;
+        // For verbs that can take a positional package, walk the tokens
+        // after the verb: stop at the first shell operator. A non-flag,
+        // non-operator token is a package name → NOT a bare install.
+        //
+        // Verbs that NEVER take a positional skip this scan unconditionally,
+        // so value-consuming flag arguments (`--with dev`, `--extra dev`)
+        // do not flip `has_package` to true and cause a silent miss.
+        let has_package = if accepts_packages {
+            let mut found = false;
+            let mut scan = verb_span_end_idx + 1;
+            while scan < tokens.len() {
+                let t = tokens[scan].1.as_str();
+                if is_shell_operator(t) {
+                    break;
+                }
+                if !t.starts_with('-') {
+                    found = true;
+                    break;
+                }
+                scan += 1;
             }
-            if !t.starts_with('-') {
-                has_package = true;
-                break;
-            }
-            scan += 1;
-        }
+            found
+        } else {
+            false
+        };
 
         if !has_package {
             // Skip if a higher-priority pattern already claimed this span.
@@ -1663,6 +1733,172 @@ mod tests {
         // "install" but contains no install verb. Must produce zero hits.
         let v = detect_installs("/some/random/path/install/notnpm.txt");
         assert!(v.is_empty(), "no install verb here, got: {:?}", v);
+    }
+
+    // ─── Peer-review round 2 (BLOCKER + HIGHs from #142) ───────────────────
+    //
+    // Both Codex and agy peer-reviewed #142 and converged on a BLOCKER:
+    // value-consuming flags (`poetry install --with dev`, `uv sync --extra dev`)
+    // misclassified the value token as a package, flipping `has_package=true`
+    // and causing a silent Skip on the newly-expanded detection surface.
+    // agy added line-continuation and case-sensitivity issues; Codex added
+    // versioned pip and case-sensitivity. All pinned here.
+
+    #[test]
+    fn poetry_install_with_value_consuming_flag_still_bare() {
+        // BLOCKER: `--with <group>` consumes the next token. Before this fix,
+        // `dev` was treated as a package and the install was silently dropped.
+        let v = detect_installs("poetry install --with dev");
+        assert_eq!(v.len(), 1, "poetry install --with dev must still surface as bare");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn poetry_install_with_only_flag_still_bare() {
+        let v = detect_installs("poetry install --only main");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn poetry_install_with_without_and_extras_flags_still_bare() {
+        let v = detect_installs("poetry install --without dev --extras docs");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+    }
+
+    #[test]
+    fn uv_sync_with_extra_value_still_bare() {
+        // BLOCKER mirror in PyPI/uv: `--extra dev` consumes a value.
+        let v = detect_installs("uv sync --extra dev");
+        assert_eq!(v.len(), 1, "uv sync --extra dev must still surface as bare");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn uv_sync_with_group_value_still_bare() {
+        let v = detect_installs("uv sync --group dev --no-extra docs");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+    }
+
+    #[test]
+    fn npm_ci_with_value_consuming_flag_still_bare() {
+        // npm ci never takes a positional package; treat any trailing token
+        // as a flag value, never as a package.
+        let v = detect_installs("npm ci --prefix /opt/build");
+        assert_eq!(v.len(), 1, "npm ci is always bare");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+    }
+
+    #[test]
+    fn yarn_install_with_value_consuming_flag_still_bare() {
+        let v = detect_installs("yarn install --modules-folder vendor");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+    }
+
+    // Windows launcher case-insensitivity (Codex + agy HIGH on #142).
+
+    #[test]
+    fn windows_launcher_uppercase_npm_cmd_detected() {
+        let v = detect_installs("NPM.CMD install lodash");
+        assert_eq!(v.len(), 1, "NPM.CMD (all caps) must classify as npm");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn windows_launcher_mixed_case_detected() {
+        let v = detect_installs("Npm.Cmd install lodash");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn windows_launcher_full_uppercase_no_suffix_detected() {
+        let v = detect_installs("NPM install lodash");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn windows_launcher_pip_exe_uppercase_detected() {
+        let v = detect_installs("PIP.EXE install requests");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn windows_launcher_double_extension_detected() {
+        // agy MEDIUM: `npm.cmd.exe` only had one suffix layer stripped.
+        // Loop strip now collapses both.
+        let v = detect_installs("npm.cmd.exe install lodash");
+        assert_eq!(v.len(), 1, "double-extension must strip recursively");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    // Versioned pip launcher (Codex HIGH on #142).
+
+    #[test]
+    fn versioned_pip_3_12_detected() {
+        let v = detect_installs("pip3.12 install requests");
+        assert_eq!(v.len(), 1, "pip3.12 must classify as pip");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn versioned_pip_3_12_exe_detected() {
+        let v = detect_installs("pip3.12.exe install requests");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn versioned_pip_abs_path_detected() {
+        let v = detect_installs("/usr/local/bin/pip3.11 install httpx");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["httpx"]);
+    }
+
+    // Line continuation (agy HIGH on #142).
+
+    #[test]
+    fn line_continuation_multiline_install_caught() {
+        // `\\<nl>  foo` → ` foo`. Without the preprocess, the `\r\n` guard
+        // in the arg-capture truncated at the `\` and packages on the next
+        // line went undetected.
+        let v = detect_installs("npm install left-pad \\\n  lodash");
+        assert_eq!(v.len(), 1, "line-continuation must collapse to one install");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        let pkgs: Vec<&str> = v[0].packages.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(pkgs.contains(&"left-pad"), "missing left-pad in {pkgs:?}");
+        assert!(pkgs.contains(&"lodash"), "missing lodash in {pkgs:?}");
+    }
+
+    #[test]
+    fn line_continuation_crlf_caught() {
+        let v = detect_installs("npm install foo \\\r\n  bar");
+        assert_eq!(v.len(), 1);
+        let pkgs: Vec<&str> = v[0].packages.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(pkgs.contains(&"foo"));
+        assert!(pkgs.contains(&"bar"));
+    }
+
+    #[test]
+    fn line_continuation_does_not_merge_distinct_commands() {
+        // Real newline (no backslash) still separates two installs — the
+        // preprocess only collapses `\<nl>`, not bare `<nl>`.
+        let v = detect_installs("npm install x\npip install y");
+        assert_eq!(v.len(), 2, "bare newline still separates installs");
     }
 
     #[test]
