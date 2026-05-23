@@ -283,23 +283,42 @@ impl Ecosystem {
 // absolute / relative path bypass observed on 2026-05-23 — invoking the
 // package manager via `/Users/.../bin/npm install foo` or `./bin/pnpm i x`
 // must not slip past the gate just because the byte before the verb is a
-// path separator. See abs_path_*_detected tests for the regression guard.
+// path separator. The optional `(?:\.(?:cmd|exe|bat))?` suffix lets
+// Windows launchers (`npm.cmd`, `pip.exe`, `yarn.cmd`) match without
+// requiring callers to strip those suffixes upstream. The capture group
+// excludes `\r\n` so a multi-line script like `npm install x\npip install y`
+// does not chain-swallow the next line (Antigravity peer-review BLOCKER).
+// See abs_path_*, newline_chain_*, and windows_launcher_* tests for the
+// regression guards.
 lazy_static! {
-    static ref NPM_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)npm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
-    static ref PNPM_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)pnpm\s+(?:i|install|add)\s+([^|;&<>]+)").unwrap();
-    static ref YARN_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)yarn\s+add\s+([^|;&<>]+)").unwrap();
-    static ref PIP_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?:pip|pip3)\s+install\s+([^|;&<>]+)").unwrap();
-    static ref UV_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)uv\s+(?:pip\s+)?(?:install|add)\s+([^|;&<>]+)")
-            .unwrap();
-    static ref POETRY_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)poetry\s+add\s+([^|;&<>]+)").unwrap();
-    static ref PIPX_RE: Regex =
-        Regex::new(r"(?m)(?:^|[\s;/\\]|&&|\|\|)pipx\s+install\s+([^|;&<>]+)").unwrap();
+    static ref NPM_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)npm(?:\.(?:cmd|exe|bat))?\s+(?:i|install|add)\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
+    static ref PNPM_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)pnpm(?:\.(?:cmd|exe|bat))?\s+(?:i|install|add)\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
+    static ref YARN_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)yarn(?:\.(?:cmd|exe|bat))?\s+add\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
+    static ref PIP_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)(?:pip|pip3)(?:\.(?:cmd|exe|bat))?\s+install\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
+    static ref UV_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)uv(?:\.(?:cmd|exe|bat))?\s+(?:pip\s+)?(?:install|add)\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
+    static ref POETRY_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)poetry(?:\.(?:cmd|exe|bat))?\s+add\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
+    static ref PIPX_RE: Regex = Regex::new(
+        r"(?m)(?:^|[\s;/\\]|&&|\|\|)pipx(?:\.(?:cmd|exe|bat))?\s+install\s+([^|;&<>\r\n]+)"
+    )
+    .unwrap();
 }
 
 /// Tokenise a shell command into (offset, token) pairs, treating the shell
@@ -423,20 +442,30 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     out
 }
 
-/// Last path component of a token, stripping both POSIX (`/`) and Windows
-/// (`\`) separators. Used to normalise an installer command head before
-/// matching `"npm"` / `"pnpm"` / `"yarn"`, so `/Users/x/.nvm/.../bin/npm`
-/// classifies as `npm`. Returns `tok` unchanged for plain tokens.
+/// Last path component of a token, stripping POSIX (`/`) and Windows (`\`)
+/// separators, then dropping a trailing Windows launcher extension
+/// (`.cmd` / `.exe` / `.bat`). Used to normalise an installer command head
+/// before matching `"npm"` / `"pnpm"` / `"yarn"` — both `/Users/.../bin/npm`
+/// and `C:\Tools\npm.cmd` classify as `npm`. Returns `tok` unchanged for
+/// plain tokens.
 fn installer_basename(tok: &str) -> &str {
-    tok.rsplit(['/', '\\']).next().unwrap_or(tok)
+    let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+    base.strip_suffix(".cmd")
+        .or_else(|| base.strip_suffix(".exe"))
+        .or_else(|| base.strip_suffix(".bat"))
+        .unwrap_or(base)
 }
 
-/// Scan the shell token stream for npm/pnpm/yarn install verbs that resolve
-/// their package set from a lockfile (no package-name token follows). A
-/// package name is a bare token that is neither a flag (`-`-prefixed) nor a
-/// shell operator; trailing flags and shell operators must NOT defeat the
-/// classification. A verb followed by a package token is left for the
-/// package-bearing regexes above.
+/// Scan the shell token stream for package-manager install verbs that
+/// resolve their package set from a lockfile (no package-name token
+/// follows). Covers npm/pnpm/yarn (via lockfile install) plus
+/// `poetry install` and `uv sync` (which resolve from
+/// pyproject.toml / uv.lock — Antigravity peer-review HIGH).
+///
+/// A package name is a bare token that is neither a flag (`-`-prefixed)
+/// nor a shell operator; trailing flags and shell operators must NOT
+/// defeat the classification. A verb followed by a package token is left
+/// for the package-bearing regexes above.
 fn detect_bare_lockfile_installs(
     cmd: &str,
     claimed: &mut Vec<(usize, usize)>,
@@ -449,17 +478,17 @@ fn detect_bare_lockfile_installs(
         // Basename-normalise the head token before matching. Without this,
         // `/Users/.../bin/npm install` slips past because the literal token
         // is the absolute path, not `"npm"`. Closes the abs/relative-path
-        // bypass observed on 2026-05-23. (Path separators handled: `/` for
-        // POSIX, `\` for Windows.)
+        // bypass observed on 2026-05-23. Also strips Windows launcher
+        // suffixes (`.cmd` / `.exe` / `.bat`) so `npm.cmd install` classifies.
         let tok = installer_basename(raw_tok);
-        // Identify an install-verb head: `npm`/`pnpm`/`yarn` plus the verb
-        // token(s). Bare `yarn` (no sub-command) is itself an install.
-        let (verb_span_end_idx, is_bare_install_verb) = match tok {
+        // Identify an install-verb head and the ecosystem it belongs to.
+        // `Some(eco)` ⇒ this is a bare lockfile-install verb.
+        let (verb_span_end_idx, bare_eco) = match tok {
             "npm" | "pnpm" => {
                 match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
-                    Some("install") | Some("i") => (idx + 1, true),
+                    Some("install") | Some("i") => (idx + 1, Some(Ecosystem::Npm)),
                     // `npm ci` is npm-only but harmless to accept for pnpm too.
-                    Some("ci") => (idx + 1, true),
+                    Some("ci") => (idx + 1, Some(Ecosystem::Npm)),
                     _ => {
                         idx += 1;
                         continue;
@@ -467,11 +496,36 @@ fn detect_bare_lockfile_installs(
                 }
             }
             "yarn" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
-                Some("install") => (idx + 1, true),
+                Some("install") => (idx + 1, Some(Ecosystem::Npm)),
                 // Bare `yarn` or `yarn` followed by a flag / operator is an
                 // install. `yarn add ...` / `yarn <other>` is not.
-                Some(next) if next.starts_with('-') || is_shell_operator(next) => (idx, true),
-                None => (idx, true),
+                Some(next) if next.starts_with('-') || is_shell_operator(next) => {
+                    (idx, Some(Ecosystem::Npm))
+                }
+                None => (idx, Some(Ecosystem::Npm)),
+                _ => {
+                    idx += 1;
+                    continue;
+                }
+            },
+            // `poetry install` resolves from pyproject.toml / poetry.lock —
+            // bare lockfile install in the PyPI ecosystem. `poetry add foo` is
+            // package-bearing and handled by POETRY_RE.
+            "poetry" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
+                Some("install") => (idx + 1, Some(Ecosystem::Pypi)),
+                _ => {
+                    idx += 1;
+                    continue;
+                }
+            },
+            // `uv sync` (and `uv pip sync`) resolves from uv.lock — bare
+            // lockfile install in PyPI. `uv install foo` / `uv add foo` /
+            // `uv pip install foo` are package-bearing and handled by UV_RE.
+            "uv" => match tokens.get(idx + 1).map(|(_, t)| t.as_str()) {
+                Some("sync") => (idx + 1, Some(Ecosystem::Pypi)),
+                Some("pip") if tokens.get(idx + 2).map(|(_, t)| t.as_str()) == Some("sync") => {
+                    (idx + 2, Some(Ecosystem::Pypi))
+                }
                 _ => {
                     idx += 1;
                     continue;
@@ -483,10 +537,10 @@ fn detect_bare_lockfile_installs(
             }
         };
 
-        if !is_bare_install_verb {
+        let Some(eco) = bare_eco else {
             idx += 1;
             continue;
-        }
+        };
 
         // Walk the tokens after the verb: stop at the first shell operator
         // (end of this command). If a non-flag, non-operator token appears,
@@ -516,14 +570,19 @@ fn detect_bare_lockfile_installs(
                     + tokens[verb_span_end_idx].1.len();
                 claimed.push((*start, verb_end));
                 out.push(ParsedInstall {
-                    ecosystem: Ecosystem::Npm,
+                    ecosystem: eco,
                     packages: Vec::new(),
                     has_editable: false,
-                    unvettable: Some(
-                        "bare lockfile install — pulls the dependency tree from \
-                         package-lock.json/pnpm-lock.yaml/yarn.lock the gate cannot vet"
+                    unvettable: Some(match eco {
+                        Ecosystem::Npm => "bare lockfile install — pulls the dependency tree \
+                                           from package-lock.json/pnpm-lock.yaml/yarn.lock \
+                                           the gate cannot vet"
                             .to_string(),
-                    ),
+                        Ecosystem::Pypi => "bare lockfile install — pulls the dependency tree \
+                                            from poetry.lock/uv.lock/pyproject.toml the gate \
+                                            cannot vet"
+                            .to_string(),
+                    }),
                 });
             }
         }
@@ -1483,6 +1542,119 @@ mod tests {
             v[0].unvettable.is_some(),
             "bare install has no named package, must surface as unvettable"
         );
+    }
+
+    // ─── Peer-review follow-ups (newline chain, Windows launchers,
+    //     poetry/uv bare-install) ────────────────────────────────────────────
+
+    #[test]
+    fn newline_chain_both_installs_detected() {
+        // BLOCKER (Antigravity peer review): `[^|;&<>]+` matched newlines, so
+        // a multi-line script's first install greedily swallowed subsequent
+        // lines and suppressed downstream detection. Newlines now end the
+        // arg-capture and each line is its own install.
+        let v = detect_installs("npm install left-pad\npip install requests");
+        assert_eq!(
+            v.len(),
+            2,
+            "newline must NOT chain-swallow: expected both installs, got {v:?}"
+        );
+        assert!(v.iter().any(|p| p.ecosystem == Ecosystem::Npm));
+        assert!(v.iter().any(|p| p.ecosystem == Ecosystem::Pypi));
+    }
+
+    #[test]
+    fn newline_chain_carriage_return_also_caught() {
+        // Windows line endings (`\r\n`) — same guard must apply.
+        let v = detect_installs("npm install left-pad\r\npip install requests");
+        assert_eq!(v.len(), 2, "\\r\\n line ending must not chain: {v:?}");
+    }
+
+    #[test]
+    fn windows_launcher_npm_cmd_detected() {
+        let v = detect_installs("npm.cmd install lodash");
+        assert_eq!(v.len(), 1, "npm.cmd install must classify as npm");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn windows_launcher_pip_exe_detected() {
+        let v = detect_installs("pip.exe install requests");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["requests"]);
+    }
+
+    #[test]
+    fn windows_launcher_abs_path_npm_cmd_detected() {
+        // Combined: Windows abs path + .cmd suffix.
+        let v = detect_installs(r"C:\Tools\node\npm.cmd install lodash");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(names(&v[0]), vec!["lodash"]);
+    }
+
+    #[test]
+    fn windows_launcher_bare_npm_cmd_detected() {
+        // Bare lockfile install via Windows launcher — basename strip must
+        // drop .cmd before the token-match arm fires.
+        let v = detect_installs("npm.cmd install");
+        assert_eq!(v.len(), 1, "bare npm.cmd install must be detected");
+        assert_eq!(v[0].ecosystem, Ecosystem::Npm);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn poetry_install_bare_lockfile_detected() {
+        // `poetry install` resolves from pyproject.toml / poetry.lock with no
+        // package args — silent Skip before, now surfaced as Pypi unvettable.
+        let v = detect_installs("poetry install");
+        assert_eq!(v.len(), 1, "poetry install must surface as bare lockfile");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn poetry_install_with_flags_still_bare_lockfile() {
+        // Flags after the verb must not turn this into a named install.
+        let v = detect_installs("poetry install --no-dev --no-interaction");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn poetry_add_still_handled_by_regex() {
+        // Sanity: `poetry add` is package-bearing and must stay claimed by
+        // POETRY_RE, not the new bare-install path.
+        let v = detect_installs("poetry add httpx");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert_eq!(names(&v[0]), vec!["httpx"]);
+    }
+
+    #[test]
+    fn uv_sync_bare_lockfile_detected() {
+        let v = detect_installs("uv sync");
+        assert_eq!(v.len(), 1, "uv sync must surface as bare lockfile");
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn uv_pip_sync_bare_lockfile_detected() {
+        let v = detect_installs("uv pip sync");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
+        assert!(v[0].unvettable.is_some());
+    }
+
+    #[test]
+    fn uv_abs_path_sync_detected() {
+        let v = detect_installs("/Users/me/.cargo/bin/uv sync");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ecosystem, Ecosystem::Pypi);
     }
 
     #[test]
