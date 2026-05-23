@@ -47,6 +47,8 @@ pub enum AgentTarget {
     Antigravity,
     /// Hermes CLI
     Hermes,
+    /// Pi coding agent (earendil-works)
+    Pidev,
 }
 
 #[derive(Parser)]
@@ -2185,21 +2187,30 @@ fn main() {
     std::process::exit(code);
 }
 
-fn uninstall_init_dispatch<UninstallHermes, UninstallStandard>(
+// 8 args: one per special-cased agent (Hermes, Pi) plus the standard
+// fallback, with the dispatch flags (agent, global, gemini, codex, ctx).
+// Collapsing into a struct buys little — these are call-site-level routing
+// callbacks, not domain state.
+#[allow(clippy::too_many_arguments)]
+fn uninstall_init_dispatch<UninstallHermes, UninstallPidev, UninstallStandard>(
     agent: Option<AgentTarget>,
     global: bool,
     gemini: bool,
     codex: bool,
     ctx: hooks::init::InitContext,
     uninstall_hermes: UninstallHermes,
+    uninstall_pidev: UninstallPidev,
     uninstall_standard: UninstallStandard,
 ) -> Result<()>
 where
     UninstallHermes: FnOnce(hooks::init::InitContext) -> Result<()>,
+    UninstallPidev: FnOnce(hooks::init::InitContext) -> Result<()>,
     UninstallStandard: FnOnce(bool, bool, bool, bool, hooks::init::InitContext) -> Result<()>,
 {
     if agent == Some(AgentTarget::Hermes) {
         uninstall_hermes(ctx)
+    } else if agent == Some(AgentTarget::Pidev) {
+        uninstall_pidev(ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
         uninstall_standard(global, gemini, codex, cursor, ctx)
@@ -3473,6 +3484,7 @@ fn run_cli() -> Result<i32> {
                     codex,
                     ctx,
                     hooks::init::uninstall_hermes,
+                    hooks::init::uninstall_pidev,
                     hooks::init::uninstall,
                 )?;
             } else if gemini {
@@ -3500,6 +3512,8 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_antigravity_mode(ctx)?;
             } else if agent == Some(AgentTarget::Hermes) {
                 hooks::init::run_hermes_mode(ctx)?;
+            } else if agent == Some(AgentTarget::Pidev) {
+                hooks::init::run_pidev_mode(ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -4490,8 +4504,34 @@ mod tests {
     }
 
     #[test]
+    fn test_try_parse_init_agent_pidev() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "pidev"]).unwrap();
+        match cli.command {
+            Commands::Init { agent, .. } => {
+                assert_eq!(agent, Some(AgentTarget::Pidev));
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_init_agent_pidev_uninstall() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "pidev", "--uninstall"]).unwrap();
+        match cli.command {
+            Commands::Init {
+                agent, uninstall, ..
+            } => {
+                assert_eq!(agent, Some(AgentTarget::Pidev));
+                assert!(uninstall);
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
     fn test_init_uninstall_dispatch_routes_hermes_to_hermes_cleanup() {
         let hermes_called = Cell::new(false);
+        let pidev_called = Cell::new(false);
         let standard_called = Cell::new(false);
         let ctx = hooks::init::InitContext {
             verbose: 2,
@@ -4510,6 +4550,10 @@ mod tests {
                 assert!(ctx.dry_run);
                 Ok(())
             },
+            |_| {
+                pidev_called.set(true);
+                Ok(())
+            },
             |_, _, _, _, _| {
                 standard_called.set(true);
                 Ok(())
@@ -4518,6 +4562,45 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(hermes_called.get());
+        assert!(!pidev_called.get());
+        assert!(!standard_called.get());
+    }
+
+    #[test]
+    fn test_init_uninstall_dispatch_routes_pidev_to_pidev_cleanup() {
+        let hermes_called = Cell::new(false);
+        let pidev_called = Cell::new(false);
+        let standard_called = Cell::new(false);
+        let ctx = hooks::init::InitContext {
+            verbose: 1,
+            dry_run: true,
+        };
+
+        let result = uninstall_init_dispatch(
+            Some(AgentTarget::Pidev),
+            true,
+            false,
+            false,
+            ctx,
+            |_| {
+                hermes_called.set(true);
+                Ok(())
+            },
+            |ctx| {
+                pidev_called.set(true);
+                assert_eq!(ctx.verbose, 1);
+                assert!(ctx.dry_run);
+                Ok(())
+            },
+            |_, _, _, _, _| {
+                standard_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(pidev_called.get(), "Pidev should route to pidev cleanup");
+        assert!(!hermes_called.get());
         assert!(!standard_called.get());
     }
 
