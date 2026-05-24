@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
 // ContextCrawler OpenCode plugin — rewrites commands to use contextcrawler for token savings.
-// Requires: contextcrawler >= 0.23.0 in PATH.
+// Requires contextcrawler on PATH (with the rewrite subcommand).
 //
 // This is a thin delegating plugin: all rewrite logic lives in `contextcrawler rewrite`,
 // which is the single source of truth (src/discover/registry.rs).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rtk-hook-version: 3
 # ContextCrawler Claude Code hook — rewrites commands to use contextcrawler for token savings.
-# Requires: contextcrawler >= 0.23.0, jq
+# Requires: contextcrawler on PATH (with the rewrite subcommand), jq
 #
 # This is a thin delegating hook: all rewrite logic lives in `contextcrawler rewrite`,
 # which is the single source of truth (src/discover/registry.rs).
@@ -23,13 +23,9 @@ if ! command -v contextcrawler &>/dev/null; then
   exit 0
 fi
 
-# Version guard: contextcrawler rewrite was added in 0.23.0.
-# Older binaries: warn once and exit cleanly (no silent failure).
-# Cache the version check to avoid spawning multiple processes on every hook call.
-CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}
-# ContextCrawler downstream: dropped the upstream version guard.
-# Upstream's logic parsed `rtk <ver>` output to enforce rtk >= 0.23.0; our
-# --version banner format doesn't match that shape, and ContextCrawler
+# ContextCrawler downstream: no version guard.
+# Upstream's logic parsed `rtk <ver>` output to enforce a minimum version;
+# our --version banner format doesn't match that shape, and ContextCrawler
 # always ships against a recent rtk core. The hook simply requires the
 # binary to be present; the binary itself enforces its own minimums.
 :

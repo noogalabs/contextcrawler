@@ -7,7 +7,7 @@
  * ContextCrawler repo), which is the single source of truth. To change
  * rewrite rules, edit the Rust registry — not this file.
  *
- * Requires contextcrawler >= 0.23.0 on PATH.
+ * Requires contextcrawler on PATH (with the rewrite subcommand).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
