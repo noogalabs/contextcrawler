@@ -3,7 +3,7 @@
 # ContextCrawler Cursor Agent hook — rewrites shell commands to use contextcrawler for token savings.
 # Works with both Cursor editor and cursor-cli (they share ~/.cursor/hooks.json).
 # Cursor preToolUse hook format: receives JSON on stdin, returns JSON on stdout.
-# Requires: contextcrawler >= 0.23.0, jq
+# Requires: contextcrawler on PATH (with the rewrite subcommand), jq
 #
 # This is a thin delegating hook: all rewrite logic lives in `contextcrawler rewrite`,
 # which is the single source of truth (src/discover/registry.rs).
