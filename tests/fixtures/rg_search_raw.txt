@@ -1,0 +1,40 @@
+src/cmds/js/playwright_cmd.rs:168:    lazy_static::lazy_static! {
+src/cmds/js/playwright_cmd.rs:224:    lazy_static::lazy_static! {
+src/cmds/js/next_cmd.rs:47:    lazy_static::lazy_static! {
+src/cmds/js/next_cmd.rs:177:    lazy_static::lazy_static! {
+src/cmds/js/vitest_cmd.rs:120:    lazy_static::lazy_static! {
+src/cmds/python/mypy_cmd.rs:54:    lazy_static::lazy_static! {
+src/cmds/jvm/gradlew_cmd.rs:5:use lazy_static::lazy_static;
+src/cmds/jvm/gradlew_cmd.rs:12:lazy_static! {
+src/cmds/jvm/gradlew_cmd.rs:219:    lazy_static! {
+src/cmds/jvm/gradlew_cmd.rs:270:    lazy_static! {
+src/cmds/jvm/gradlew_cmd.rs:346:    lazy_static! {
+src/cmds/jvm/gradlew_cmd.rs:394:    lazy_static! {
+src/cmds/git/gh_cmd.rs:10:use lazy_static::lazy_static;
+src/cmds/git/gh_cmd.rs:15:lazy_static! {
+src/cmds/js/tsc_cmd.rs:7:use lazy_static::lazy_static;
+src/cmds/js/tsc_cmd.rs:11:lazy_static! {
+src/cmds/git/gt_cmd.rs:9:use lazy_static::lazy_static;
+src/cmds/git/gt_cmd.rs:13:lazy_static! {
+src/discover/README.md:73:No other files need to change. The registry compiles the patterns at first use via `lazy_static`.
+src/discover/registry.rs:3:use lazy_static::lazy_static;
+src/discover/registry.rs:47:lazy_static! {
+src/cmds/rust/runner.rs:5:use lazy_static::lazy_static;
+src/cmds/rust/runner.rs:9:lazy_static! {
+src/core/utils.rs:49:    lazy_static::lazy_static! {
+src/learn/README.md:17:- **Uses**: `discover::provider::ClaudeProvider` (session file discovery and command extraction), `lazy_static`/`regex` (error pattern matching), `serde_json` (JSON output)
+src/cmds/git/glab_cmd.rs:19:use lazy_static::lazy_static;
+src/cmds/git/glab_cmd.rs:24:lazy_static! {
+src/cmds/ruby/rake_cmd.rs:173:    lazy_static::lazy_static! {
+src/cmds/ruby/rspec_cmd.rs:13:use lazy_static::lazy_static;
+src/cmds/ruby/rspec_cmd.rs:19:lazy_static! {
+src/core/filter.rs:3:use lazy_static::lazy_static;
+src/core/filter.rs:162:lazy_static! {
+src/core/filter.rs:239:lazy_static! {
+src/cmds/system/env_cmd.rs:160:    use lazy_static::lazy_static;
+src/cmds/system/env_cmd.rs:162:    lazy_static! {
+src/learn/detector.rs:3:use lazy_static::lazy_static;
+src/learn/detector.rs:51:lazy_static! {
+src/core/tracking.rs:88:    use lazy_static::lazy_static;
+src/core/tracking.rs:89:    lazy_static! {
+src/core/toml_filter.rs:26:use lazy_static::lazy_static;
