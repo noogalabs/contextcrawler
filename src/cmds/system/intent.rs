@@ -394,14 +394,28 @@ fn assemble_output(
 
 /// Take lines from the iterator until the byte cap is reached. Joining with
 /// '\n' so a 1-line-megabyte file emits at most ~1 line worth of bookend.
+///
+/// When the first line itself exceeds the cap, truncates to the largest
+/// UTF-8-valid byte prefix that fits below the cap and appends a marker.
+/// Byte-boundary safe — never slices mid-codepoint, so multibyte UTF-8
+/// inputs (CJK, emoji, accented Latin) can't panic. Peer-review #151 (Codex).
 fn take_capped<'a, I: Iterator<Item = &'a str>>(iter: I, max_bytes: usize) -> String {
+    const TRUNCATION_MARKER: &str = " …[truncated]";
     let mut out = String::new();
     for line in iter {
         if out.len() + line.len() + 1 > max_bytes {
             if out.is_empty() {
-                // First line already exceeds cap — keep a prefix and signal.
-                out.push_str(&line.chars().take(max_bytes.saturating_sub(20)).collect::<String>());
-                out.push_str(" …[truncated]");
+                // First line already exceeds cap. Keep the largest valid-
+                // UTF-8 prefix that fits below (cap - marker.len()) bytes.
+                let cap = max_bytes.saturating_sub(TRUNCATION_MARKER.len());
+                let end = line
+                    .char_indices()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .take_while(|&i| i <= cap)
+                    .last()
+                    .unwrap_or(0);
+                out.push_str(&line[..end]);
+                out.push_str(TRUNCATION_MARKER);
             }
             break;
         }
@@ -579,5 +593,60 @@ mod tests {
             .expect("extraction applies");
         assert!(out.contains("// head bookend:"));
         assert!(out.contains("// tail bookend:"));
+    }
+
+    // ─── Real-fixture grounding (peer-review #151 Codex finding #6) ────────
+
+    #[test]
+    fn extract_on_real_cargo_lock_meets_savings_target() {
+        // Codex called out the 96.1% live-demo claim as unsubstantiated by
+        // the test suite — the prior savings test used a synthetic fixture.
+        // Ground the claim in the repo's actual Cargo.lock so any regression
+        // surfaces. Defensible (not cherry-picked) target: ≥ 80%.
+        let lock = include_str!("../../../Cargo.lock");
+        let out = extract_for_intent(lock, Some("lock"), Language::Data, "rusqlite chrono", "Cargo.lock")
+            .expect("Cargo.lock is large enough to extract from");
+        let savings_pct =
+            100.0 - (count_tokens(&out) as f64 / count_tokens(lock) as f64 * 100.0);
+        assert!(
+            savings_pct >= 80.0,
+            "Cargo.lock extraction must achieve ≥80% token reduction, got {savings_pct:.1}%"
+        );
+        // Sanity: the requested terms must actually appear in the output —
+        // a "high savings" result that filtered out the matches would be a
+        // regression worse than the baseline filter.
+        assert!(
+            out.contains("rusqlite"),
+            "rusqlite must appear in the kept sections"
+        );
+        assert!(
+            out.contains("chrono"),
+            "chrono must appear in the kept sections"
+        );
+    }
+
+    // ─── take_capped UTF-8 safety (peer-review #151 Codex finding #4) ──────
+
+    #[test]
+    fn take_capped_does_not_panic_on_multibyte_overflow() {
+        // A single line of 4-byte emoji exceeding the cap must truncate at
+        // a valid UTF-8 boundary, not panic mid-codepoint. Each "🎉" is 4
+        // bytes; with cap=50 we expect at most 9 emoji (36 bytes) before
+        // the marker.
+        let huge = "🎉".repeat(100);
+        let lines = std::iter::once(huge.as_str());
+        let out = take_capped(lines, 50);
+        assert!(out.ends_with("…[truncated]"), "marker must be present: {out:?}");
+        // Output is valid UTF-8 by construction (String guarantees this) —
+        // the real test is that the function didn't panic.
+    }
+
+    #[test]
+    fn take_capped_emits_nothing_when_cap_is_tiny() {
+        // Cap smaller than the truncation marker itself must not panic.
+        let out = take_capped(std::iter::once("anything"), 3);
+        // saturating_sub(marker.len()) → 0, so first line truncates to empty
+        // prefix + marker.
+        assert!(out.contains("[truncated]"));
     }
 }
