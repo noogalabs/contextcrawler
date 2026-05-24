@@ -21,7 +21,7 @@ use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::system::{
     deps, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
-    read, summary, tree, wc_cmd,
+    read, rg_cmd, summary, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -323,6 +323,17 @@ enum Commands {
         /// Command to run and summarize
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Ripgrep wrapper — routes to the grep filter so `contextcrawler rg` no longer
+    /// falls through unfiltered. Supports `rg PATTERN [PATH]`, `rg --files [PATH]`,
+    /// `rg -l/-L/-c/-o/-Z PATTERN [PATH]`, and standard rg flags like `-n -i -A 3
+    /// --glob '*.rs' -t rust`. Unmappable invocations fall back to raw rg with a
+    /// single stderr note.
+    Rg {
+        /// All rg arguments (pattern, path, flags) in native rg order.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Compact grep - strips whitespace, truncates, groups by file
@@ -3478,6 +3489,10 @@ fn run_cli() -> Result<i32> {
             &extra_args,
             cli.verbose,
         )?,
+
+        // Issue #165A: `rg` is no longer a 0% fallback. Parse rg-native
+        // syntax (incl. `--files`, `-l`, `-A 3`) and route to grep_cmd.
+        Commands::Rg { args } => rg_cmd::run_from_args(&args, cli.verbose)?,
 
         Commands::Init {
             global,

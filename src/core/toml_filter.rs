@@ -183,6 +183,23 @@ pub struct TomlFilterRegistry {
 }
 
 impl TomlFilterRegistry {
+    /// Returns true if a TOML filters file has zero active rules — i.e. it
+    /// parses but defines an empty `[filters]` table (the shape of skeleton
+    /// templates emitted by `contextcrawler init` and the like). Used to
+    /// suppress the noisy trust warning on files that wouldn't run anything
+    /// even after they were trusted. Issue #165B.
+    ///
+    /// Conservative: on any parse failure we return false so the trust
+    /// warning still fires — a malformed file is exactly the case where the
+    /// user benefits from seeing the warning.
+    fn has_no_active_rules(bytes: &[u8]) -> bool {
+        let content = String::from_utf8_lossy(bytes);
+        match toml::from_str::<TomlFilterFile>(&content) {
+            Ok(file) => file.filters.is_empty(),
+            Err(_) => false,
+        }
+    }
+
     /// Load registry from disk + built-in. Emits warnings to stderr on parse
     /// errors but never panics — bad files are silently ignored.
     fn load() -> Self {
@@ -209,12 +226,20 @@ impl TomlFilterRegistry {
                         }
                     }
                     crate::hooks::trust::TrustStatus::Untrusted => {
-                        eprintln!("[contextcrawler] WARNING: untrusted project filters (.rtk/filters.toml)");
-                        eprintln!("[contextcrawler] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
+                        // Skeleton-file suppression (issue #165B): a freshly
+                        // initialised filters.toml that only contains
+                        // schema_version + comments would never apply any rule
+                        // even if trusted. Skip the scary warning entirely.
+                        if !Self::has_no_active_rules(&bytes) {
+                            eprintln!("[contextcrawler] WARNING: untrusted project filters (.rtk/filters.toml)");
+                            eprintln!("[contextcrawler] Filters NOT applied. Run `contextcrawler trust` to review and enable.");
+                        }
                     }
                     crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
-                        eprintln!("[contextcrawler] WARNING: .rtk/filters.toml changed since trusted.");
-                        eprintln!("[contextcrawler] Filters NOT applied. Run `contextcrawler trust` to re-review.");
+                        if !Self::has_no_active_rules(&bytes) {
+                            eprintln!("[contextcrawler] WARNING: .rtk/filters.toml changed since trusted.");
+                            eprintln!("[contextcrawler] Filters NOT applied. Run `contextcrawler trust` to re-review.");
+                        }
                     }
                 }
             }
@@ -249,22 +274,28 @@ impl TomlFilterRegistry {
                             }
                         }
                         crate::hooks::trust::TrustStatus::Untrusted => {
-                            eprintln!(
-                                "[contextcrawler] WARNING: untrusted user-global filters ({})",
-                                global_path.display()
-                            );
-                            eprintln!(
-                                "[contextcrawler] Filters NOT applied. Run `contextcrawler trust --global` to review and enable."
-                            );
+                            // Skeleton-file suppression (issue #165B): see
+                            // matching note on project-local path above.
+                            if !Self::has_no_active_rules(&bytes) {
+                                eprintln!(
+                                    "[contextcrawler] WARNING: untrusted user-global filters ({})",
+                                    global_path.display()
+                                );
+                                eprintln!(
+                                    "[contextcrawler] Filters NOT applied. Run `contextcrawler trust --global` to review and enable."
+                                );
+                            }
                         }
                         crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
-                            eprintln!(
-                                "[contextcrawler] WARNING: {} changed since trusted.",
-                                global_path.display()
-                            );
-                            eprintln!(
-                                "[contextcrawler] Filters NOT applied. Run `contextcrawler trust --global` to re-review."
-                            );
+                            if !Self::has_no_active_rules(&bytes) {
+                                eprintln!(
+                                    "[contextcrawler] WARNING: {} changed since trusted.",
+                                    global_path.display()
+                                );
+                                eprintln!(
+                                    "[contextcrawler] Filters NOT applied. Run `contextcrawler trust --global` to re-review."
+                                );
+                            }
                         }
                     }
                 }
@@ -328,6 +359,7 @@ const RUST_HANDLED_COMMANDS: &[&str] = &[
     "kubectl",
     "summary",
     "grep",
+    "rg",
     "init",
     "wget",
     "wc",
@@ -645,7 +677,11 @@ pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
         .into_iter()
         .filter(|name| {
             // When a specific filter is requested, only report that one as missing tests
-            filter_name_opt.is_none_or(|f| name == f)
+            // (manual `is_none_or` — keep MSRV 1.80 compat; `is_none_or` is stable from 1.82)
+            match filter_name_opt {
+                None => true,
+                Some(f) => name == f,
+            }
         })
         .filter(|name| !tested_filter_names.contains(name))
         .collect();
@@ -1022,6 +1058,56 @@ match_command = "^cmd"
     }
 
     // --- Registry / find ---
+
+    // Issue #165B: skeleton filter files (parse OK, zero rules) should be
+    // treated as "no active rules" so the trust warning is suppressed.
+    #[test]
+    fn test_has_no_active_rules_empty_skeleton() {
+        let bytes = b"schema_version = 1\n";
+        assert!(TomlFilterRegistry::has_no_active_rules(bytes));
+    }
+
+    #[test]
+    fn test_has_no_active_rules_comments_only() {
+        let bytes = br#"
+# Skeleton template - no rules yet.
+schema_version = 1
+
+# [filters.example]
+# match_command = "^example"
+# strip_lines_matching = ["noise"]
+"#;
+        assert!(TomlFilterRegistry::has_no_active_rules(bytes));
+    }
+
+    #[test]
+    fn test_has_no_active_rules_explicit_empty_table() {
+        // [filters] declared but no entries — still skeleton-shaped.
+        let bytes = br#"
+schema_version = 1
+[filters]
+"#;
+        assert!(TomlFilterRegistry::has_no_active_rules(bytes));
+    }
+
+    #[test]
+    fn test_has_no_active_rules_real_filter_returns_false() {
+        let bytes = br#"
+schema_version = 1
+[filters.f]
+match_command = "^cmd"
+strip_lines_matching = ["^noise"]
+"#;
+        assert!(!TomlFilterRegistry::has_no_active_rules(bytes));
+    }
+
+    #[test]
+    fn test_has_no_active_rules_malformed_returns_false() {
+        // Conservative: malformed TOML keeps the warning loud so the user
+        // notices the broken file.
+        let bytes = b"this is not = valid toml [[[";
+        assert!(!TomlFilterRegistry::has_no_active_rules(bytes));
+    }
 
     #[test]
     fn test_builtin_filters_compile() {
