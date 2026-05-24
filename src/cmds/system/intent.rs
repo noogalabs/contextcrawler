@@ -103,19 +103,31 @@ pub fn extract_for_intent(
     // Keep top scorers until kept content is approximately KEEP_TARGET_RATIO%
     // of the original. Sort kept indices in original document order so the
     // assembled output reads chronologically, not by score.
+    //
+    // Tie handling (peer-review #163, Codex Q6): once the target is reached,
+    // KEEP adding any further sections whose score equals the last-included
+    // score before stopping. Without this, a single chunky section can push
+    // past the target and the loop would silently drop equally-relevant
+    // siblings that should have appeared together.
     scored.sort_by(|a, b| b.1.cmp(&a.1));
     let target_bytes = content.len() * KEEP_TARGET_RATIO / 100;
     let mut kept: Vec<usize> = Vec::new();
     let mut kept_bytes = 0usize;
+    let mut last_kept_score: Option<usize> = None;
     for (idx, score) in &scored {
         if *score == 0 {
             break;
         }
+        if kept_bytes >= target_bytes {
+            // Past target — only keep going if this section ties the last
+            // included one. The moment we hit a strictly lower score, stop.
+            if last_kept_score != Some(*score) {
+                break;
+            }
+        }
         kept.push(*idx);
         kept_bytes += sections[*idx].body.len();
-        if kept_bytes >= target_bytes {
-            break;
-        }
+        last_kept_score = Some(*score);
     }
     kept.sort();
 
@@ -403,8 +415,15 @@ fn take_capped<'a, I: Iterator<Item = &'a str>>(iter: I, max_bytes: usize) -> St
     const TRUNCATION_MARKER: &str = " …[truncated]";
     let mut out = String::new();
     for line in iter {
-        if out.len() + line.len() + 1 > max_bytes {
-            if out.is_empty() {
+        // Peer-review #163 Q4a: only charge the separator newline when
+        // there's already content; without this, an exactly-fitting first
+        // line was falsely treated as overflow.
+        let separator_cost = if out.is_empty() { 0 } else { 1 };
+        if out.len() + line.len() + separator_cost > max_bytes {
+            // Peer-review #163 Q4b: if the cap is smaller than the marker
+            // itself, emitting "marker alone" exceeds the nominal cap.
+            // Honour the cap strictly — return empty rather than over-emit.
+            if out.is_empty() && max_bytes >= TRUNCATION_MARKER.len() {
                 // First line already exceeds cap. Keep the largest valid-
                 // UTF-8 prefix that fits below (cap - marker.len()) bytes.
                 let cap = max_bytes.saturating_sub(TRUNCATION_MARKER.len());
@@ -598,19 +617,28 @@ mod tests {
     // ─── Real-fixture grounding (peer-review #151 Codex finding #6) ────────
 
     #[test]
-    fn extract_on_real_cargo_lock_meets_savings_target() {
-        // Codex called out the 96.1% live-demo claim as unsubstantiated by
-        // the test suite — the prior savings test used a synthetic fixture.
-        // Ground the claim in the repo's actual Cargo.lock so any regression
-        // surfaces. Defensible (not cherry-picked) target: ≥ 80%.
-        let lock = include_str!("../../../Cargo.lock");
-        let out = extract_for_intent(lock, Some("lock"), Language::Data, "rusqlite chrono", "Cargo.lock")
-            .expect("Cargo.lock is large enough to extract from");
+    fn extract_on_pinned_cargo_lock_meets_savings_target() {
+        // Peer-review #163 Q8: pin a static Cargo.lock-shaped fixture
+        // instead of the live repo Cargo.lock. The previous test was
+        // brittle — adding/removing a single dep on develop could shift
+        // baseline byte count and the matched section set, causing spurious
+        // failures unrelated to the filter logic. Snapshot lives in
+        // tests/fixtures/cargo_lock_sample.txt and is treated as a fixed
+        // input the test owns.
+        let lock = include_str!("../../../tests/fixtures/cargo_lock_sample.txt");
+        let out = extract_for_intent(
+            lock,
+            Some("lock"),
+            Language::Data,
+            "rusqlite chrono",
+            "cargo_lock_sample.txt",
+        )
+        .expect("pinned fixture is large enough to extract from");
         let savings_pct =
             100.0 - (count_tokens(&out) as f64 / count_tokens(lock) as f64 * 100.0);
         assert!(
             savings_pct >= 80.0,
-            "Cargo.lock extraction must achieve ≥80% token reduction, got {savings_pct:.1}%"
+            "Cargo.lock-shaped extraction must achieve ≥80% token reduction, got {savings_pct:.1}%"
         );
         // Sanity: the requested terms must actually appear in the output —
         // a "high savings" result that filtered out the matches would be a
@@ -622,6 +650,54 @@ mod tests {
         assert!(
             out.contains("chrono"),
             "chrono must appear in the kept sections"
+        );
+    }
+
+    // ─── KEEP_TARGET_RATIO tie handling (peer-review #163 Q6 CONCERN) ──────
+
+    #[test]
+    fn extract_keeps_tied_scoring_sections_past_target() {
+        // Construct a fixture where two sections both contain the same
+        // intent terms with the same density. The first kept section
+        // already pushes past target_bytes — without the tie-handling
+        // fix, the second equally-relevant section would be silently
+        // dropped.
+        let make_body = |topic: &str, line: &str, n: usize| -> String {
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(&format!("{}: {}\n", topic, line));
+            }
+            s
+        };
+        // Two large sections that both match "alpha beta" with identical
+        // term frequency (each line contains both terms once). Each ~100
+        // lines × 30 bytes = ~3 KB. Combined with the third (smaller,
+        // non-matching) section, total is ~6.5 KB — large enough to
+        // trigger extraction.
+        let mut md = String::new();
+        md.push_str("# Alpha\n\n");
+        md.push_str(&make_body("Alpha", "this line covers alpha and beta", 100));
+        md.push_str("\n# Beta\n\n");
+        md.push_str(&make_body("Beta", "this line covers alpha and beta", 100));
+        md.push_str("\n# Gamma\n\n");
+        md.push_str(&make_body("Gamma", "irrelevant content here", 20));
+
+        let out = extract_for_intent(&md, Some("md"), Language::Data, "alpha beta", "tied.md")
+            .expect("extraction applies");
+        // Both equally-scoring sections must appear, despite the first
+        // alone exceeding target_bytes. This is the Q6 regression guard.
+        assert!(
+            out.contains("// match: Alpha"),
+            "first tied section must be kept: {out}"
+        );
+        assert!(
+            out.contains("// match: Beta"),
+            "tied-scoring sibling must also be kept (Q6 tie-handling): {out}"
+        );
+        // The strictly-lower-scoring section MUST NOT be kept.
+        assert!(
+            !out.contains("// match: Gamma"),
+            "non-matching section must remain excluded: {out}"
         );
     }
 
@@ -643,10 +719,15 @@ mod tests {
 
     #[test]
     fn take_capped_emits_nothing_when_cap_is_tiny() {
-        // Cap smaller than the truncation marker itself must not panic.
+        // Peer-review #163 Q4b: when the cap is smaller than the truncation
+        // marker itself, emitting "marker alone" would exceed the nominal
+        // cap. The function must honour the cap strictly and return empty
+        // rather than over-emit. Pre-fix behaviour returned the bare marker
+        // which violated the cap contract.
         let out = take_capped(std::iter::once("anything"), 3);
-        // saturating_sub(marker.len()) → 0, so first line truncates to empty
-        // prefix + marker.
-        assert!(out.contains("[truncated]"));
+        assert_eq!(
+            out, "",
+            "cap < TRUNCATION_MARKER.len() must yield empty output, not the bare marker"
+        );
     }
 }
