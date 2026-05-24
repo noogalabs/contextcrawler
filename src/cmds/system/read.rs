@@ -1,5 +1,6 @@
 //! Reads source files with optional language-aware filtering to strip boilerplate.
 
+use crate::cmds::system::intent as intent_extractor;
 use crate::cmds::system::json_cmd;
 use crate::core::config;
 use crate::core::filter::{self, FilterLevel, Language};
@@ -11,12 +12,14 @@ use std::path::Path;
 
 const JSON_MAX_DEPTH: usize = 5;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     file: &Path,
     level: FilterLevel,
     max_lines: Option<usize>,
     tail_lines: Option<usize>,
     line_numbers: bool,
+    intent: Option<&str>,
     verbose: u8,
 ) -> Result<()> {
     let timer = tracking::TimedExecution::start();
@@ -44,18 +47,29 @@ pub fn run(
     }
 
     let display_path = file.display().to_string();
-    let filtered = render_output(
-        &content,
-        ext,
-        lang,
-        level,
-        max_lines,
-        tail_lines,
-        &read_config,
-        true,
-        &display_path,
-        verbose,
-    );
+
+    // #151: if --intent was provided and the file is big enough to benefit,
+    // try surgical extraction first. Falls back to the regular render path
+    // when the extractor returns None (small file, no matching sections,
+    // unsupported format, etc.).
+    let filtered = if let Some(extracted) = intent.and_then(|i| {
+        intent_extractor::extract_for_intent(&content, ext, lang, i, &display_path)
+    }) {
+        extracted
+    } else {
+        render_output(
+            &content,
+            ext,
+            lang,
+            level,
+            max_lines,
+            tail_lines,
+            &read_config,
+            true,
+            &display_path,
+            verbose,
+        )
+    };
 
     let rtk_output = if line_numbers {
         format_with_line_numbers(&filtered)
@@ -72,11 +86,13 @@ pub fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_stdin(
     level: FilterLevel,
     max_lines: Option<usize>,
     tail_lines: Option<usize>,
     line_numbers: bool,
+    intent: Option<&str>,
     verbose: u8,
 ) -> Result<()> {
     use std::io::{self, Read as IoRead};
@@ -102,22 +118,28 @@ pub fn run_stdin(
         eprintln!("Language: {:?} (stdin has no extension)", lang);
     }
 
-    let filtered = render_output(
-        &content,
-        None,
-        lang,
-        level,
-        max_lines,
-        tail_lines,
-        &read_config,
-        // Apply the cap to stdin too. Piping a huge unrecognised file via
-        // `cat … | rtk read -` should give the same protection as reading
-        // it directly. The marker tells the consumer it was capped and how
-        // to recover full content if they need it.
-        true,
-        "(stdin)",
-        verbose,
-    );
+    let filtered = if let Some(extracted) = intent.and_then(|i| {
+        intent_extractor::extract_for_intent(&content, None, lang, i, "(stdin)")
+    }) {
+        extracted
+    } else {
+        render_output(
+            &content,
+            None,
+            lang,
+            level,
+            max_lines,
+            tail_lines,
+            &read_config,
+            // Apply the cap to stdin too. Piping a huge unrecognised file via
+            // `cat … | rtk read -` should give the same protection as reading
+            // it directly. The marker tells the consumer it was capped and how
+            // to recover full content if they need it.
+            true,
+            "(stdin)",
+            verbose,
+        )
+    };
 
     let rtk_output = if line_numbers {
         format_with_line_numbers(&filtered)
@@ -341,7 +363,7 @@ fn main() {{
         )?;
 
         // Just verify it doesn't panic
-        run(file.path(), FilterLevel::Minimal, None, None, false, 0)?;
+        run(file.path(), FilterLevel::Minimal, None, None, false, None, 0)?;
         Ok(())
     }
 

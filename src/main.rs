@@ -111,6 +111,13 @@ enum Commands {
         /// Show line numbers
         #[arg(short = 'n', long)]
         line_numbers: bool,
+        /// Surgical extraction: score heading-anchored sections by lexical
+        /// match against the intent terms and return only the top matches
+        /// + head/tail bookends. Only applies when file > 5KB and the
+        /// splitter finds ≥ 3 sections; otherwise falls back to the normal
+        /// render path. See issue #151.
+        #[arg(long)]
+        intent: Option<String>,
     },
 
     /// Generate 2-line technical summary (heuristic-based)
@@ -3055,9 +3062,11 @@ fn run_cli() -> Result<i32> {
             max_lines,
             tail_lines,
             line_numbers,
+            intent,
         } => {
             let mut had_error = false;
             let mut stdin_seen = false;
+            let intent_ref = intent.as_deref();
             for file in &files {
                 let result = if file == Path::new("-") {
                     if stdin_seen {
@@ -3065,7 +3074,14 @@ fn run_cli() -> Result<i32> {
                         continue;
                     }
                     stdin_seen = true;
-                    read::run_stdin(level, max_lines, tail_lines, line_numbers, cli.verbose)
+                    read::run_stdin(
+                        level,
+                        max_lines,
+                        tail_lines,
+                        line_numbers,
+                        intent_ref,
+                        cli.verbose,
+                    )
                 } else {
                     read::run(
                         file,
@@ -3073,6 +3089,7 @@ fn run_cli() -> Result<i32> {
                         max_lines,
                         tail_lines,
                         line_numbers,
+                        intent_ref,
                         cli.verbose,
                     )
                 };
