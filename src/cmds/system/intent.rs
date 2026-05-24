@@ -414,18 +414,17 @@ fn assemble_output(
 fn take_capped<'a, I: Iterator<Item = &'a str>>(iter: I, max_bytes: usize) -> String {
     const TRUNCATION_MARKER: &str = " …[truncated]";
     let mut out = String::new();
+    let mut truncated = false;
     for line in iter {
         // Peer-review #163 Q4a: only charge the separator newline when
         // there's already content; without this, an exactly-fitting first
         // line was falsely treated as overflow.
         let separator_cost = if out.is_empty() { 0 } else { 1 };
         if out.len() + line.len() + separator_cost > max_bytes {
-            // Peer-review #163 Q4b: if the cap is smaller than the marker
-            // itself, emitting "marker alone" exceeds the nominal cap.
-            // Honour the cap strictly — return empty rather than over-emit.
             if out.is_empty() && max_bytes >= TRUNCATION_MARKER.len() {
-                // First line already exceeds cap. Keep the largest valid-
-                // UTF-8 prefix that fits below (cap - marker.len()) bytes.
+                // First-line overflow case where the marker fits inline.
+                // Keep the largest UTF-8-valid prefix that fits below
+                // (cap - marker.len()) bytes, then append the marker.
                 let cap = max_bytes.saturating_sub(TRUNCATION_MARKER.len());
                 let end = line
                     .char_indices()
@@ -435,6 +434,12 @@ fn take_capped<'a, I: Iterator<Item = &'a str>>(iter: I, max_bytes: usize) -> St
                     .unwrap_or(0);
                 out.push_str(&line[..end]);
                 out.push_str(TRUNCATION_MARKER);
+            } else {
+                // Later-line boundary truncation, OR first-line with cap
+                // too small for the marker. Flag so the post-loop block
+                // can decide whether to append a stand-alone marker.
+                // Peer-review #163 round-2 (agy YELLOW).
+                truncated = true;
             }
             break;
         }
@@ -442,6 +447,15 @@ fn take_capped<'a, I: Iterator<Item = &'a str>>(iter: I, max_bytes: usize) -> St
             out.push('\n');
         }
         out.push_str(line);
+    }
+    // Late-truncation marker: when truncation happened at a later-line
+    // boundary, signal it to the caller — silent line-dropping is the
+    // round-2 YELLOW concern. Never push past the cap: if the marker
+    // doesn't fit in the remaining budget, skip silently (matches the
+    // first-line-too-small-for-marker behaviour above).
+    if truncated && !out.is_empty() && out.len() + 1 + TRUNCATION_MARKER.len() <= max_bytes {
+        out.push('\n');
+        out.push_str(TRUNCATION_MARKER);
     }
     out
 }
@@ -715,6 +729,56 @@ mod tests {
         assert!(out.ends_with("…[truncated]"), "marker must be present: {out:?}");
         // Output is valid UTF-8 by construction (String guarantees this) —
         // the real test is that the function didn't panic.
+    }
+
+    #[test]
+    fn take_capped_marks_late_truncation_when_budget_allows() {
+        // Peer-review #163 round-2 (agy YELLOW): when truncation happens at
+        // a later-line boundary (out non-empty, next line would overflow),
+        // the caller must SEE that truncation occurred rather than getting
+        // silently clean output.
+        //
+        // Fixture math: each line is 20 bytes. Two lines + separator = 41
+        // bytes. Adding a 3rd line + separator would be 62 bytes. Marker
+        // with separator is 16 bytes. Cap=60 lets 2 lines + marker fit
+        // (41+16=57) but rejects the 3rd line (62>60).
+        let lines = vec![
+            "aaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccc",
+            "dddddddddddddddddddd",
+        ];
+        let out = take_capped(lines.iter().copied(), 60);
+        assert!(
+            out.starts_with("aaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb"),
+            "first two lines must be present: {out:?}"
+        );
+        assert!(
+            out.ends_with("[truncated]"),
+            "late-truncation marker must signal that content was dropped: {out:?}"
+        );
+        assert!(
+            !out.contains("cccc"),
+            "third line must NOT be in output (overflow): {out:?}"
+        );
+    }
+
+    #[test]
+    fn take_capped_omits_late_marker_when_budget_too_tight() {
+        // Same shape but cap is exactly the size of two lines + separator
+        // with no remaining budget for the marker. Must omit silently
+        // rather than push past cap.
+        let lines = vec![
+            "aaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccc",
+        ];
+        // 20 + 1 + 20 = 41 bytes exactly.
+        let out = take_capped(lines.iter().copied(), 41);
+        assert_eq!(
+            out, "aaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb",
+            "marker must be omitted when no budget for it: {out:?}"
+        );
     }
 
     #[test]
