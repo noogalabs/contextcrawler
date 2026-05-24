@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="ContextCrawler — Princess Donut says: Dammit Claude!" width="480">
+  <img src="docs/assets/logo.png" alt="ContextCrawler — Princess Donut says: Dammit exec()!" width="480">
 </p>
 
 # ContextCrawler
