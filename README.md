@@ -2,6 +2,14 @@
   <img src="docs/assets/logo.png" alt="ContextCrawler — Princess Donut says: Dammit exec()!" width="480">
 </p>
 
+### A note from the author
+
+[rtk-ai/rtk](https://github.com/rtk-ai/rtk) gave me the clean CLI proxy. [contextzip](https://github.com/jee599/contextzip) folded in the session and stacktrace compactors I kept reaching for. [Tirith](https://tirith.sh) gave me a real shell-syntax gate. I was meant to just *use* them. Instead I keep bolting more crap on: supply-chain gate, discover command, web extractor, session manager. I genuinely cannot stop.
+
+The fluffy ragdoll up top is my recurring mascot, same one on the blog, same one anywhere I need a logo. Hat tip to **Matt Dinniman** ([Dungeon Crawler Carl](https://en.wikipedia.org/wiki/Dungeon_Crawler_Carl)) for the recent-reading inspiration behind the "Dammit exec()!" line.
+
+Thanks **[rtk](https://github.com/rtk-ai/rtk)**, **[contextzip](https://github.com/jee599/contextzip)** and **[Tirith](https://tirith.sh)** for the bones. Sorry upstream for the bolt-ons. Not sorry for the cat.
+
 # ContextCrawler
 
 > [!WARNING]
