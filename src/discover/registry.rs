@@ -3,7 +3,7 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{extract_substitutions, split_on_operators, tokenize, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -494,6 +494,47 @@ fn strip_trailing_redirects(cmd: &str) -> (&str, &str) {
     (cmd_part, redir_part)
 }
 
+/// #166: classify a single Redirect token's effect on the producing
+/// command's stdout. Returns `true` when the redirect diverts stdout
+/// away from where it would otherwise go (model/terminal). Returns
+/// `false` when stdout is unaffected (stderr-only redirect, stdin
+/// redirect, heredoc).
+///
+/// Examples:
+/// - `">"`, `">>"`, `"1>"`, `"1>>"`, `"&>"`, `"&>>"` — stdout to file
+/// - `">&2"`, `"1>&2"`, `"1>&-"` — stdout duped or closed
+/// - `"2>"`, `"2>>"`, `"2>&1"`, `"2>&-"` — stderr-only, stdout safe
+/// - `"<"`, `"<<"`, `"<<<"` — stdin, stdout safe
+///
+/// Fail-closed: an unrecognised redirect token returns `true` (treat as
+/// stdout-affecting) so we never rewrite an unknown construct.
+fn redirect_affects_stdout(redirect_token: &str) -> bool {
+    let t = redirect_token.trim();
+    // Stdin / heredoc — never affects stdout.
+    if t.starts_with('<') {
+        return false;
+    }
+    // Stderr-source forms: `2>`, `2>>`, `2>&1`, `2>&-`, etc.
+    // These divert stderr, not stdout.
+    if let Some(rest) = t.strip_prefix("2>") {
+        // `2>&N` where N is `1` or `-` is stderr-source. `2>&0` would be
+        // unusual but still stderr-source.
+        let _ = rest;
+        return false;
+    }
+    // Everything else is stdout-affecting:
+    //   `>`, `>>`, `1>`, `1>>`, `&>`, `&>>`, `>&2`, `1>&2`, `>&-`, etc.
+    true
+}
+
+/// #166: true if any trailing-redirect token on this segment diverts
+/// stdout away from the model. Inspects `tokenize(cmd)` once.
+fn segment_stdout_is_redirected(cmd: &str) -> bool {
+    tokenize(cmd)
+        .iter()
+        .any(|t| t.kind == TokenKind::Redirect && redirect_affects_stdout(&t.value))
+}
+
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
 ///
 /// Handles compound commands (`&&`, `||`, `;`) by rewriting each segment independently.
@@ -591,21 +632,18 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe => {
+                // #166: a command whose stdout is piped MUST NOT be
+                // rewritten. The pipeline consumer depends on the
+                // producer's exact bytes; substituting `contextcrawler
+                // <cmd>` changes those bytes and silently changes the
+                // consumer's answer (e.g. `grep ... | wc -l` counts the
+                // filtered lines, not the raw matches).
+                //
+                // Keep the producer segment AND the rest of the pipe
+                // chain (everything up to the next `&&`/`||`/`;`/`&`)
+                // exactly as the user typed it.
                 let seg = cmd[seg_start..tok.offset].trim();
-                let is_pipe_incompatible = seg.starts_with("find ")
-                    || seg == "find"
-                    || seg.starts_with("fd ")
-                    || seg == "fd";
-                let rewritten = if is_pipe_incompatible {
-                    seg.to_string()
-                } else {
-                    rewrite_segment(seg, excluded, transparent_prefixes)
-                        .unwrap_or_else(|| seg.to_string())
-                };
-                if rewritten != seg {
-                    any_changed = true;
-                }
-                result.push_str(&rewritten);
+                result.push_str(seg);
 
                 let pipe_group_end = tokens.iter().find(|t| {
                     t.offset > tok.offset
@@ -809,6 +847,32 @@ fn rewrite_segment_inner(
             return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
                 .map(|rewritten| format!("{} {}", prefix, rewritten));
         }
+    }
+
+    // #166: if ANY redirect on this segment diverts stdout away from the
+    // model (e.g. `>file`, `&>file`, `>&2`), skip rewrite entirely. The
+    // user asked for the raw bytes to land at the redirect target;
+    // replacing the command with `contextcrawler <cmd>` would land
+    // filtered bytes instead and silently produce wrong output. Only
+    // stderr-source redirects (`2>file`, `2>&1`, `2>&-`) and stdin
+    // redirects (`<file`) leave stdout intact and are safe to rewrite.
+    if segment_stdout_is_redirected(trimmed) {
+        return None;
+    }
+
+    // #166: command substitution `$(...)`, backticks, and process
+    // substitution `<(...)` / `>(...)` all execute a subshell whose
+    // output is interpolated into the surrounding command. Rewriting
+    // the OUTER command can silently change what the substitution
+    // feeds in (process subst), and we cannot rewrite the INNER without
+    // re-parsing it as a fresh command — out of scope for the simple
+    // rewrite engine. Fail closed: leave the whole segment raw.
+    //
+    // `extract_substitutions` returns one entry per `$(...)`, backtick
+    // and `<(...)`/`>(...)` construct found at any quoting depth, so a
+    // non-empty list means at least one is present.
+    if !extract_substitutions(trimmed).is_empty() {
+        return None;
     }
 
     // Strip trailing stderr/stdout redirects before matching (#530)
@@ -1694,10 +1758,14 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_first_only() {
-        // After a pipe, the filter command stays raw
+        // #166: a command whose stdout is piped MUST NOT be rewritten.
+        // The pipeline consumer (here, `grep feat`) depends on the producer's
+        // exact output format; replacing `git log -10` with `contextcrawler
+        // git log -10` would change the producer's bytes and silently change
+        // the consumer's answer. Leave the whole pipeline raw.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("contextcrawler git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -1884,9 +1952,11 @@ mod tests {
 
     #[test]
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
+        // #166: stdout (including the merged stderr) is piped to `head`
+        // — the producer must stay raw.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | head", &[]),
-            Some("contextcrawler cargo test 2>&1 | head".into())
+            None
         );
     }
 
@@ -1917,18 +1987,22 @@ mod tests {
 
     #[test]
     fn test_rewrite_redirect_amp_gt_devnull() {
+        // #166: `&>` redirects BOTH stdout and stderr to a file. The user
+        // asked for the raw bytes in the file — must not rewrite.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test &>/dev/null", &[]),
-            Some("contextcrawler cargo test &>/dev/null".into())
+            None
         );
     }
 
     #[test]
     fn test_rewrite_redirect_double() {
-        // Double redirect: only last one stripped, but full command rewrites correctly
+        // #166: `2>&1 >/dev/null` — the trailing `>/dev/null` redirects
+        // stdout to a file, so the user wanted raw bytes in /dev/null
+        // (or wherever). Must not rewrite.
         assert_eq!(
             rewrite_command_no_prefixes("git status 2>&1 >/dev/null", &[]),
-            Some("contextcrawler git status 2>&1 >/dev/null".into())
+            None
         );
     }
 
@@ -3330,18 +3404,20 @@ mod tests {
 
     #[test]
     fn test_rewrite_compound_pipe_raw_filter() {
-        // Pipe: rewrite first segment only, pass through rest unchanged
+        // #166: pipeline producer must stay raw, otherwise the consumer
+        // sees filtered bytes and silently produces a wrong answer.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            Some("contextcrawler cargo test | grep FAILED".into())
+            None
         );
     }
 
     #[test]
     fn test_rewrite_compound_pipe_git_grep() {
+        // #166: same — the producer stays raw inside a pipeline.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("contextcrawler git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -3876,9 +3952,15 @@ mod tests {
 
     #[test]
     fn test_rewrite_command_substitution_passthrough() {
+        // #166: a command containing $(...) executes the inner in a
+        // subshell whose output is interpolated as an arg. Rewriting
+        // the outer to `contextcrawler git log $(...)` would route the
+        // inner result through the contextcrawler filter, which may
+        // mangle the resolved arg (e.g. a commit hash with surrounding
+        // commit metadata). Fail closed: leave the whole thing raw.
         assert_eq!(
             rewrite_command_no_prefixes("git log $(git rev-parse HEAD~1)", &[]),
-            Some("contextcrawler git log $(git rev-parse HEAD~1)".into())
+            None
         );
     }
 
@@ -4134,9 +4216,12 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_then_and() {
+        // #166: the pipe branch (`git log | head -5`) stays raw; the `&&`
+        // branch (`git stash`) is a separate simple command whose stdout
+        // goes to the model — rewrite it normally.
         assert_eq!(
             rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("contextcrawler git log | head -5 && contextcrawler git stash".into())
+            Some("git log | head -5 && contextcrawler git stash".into())
         );
     }
 
@@ -4144,7 +4229,7 @@ mod tests {
     fn test_rewrite_pipe_then_semicolon() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("contextcrawler cargo test | head; contextcrawler git status".into())
+            Some("cargo test | head; contextcrawler git status".into())
         );
     }
 
@@ -4152,26 +4237,29 @@ mod tests {
     fn test_rewrite_pipe_then_or() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("contextcrawler cargo test | grep FAIL || contextcrawler git stash".into())
+            Some("cargo test | grep FAIL || contextcrawler git stash".into())
         );
     }
 
     #[test]
     fn test_rewrite_env_pipe_then_and() {
+        // #166: env-prefixed pipeline producer also stays raw.
         assert_eq!(
             rewrite_command_no_prefixes(
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 contextcrawler cargo test 2>&1 | grep FAILED && contextcrawler git stash".into())
+            Some("RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && contextcrawler git stash".into())
         );
     }
 
     #[test]
     fn test_rewrite_and_then_pipe() {
+        // #166: left branch is a simple command with terminal stdout
+        // (rewrite). Right branch is a pipeline producer (stay raw).
         assert_eq!(
             rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("contextcrawler git status && contextcrawler cargo test | grep FAIL".into())
+            Some("contextcrawler git status && cargo test | grep FAIL".into())
         );
     }
 
@@ -4179,7 +4267,266 @@ mod tests {
     fn test_rewrite_multi_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("contextcrawler git log | head | tail && contextcrawler git status".into())
+            Some("git log | head | tail && contextcrawler git status".into())
+        );
+    }
+
+    // --- #166: pipeline-safe + redirection-safe rewrite ---
+
+    /// The original bug report. `grep ... | wc -l` MUST count the raw grep
+    /// output, not the filtered output. Skip rewriting the pipeline
+    /// producer entirely.
+    #[test]
+    fn issue_166_grep_into_wc_is_not_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes(r#"grep -R "fn " src/analytics | wc -l"#, &[]),
+            None
+        );
+    }
+
+    /// Stdout redirected to a file. The user explicitly asked for the raw
+    /// bytes to land in the file, not the filtered ones.
+    #[test]
+    fn issue_166_stdout_redirect_is_not_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo check >/tmp/build.log", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_stdout_redirect_with_space_is_not_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("ls -la src > /tmp/f.txt", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_stdout_append_redirect_is_not_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status >> /tmp/log.txt", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_amp_gt_redirect_is_not_rewritten() {
+        // `&>file` redirects BOTH stdout and stderr — must not rewrite.
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo test &>/dev/null", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_amp_gt_gt_redirect_is_not_rewritten() {
+        // `&>>file` is the append form of `&>` — both streams redirected.
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo test &>>/tmp/log", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_explicit_fd1_redirect_is_not_rewritten() {
+        // `1>file` is the same as `>file` — stdout to a file.
+        assert_eq!(
+            rewrite_command_no_prefixes("git status 1>/tmp/out", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_2_then_1_swap_then_devnull_not_rewritten() {
+        // `2>&1 >/dev/null` — stdout to /dev/null, stderr to original
+        // stdout (which is terminal). The `>` redirects stdout, so skip.
+        assert_eq!(
+            rewrite_command_no_prefixes("git status 2>&1 >/dev/null", &[]),
+            None
+        );
+    }
+
+    /// `2>file` redirects ONLY stderr. Stdout still goes to the model, so
+    /// rewriting is safe. The filter is applied to stdout; stderr is
+    /// untouched in either case.
+    #[test]
+    fn issue_166_stderr_only_redirect_is_still_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo check 2>/tmp/err.log", &[]),
+            Some("contextcrawler cargo check 2>/tmp/err.log".into())
+        );
+    }
+
+    /// `2>&1` alone (no other redirect) merges stderr INTO stdout. Stdout
+    /// still goes to the model, so rewriting is safe.
+    #[test]
+    fn issue_166_stderr_to_stdout_merge_only_is_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo test 2>&1", &[]),
+            Some("contextcrawler cargo test 2>&1".into())
+        );
+    }
+
+    /// `2>&-` closes stderr — stdout still goes to the model.
+    #[test]
+    fn issue_166_close_stderr_is_still_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status 2>&-", &[]),
+            Some("contextcrawler git status 2>&-".into())
+        );
+    }
+
+    /// Command substitution payload must not be rewritten — the outer
+    /// `echo` already passes through `classify_command` as Unsupported
+    /// (not in the rules table), but assert the outer result for any
+    /// command shape we DO recognise.
+    #[test]
+    fn issue_166_command_substitution_is_not_rewritten() {
+        // The outer `git status` is wrapped in $(...) for substitution.
+        // Substitution payloads execute in a subshell that captures
+        // stdout into the surrounding command — rewriting the inner
+        // would silently change what `echo` prints.
+        // Today this entire shape (echo $(...)) is Unsupported at the
+        // outer level (echo is not in rules), so the rewrite returns
+        // None. Guard that until/unless echo gets a filter; the inner
+        // payload must not leak a rewrite either.
+        assert_eq!(
+            rewrite_command_no_prefixes("echo $(git status)", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_backtick_substitution_is_not_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("echo `git status`", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_166_heredoc_is_not_rewritten() {
+        // Pre-existing behaviour but assert it explicitly under #166.
+        assert_eq!(
+            rewrite_command_no_prefixes("cat <<EOF\nhello\nEOF", &[]),
+            None
+        );
+    }
+
+    /// Baseline that the fix does NOT regress: a simple `git status`
+    /// with stdout going to the model still rewrites.
+    #[test]
+    fn issue_166_simple_command_still_rewrites() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status", &[]),
+            Some("contextcrawler git status".into())
+        );
+    }
+
+    /// `cmd1 && cmd2` where both branches are simple terminal-stdout
+    /// commands — both rewrite.
+    #[test]
+    fn issue_166_and_chain_both_branches_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status && cargo check", &[]),
+            Some("contextcrawler git status && contextcrawler cargo check".into())
+        );
+    }
+
+    /// Nested shells (`sh -lc '...'`) currently bypass rewrite — assert
+    /// that explicitly so the safer-than-rewriting-blindly behaviour
+    /// noted in the issue is locked in.
+    #[test]
+    fn issue_166_nested_shell_bypasses_rewrite() {
+        assert_eq!(
+            rewrite_command_no_prefixes("sh -lc 'git status'", &[]),
+            None
+        );
+    }
+
+    /// Process substitution (`<(...)`, `>(...)`) — the outer command
+    /// connects to the substitution via a pipe-like file descriptor.
+    /// Rewriting the outer would change what the substitution reads.
+    /// At minimum the inner payload must not leak a rewrite; today the
+    /// outer command is whatever the user typed (often `diff` or `cat`
+    /// — not in the rules table). Assert that a recognised outer with
+    /// process substitution is not rewritten.
+    #[test]
+    fn issue_166_process_substitution_outer_not_rewritten() {
+        // `diff <(git status) <(git status)` — `diff` is not in the
+        // rules table, returns None. The behaviour we lock in here is
+        // that a process substitution token does not cause the inner
+        // `git status` to leak out as a rewrite of the whole command.
+        let out = rewrite_command_no_prefixes("diff <(git status) <(git status)", &[]);
+        assert!(
+            out.is_none() || !out.as_deref().unwrap_or("").starts_with("contextcrawler "),
+            "process substitution must not produce a rewrite of the outer command: {:?}",
+            out
+        );
+    }
+
+    // --- Security-review lockdown tests (codex + agy round, #166) ---
+    //
+    // The peer review verified the bug class is closed but flagged four edge
+    // cases worth pinning in tests so a future lexer or rewrite-engine refactor
+    // can't silently regress the guarantee.
+
+    /// No-space chained redirect: `2>&1>file`. Agy hypothesised the lexer
+    /// could emit a single `2>&1>file` token whose `strip_prefix("2>")`
+    /// succeeds and trips fail-open. Verified in lexer.rs — the trailing `>`
+    /// after `2>&1` starts a separate Redirect token, so
+    /// `segment_stdout_is_redirected` sees the bare `>` and skips. Lock it in.
+    #[test]
+    fn issue_166_no_space_2to1_to_file_is_not_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status 2>&1>/tmp/x", &[]),
+            None
+        );
+    }
+
+    /// `|&` is bash 4+ shorthand for `2>&1 |`. The lexer tokenises this as
+    /// Pipe + Shellism rather than a single token, so the producer is not
+    /// rewritten. Importantly, assert no corrupted `contextcrawler` token
+    /// leaks into the right-hand side of the chain even when the producer
+    /// would otherwise be a rewrite candidate.
+    #[test]
+    fn issue_166_amp_pipe_does_not_corrupt_rhs() {
+        let out = rewrite_command_no_prefixes("cargo test |& head", &[]);
+        // Must not produce a rewrite (producer is in a pipe), and must not
+        // emit `contextcrawler` anywhere in the chain — that would mean the
+        // engine spliced output halfway through a corrupted shell line.
+        assert!(
+            out.is_none() || !out.as_deref().unwrap_or("").contains("contextcrawler"),
+            "|& shorthand must not corrupt the chain with a rewrite: {:?}",
+            out
+        );
+    }
+
+    /// Process substitution combined with a pipe consumer. The outer command
+    /// (`cat`) is not in the rules table, but pinning the combined shape
+    /// guards against a future change that adds `cat` to the rules table —
+    /// the process-substitution + pipe combination must still skip rewrite.
+    #[test]
+    fn issue_166_process_subst_into_pipe_is_not_rewritten() {
+        let out = rewrite_command_no_prefixes("cat <(git log) | head", &[]);
+        assert!(
+            out.is_none() || !out.as_deref().unwrap_or("").starts_with("contextcrawler "),
+            "process subst piped into another command must not rewrite the outer: {:?}",
+            out
+        );
+    }
+
+    /// Pipe consumer carries a trailing stdout redirect: `git log | tee f > /dev/null`.
+    /// The producer (`git log`) feeds `tee`, whose stdout goes to /dev/null.
+    /// If the engine ever started inspecting only the last segment's redirect
+    /// it could erroneously decide the chain is "safe to rewrite the producer".
+    /// Producer in any pipeline must stay raw.
+    #[test]
+    fn issue_166_pipe_with_consumer_redirect_producer_stays_raw() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tee f > /dev/null", &[]),
+            None
         );
     }
 }
