@@ -25,7 +25,7 @@ use super::integrity;
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 
 // Embedded Pi extension (auto-rewrite via createBashTool spawnHook)
-const PI_EXTENSION: &str = include_str!("../../hooks/pi/rtk-extension.ts");
+const PI_EXTENSION: &str = include_str!("../../hooks/pi/rtk-extension.ts"); // branding-lint: allow legacy
 
 // ─── Unified guidance ──────────────────────────────────────────────────────
 //
@@ -3028,7 +3028,7 @@ fn strip_rtk_block_from_file(
             );
         } else {
             println!(
-                "[dry-run] would remove RTK guidance block from {}: {}",
+                "[dry-run] would remove ContextCrawler guidance block from {}: {}",
                 label,
                 path.display()
             );
@@ -3048,7 +3048,7 @@ fn strip_rtk_block_from_file(
         atomic_write(path, &stripped)
             .with_context(|| format!("Failed to write {}: {}", label, path.display()))?;
         if verbose > 0 {
-            eprintln!("Removed RTK guidance block from {}: {}", label, path.display());
+            eprintln!("Removed ContextCrawler guidance block from {}: {}", label, path.display());
         }
     }
 
@@ -5122,7 +5122,7 @@ mod tests {
         assert!(after.contains("Keep me."), "user content preserved");
         assert!(
             !after.contains(RTK_BLOCK_START),
-            "RTK marker must be gone after uninstall"
+            "ContextCrawler marker must be gone after uninstall"
         );
     }
 
