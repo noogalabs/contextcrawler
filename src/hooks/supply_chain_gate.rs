@@ -263,10 +263,18 @@ struct ParsedInstall {
     unvettable: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Ecosystem {
     Npm,
     Pypi,
+    /// Ecosystem-agnostic finding. Used for synthetic `ParsedInstall`s
+    /// emitted in fail-closed paths where the gate detected something
+    /// install-shaped but cannot resolve the actual ecosystem (e.g. the
+    /// recursion-depth cap surfacing a nested payload it refuses to
+    /// inspect). Always paired with `unvettable: Some(...)` so the caller
+    /// short-circuits to `Verdict::Ask` before any registry routing or
+    /// config lookup is attempted. See #147.
+    Unknown,
 }
 
 impl Ecosystem {
@@ -274,6 +282,7 @@ impl Ecosystem {
         match self {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "PyPI",
+            Ecosystem::Unknown => "unknown",
         }
     }
 }
@@ -1000,41 +1009,43 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     out
 }
 
-/// Structural dedup: collapse `ParsedInstall`s that carry the same
-/// ecosystem + package set + editable + unvettable detail. Order of the
-/// first occurrence is preserved (stable).
-fn dedup_installs(items: &mut Vec<ParsedInstall>) {
-    let mut i = 0;
-    while i < items.len() {
-        let mut j = i + 1;
-        while j < items.len() {
-            if installs_equivalent(&items[i], &items[j]) {
-                items.remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
+/// Stable canonical signature of a `ParsedInstall` for hash-based dedup.
+/// Packages are sorted so two installs listing `[a, b]` and `[b, a]`
+/// hash equal — they semantically install the same set (#146 agy LOW).
+#[derive(Hash, PartialEq, Eq)]
+struct InstallSignature {
+    ecosystem: Ecosystem,
+    has_editable: bool,
+    unvettable: Option<String>,
+    sorted_packages: Vec<(String, Option<String>)>,
+}
+
+fn install_signature(item: &ParsedInstall) -> InstallSignature {
+    let mut pkgs = item.packages.clone();
+    pkgs.sort();
+    InstallSignature {
+        ecosystem: item.ecosystem,
+        has_editable: item.has_editable,
+        unvettable: item.unvettable.clone(),
+        sorted_packages: pkgs,
     }
 }
 
+/// Structural dedup: collapse `ParsedInstall`s that carry the same
+/// ecosystem + package set + editable + unvettable detail. Order of the
+/// first occurrence is preserved (stable). O(n) — was O(n²) pairwise
+/// before #149.
+fn dedup_installs(items: &mut Vec<ParsedInstall>) {
+    let mut seen: std::collections::HashSet<InstallSignature> =
+        std::collections::HashSet::with_capacity(items.len());
+    items.retain(|item| seen.insert(install_signature(item)));
+}
+
+/// Retained for callers/tests that still want the pairwise predicate.
+/// Equivalent to comparing the two canonical signatures.
+#[cfg_attr(not(test), allow(dead_code))]
 fn installs_equivalent(a: &ParsedInstall, b: &ParsedInstall) -> bool {
-    if a.ecosystem != b.ecosystem
-        || a.has_editable != b.has_editable
-        || a.unvettable != b.unvettable
-        || a.packages.len() != b.packages.len()
-    {
-        return false;
-    }
-    // Order-independent package-set compare (agy LOW on #146): two installs
-    // listing `[a, b]` and `[b, a]` semantically install the same set and
-    // must collapse. We sort cheap clones rather than mutate inputs so the
-    // original ordering (which has display value) is preserved for callers.
-    let mut a_pkgs = a.packages.clone();
-    let mut b_pkgs = b.packages.clone();
-    a_pkgs.sort();
-    b_pkgs.sort();
-    a_pkgs == b_pkgs
+    install_signature(a) == install_signature(b)
 }
 
 /// Recursion-bounded core of [`detect_installs`]. `depth` guards against a
@@ -1072,7 +1083,11 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
     // Run UV before PIP so `uv pip install foo` is claimed by the UV pattern
     // and PIP_RE matching the inner `pip install foo` substring is suppressed
     // for that span.
-    let mut claimed: Vec<(usize, usize)> = Vec::new();
+    // Map of start-byte → end-byte for claimed spans, sorted by start.
+    // O(log n) overlap-check via `range(..=start).next_back()` — was a
+    // linear scan (`claimed.iter().any(...)`) before #149.
+    let mut claimed: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
 
     let ordered = [
         (&*UV_RE, Ecosystem::Pypi),
@@ -1102,7 +1117,7 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
             {
                 continue;
             }
-            claimed.push((start, end));
+            claimed.insert(start, end);
             let cap = match re.captures_at(&masked, start) {
                 Some(c) => c,
                 None => continue,
@@ -1168,7 +1183,7 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
         }
     } else if !extract_recursion_segments(cmd_raw).is_empty() {
         out.push(ParsedInstall {
-            ecosystem: Ecosystem::Npm, // ecosystem-agnostic; pick one
+            ecosystem: Ecosystem::Unknown, // #147 — was hardcoded Npm; relabel
             packages: Vec::new(),
             has_editable: false,
             unvettable: Some(format!(
@@ -1230,7 +1245,7 @@ fn installer_basename(tok: &str) -> &str {
 /// for the package-bearing regexes above.
 fn detect_bare_lockfile_installs(
     cmd: &str,
-    claimed: &mut Vec<(usize, usize)>,
+    claimed: &mut std::collections::BTreeMap<usize, usize>,
     out: &mut Vec<ParsedInstall>,
 ) {
     let tokens = shell_tokens(cmd);
@@ -1371,14 +1386,19 @@ fn detect_bare_lockfile_installs(
 
         if !has_package {
             // Skip if a higher-priority pattern already claimed this span.
-            if !claimed.iter().any(|(s, e)| *start >= *s && *start < *e) {
+            // O(log n) via BTreeMap range — was O(n) linear scan (#149).
+            let already_claimed = claimed
+                .range(..=*start)
+                .next_back()
+                .is_some_and(|(_, &end)| *start < end);
+            if !already_claimed {
                 // Claim the full verb span (head token through the verb
                 // token), not just the head — the end is read by no later
                 // pass today, but a short span would silently break dedup
                 // if another detector is added after this one.
                 let verb_end = tokens[verb_span_end_idx].0
                     + tokens[verb_span_end_idx].1.len();
-                claimed.push((*start, verb_end));
+                claimed.insert(*start, verb_end);
                 out.push(ParsedInstall {
                     ecosystem: eco,
                     packages: Vec::new(),
@@ -1391,6 +1411,9 @@ fn detect_bare_lockfile_installs(
                         Ecosystem::Pypi => "bare lockfile install — pulls the dependency tree \
                                             from poetry.lock/uv.lock/pyproject.toml the gate \
                                             cannot vet"
+                            .to_string(),
+                        Ecosystem::Unknown => "bare lockfile install — ecosystem could not be \
+                                               resolved; the gate cannot vet"
                             .to_string(),
                     }),
                 });
@@ -1421,6 +1444,27 @@ fn split_attached_flag(tok: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+/// pip/uv flags that take a value in the next token. These must consume
+/// their value so the value isn't misclassified as a package name. The list
+/// is intentionally pip-focused — see #145 case 3. npm equivalents are out
+/// of scope (very rare to see value-consuming flags in npm installs).
+const PIP_VALUE_CONSUMING_FLAGS: &[&str] = &[
+    // package destination
+    "-t", "--target", "--prefix", "--root",
+    // index discovery
+    "--index-url", "-i", "--extra-index-url", "--find-links", "-f",
+    // platform / interpreter targeting
+    "--platform", "--python-version", "--implementation", "--abi",
+    // network / trust
+    "--trusted-host", "--proxy", "--cert", "--client-cert",
+    // wheel / binary policy
+    "--no-binary", "--only-binary",
+    // upgrade strategy
+    "--upgrade-strategy",
+    // build / cache directories
+    "--build", "--cache-dir", "--src", "--log",
+];
+
 /// Returns (registry-package-names with optional pinned version,
 /// saw_editable_arg, lockfile_source). `lockfile_source` is `Some(detail)`
 /// when a `-r`/`--requirement`/`-c`/`--constraint` indirection flag was seen
@@ -1432,6 +1476,13 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
     let mut tokens = s.split_whitespace().peekable();
 
     while let Some(tok) = tokens.next() {
+        // Inline shell comment — the rest of the line is annotation, not
+        // packages. `pip install flask # production` previously slurped
+        // `#` and `production` as packages, both 404'd, cascaded to Ask.
+        // #145 case 2.
+        if tok.starts_with('#') {
+            break;
+        }
         if tok == "-e" || tok == "--editable" {
             editable = true;
             tokens.next();
@@ -1458,9 +1509,9 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
                 });
                 continue;
             }
-            if matches!(flag, "-t" | "--target" | "--index-url") {
+            if PIP_VALUE_CONSUMING_FLAGS.contains(&flag) {
                 // Value-bearing flag: consume the value token only when it
-                // was NOT attached with `=`.
+                // was NOT attached with `=`. #145 case 3.
                 if attached.is_none() {
                     tokens.next();
                 }
@@ -1493,6 +1544,17 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
     (pkgs, editable, lockfile_source)
 }
 
+/// Strip a PEP 508 extras suffix (`name[extra]`, `name[a,b,c]`) from a
+/// package spec. Returns the bare name portion; if no extras, returns the
+/// input unchanged. The registry lookup endpoints reject the extras form,
+/// so we must strip it before issuing the metadata call. #145 case 1.
+fn strip_pep508_extras(s: &str) -> &str {
+    match s.find('[') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
 /// Split a token like `requests==2.20.0`, `@types/node@22.10.0`, or `lodash`
 /// into (name, optional pinned version). Only exact pins (`==X`, `name@X`)
 /// are returned; ranges like `>=2.0` yield None for the version (we don't
@@ -1517,14 +1579,14 @@ fn split_name_version(s: &str) -> (String, Option<String>) {
     // pip exact pin
     if let Some(idx) = stripped.find("==") {
         return (
-            stripped[..idx].to_string(),
+            strip_pep508_extras(&stripped[..idx]).to_string(),
             Some(stripped[idx + 2..].to_string()),
         );
     }
     // pip range specifiers — drop the spec, leave version None
     for sep in [">=", "<=", "~=", "!=", ">", "<"] {
         if let Some(idx) = stripped.find(sep) {
-            return (stripped[..idx].to_string(), None);
+            return (strip_pep508_extras(&stripped[..idx]).to_string(), None);
         }
     }
     // npm: name@version
@@ -1534,7 +1596,7 @@ fn split_name_version(s: &str) -> (String, Option<String>) {
             Some(stripped[idx + 1..].to_string()),
         );
     }
-    (stripped.to_string(), None)
+    (strip_pep508_extras(stripped).to_string(), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1571,32 +1633,102 @@ fn read_body(resp: ureq::Response) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-fn http_get_json(url: &str) -> Result<Value, String> {
-    let mut req = ureq::get(url)
-        .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
-        .timeout(StdDuration::from_secs(8));
-    // Request npm's abbreviated metadata where applicable — ~100x smaller.
-    // PyPI ignores the header, so it is safe to send unconditionally for npm
-    // hosts only.
-    if url.starts_with("https://registry.npmjs.org/") {
-        req = req.set("Accept", NPM_ABBREVIATED_ACCEPT);
+/// Per-attempt HTTP timeout. With one retry on transient errors, total
+/// wall-clock per call is bounded by `2 * HTTP_ATTEMPT_TIMEOUT +
+/// HTTP_RETRY_BACKOFF`. Kept well under `CHECK_WALL_BUDGET` so a single
+/// slow package can't blow the whole install's budget.
+const HTTP_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const HTTP_MAX_RETRIES: u32 = 1;
+const HTTP_RETRY_BACKOFF: StdDuration = StdDuration::from_millis(250);
+
+/// Lightweight tag for classifying an HTTP failure. Separated from
+/// `ureq::Error` so the policy can be unit-tested without constructing a
+/// real `ureq::Response`/`ureq::Transport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpErrTag {
+    Status(u16),
+    Transport,
+}
+
+/// Should we retry after a failure of shape `tag`? Yes for transport-level
+/// failures (DNS hiccup, connection reset, read timeout) and 5xx responses
+/// (registry unhealthy, transient overload). No for 4xx — those signal a
+/// terminal problem with the request (package missing, auth, rate-limit)
+/// where an immediate retry just adds load and won't change the outcome.
+fn is_retryable_http_err_tag(tag: HttpErrTag) -> bool {
+    match tag {
+        HttpErrTag::Status(code) => (500..600).contains(&code),
+        HttpErrTag::Transport => true,
     }
-    let resp = req
-        .call()
-        .map_err(|e| format!("HTTP {}: {}", url, e))?;
-    let buf = read_body(resp)?;
-    serde_json::from_slice(&buf).map_err(|e| e.to_string())
+}
+
+fn is_retryable_http_err(e: &ureq::Error) -> bool {
+    let tag = match e {
+        ureq::Error::Status(code, _) => HttpErrTag::Status(*code),
+        ureq::Error::Transport(_) => HttpErrTag::Transport,
+    };
+    is_retryable_http_err_tag(tag)
+}
+
+fn http_get_json(url: &str) -> Result<Value, String> {
+    let mut last_err: Option<String> = None;
+    for attempt in 0..=HTTP_MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(HTTP_RETRY_BACKOFF);
+        }
+        let mut req = ureq::get(url)
+            .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
+            .timeout(HTTP_ATTEMPT_TIMEOUT);
+        // Request npm's abbreviated metadata where applicable — ~100x smaller.
+        // PyPI ignores the header, so it is safe to send unconditionally for npm
+        // hosts only.
+        if url.starts_with("https://registry.npmjs.org/") {
+            req = req.set("Accept", NPM_ABBREVIATED_ACCEPT);
+        }
+        match req.call() {
+            Ok(resp) => {
+                let buf = read_body(resp)?;
+                return serde_json::from_slice(&buf).map_err(|e| e.to_string());
+            }
+            Err(e) => {
+                let retryable = is_retryable_http_err(&e);
+                last_err = Some(format!("HTTP {}: {}", url, e));
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("HTTP {}: no attempts", url)))
 }
 
 fn http_post_json(url: &str, body: &Value) -> Result<Value, String> {
-    let resp = ureq::post(url)
-        .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
-        .set("Content-Type", "application/json")
-        .timeout(StdDuration::from_secs(8))
-        .send_string(&body.to_string())
-        .map_err(|e| format!("HTTP {}: {}", url, e))?;
-    let buf = read_body(resp)?;
-    serde_json::from_slice(&buf).map_err(|e| e.to_string())
+    let payload = body.to_string();
+    let mut last_err: Option<String> = None;
+    for attempt in 0..=HTTP_MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(HTTP_RETRY_BACKOFF);
+        }
+        let resp = ureq::post(url)
+            .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
+            .set("Content-Type", "application/json")
+            .timeout(HTTP_ATTEMPT_TIMEOUT)
+            .send_string(&payload);
+        match resp {
+            Ok(r) => {
+                let buf = read_body(r)?;
+                return serde_json::from_slice(&buf).map_err(|e| e.to_string());
+            }
+            Err(e) => {
+                let retryable = is_retryable_http_err(&e);
+                last_err = Some(format!("HTTP {}: {}", url, e));
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("HTTP {}: no attempts", url)))
 }
 
 /// Resolve (version, publish_time) for the package. If `pinned` is Some, use
@@ -1870,6 +2002,47 @@ fn cache_put(eco: Ecosystem, pkg: &str, version: &str, publish: &DateTime<Utc>) 
     }
 }
 
+/// Does `cmd` open with a leading `NAME=VALUE` assignment (possibly preceded
+/// by sibling assignments and whitespace), and is that assignment for `name`
+/// with a value in `allowed`?
+///
+/// Used so `CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install x` bypasses the
+/// gate the same way the user reads the hint suggests. Only the *leading*
+/// run of assignments counts — once we see a non-assignment token, the
+/// rest of the cmd is ignored. (Mid-cmd `&& FOO=bar baz` does not bypass.)
+///
+/// Conservative on value parsing: unquoted values are anything up to the
+/// next whitespace; quoted values are not supported in v1 (the bypass
+/// values we care about are short bareword tokens like `off`/`0`/`false`).
+fn cmd_has_leading_assignment(cmd: &str, name: &str, allowed: &[&str]) -> bool {
+    let mut rest = cmd.trim_start();
+    while !rest.is_empty() {
+        // Pull off the next whitespace-delimited token.
+        let tok_end = rest
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len());
+        let token = &rest[..tok_end];
+        // POSIX-shape assignment: NAME=VALUE where NAME is identifier-safe.
+        let Some(eq_idx) = token.find('=') else {
+            // First non-assignment token ends the leading run.
+            return false;
+        };
+        let (n, rhs) = (&token[..eq_idx], &token[eq_idx + 1..]);
+        if n.is_empty()
+            || !n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        if n == name && allowed.iter().any(|v| *v == rhs) {
+            return true;
+        }
+        // Advance past this assignment + any whitespace before the next token.
+        rest = rest[tok_end..].trim_start();
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -1881,6 +2054,18 @@ pub fn check(cmd: &str) -> Verdict {
         return Verdict::Skip;
     }
     if std::env::var("CONTEXTCRAWLER_SUPPLY_CHAIN").as_deref() == Ok("off") {
+        return Verdict::Skip;
+    }
+    // Also honour an inline leading-prefix bypass, which is what the gate's
+    // own error messages suggest (`Overrides: rerun with
+    // CONTEXTCRAWLER_SUPPLY_CHAIN=off …`). Without this branch the user
+    // sees the hint, runs the suggested form, and is still blocked — the
+    // inline assignment scopes to the subprocess, not to this hook. See #181.
+    if cmd_has_leading_assignment(
+        cmd,
+        "CONTEXTCRAWLER_SUPPLY_CHAIN",
+        &["off", "0", "false", "no"],
+    ) {
         return Verdict::Skip;
     }
 
@@ -1932,6 +2117,12 @@ pub fn check(cmd: &str) -> Verdict {
         let eco_cfg = match install.ecosystem {
             Ecosystem::Npm => &config.npm,
             Ecosystem::Pypi => &config.pypi,
+            // Unknown is always paired with `unvettable: Some(...)` which
+            // short-circuits to Ask above this point — so this arm is
+            // unreachable in practice. Fall back to npm config for the
+            // benefit of any future code path that surfaces Unknown
+            // without the unvettable shortcut.
+            Ecosystem::Unknown => &config.npm,
         };
         let block_threshold = Severity::parse(&eco_cfg.block_severity).unwrap_or(Severity::High);
 
@@ -2002,6 +2193,14 @@ pub fn check(cmd: &str) -> Verdict {
             let registry_result = match install.ecosystem {
                 Ecosystem::Npm => npm_metadata(&pkg, pinned.as_deref()),
                 Ecosystem::Pypi => pypi_metadata(&pkg, pinned.as_deref()),
+                // Defensive: Unknown installs always have `unvettable:
+                // Some(...)` + empty packages, so this loop body never
+                // runs for them. If a future code path constructs an
+                // Unknown with packages, surface as transient so the
+                // caller fails to Ask/Unavailable instead of misrouting.
+                Ecosystem::Unknown => Err(
+                    "ecosystem-agnostic install — no registry to query".to_string(),
+                ),
             };
             let (version, publish) = match registry_result {
                 Ok(v) => v,
@@ -2132,11 +2331,13 @@ pub fn log_event(cmd: &str, verdict: &Verdict) {
         Verdict::Block(f) | Verdict::Ask(f) => serde_json::to_string(f).unwrap_or_default(),
         _ => "[]".to_string(),
     };
+    // Scrub credentials before the cmd lands on disk. See issue #180.
+    let safe_cmd = crate::core::secret_redact::redact(cmd);
     let record = format!(
         r#"{{"ts":"{}","verdict":"{}","cmd":{},"findings":{}}}"#,
         Utc::now().to_rfc3339(),
         kind,
-        serde_json::to_string(cmd).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(safe_cmd.as_ref()).unwrap_or_else(|_| "\"\"".into()),
         findings
     );
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -2757,6 +2958,204 @@ mod tests {
         assert!(v[0].packages.is_empty());
     }
 
+    // ─── #145: parse_package_args robustness ───────────────────────────────
+
+    #[test]
+    fn pep_508_extras_suffix_stripped() {
+        let v = detect_installs("pip install celery[redis]");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].packages.len(), 1);
+        assert_eq!(v[0].packages[0].0, "celery", "extras must be stripped");
+        assert_eq!(v[0].packages[0].1, None);
+    }
+
+    #[test]
+    fn pep_508_extras_with_exact_pin_preserved() {
+        let v = detect_installs("pip install celery[redis]==5.3.0");
+        assert_eq!(v[0].packages[0].0, "celery");
+        assert_eq!(v[0].packages[0].1.as_deref(), Some("5.3.0"));
+    }
+
+    #[test]
+    fn pep_508_multi_extras_stripped() {
+        let v = detect_installs("pip install requests[socks,security]");
+        assert_eq!(v[0].packages[0].0, "requests");
+    }
+
+    #[test]
+    fn pep_508_extras_direct_unit() {
+        assert_eq!(split_name_version("celery[redis]").0, "celery");
+        assert_eq!(
+            split_name_version("celery[redis]==5.3.0"),
+            ("celery".to_string(), Some("5.3.0".to_string()))
+        );
+        assert_eq!(split_name_version("requests[socks,security]>=2.0").0, "requests");
+    }
+
+    #[test]
+    fn inline_hash_comment_terminates_args() {
+        let v = detect_installs("pip install flask # this comment");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["flask"], "comment tokens leaked through");
+    }
+
+    #[test]
+    fn inline_hash_only_terminates_when_standalone_token() {
+        let v = detect_installs("pip install pkg#fragment");
+        assert_eq!(v.len(), 1);
+        assert!(!v[0].packages.is_empty());
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_platform() {
+        let v = detect_installs("pip install --platform linux_x86_64 foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_python_version() {
+        let v = detect_installs("pip install --python-version 3.11 foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_trusted_host() {
+        let v = detect_installs("pip install --trusted-host pypi.org foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_extra_index_url() {
+        let v = detect_installs("pip install --extra-index-url https://pkg.example.org/simple foo");
+        let ns = names(&v[0]);
+        assert!(ns.contains(&"foo"));
+        assert!(!ns.iter().any(|n| n.starts_with("http")));
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_find_links() {
+        let v = detect_installs("pip install --find-links /tmp/wheels foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_only_binary() {
+        let v = detect_installs("pip install --only-binary :all: foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_no_binary() {
+        let v = detect_installs("pip install --no-binary :none: foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_prefix() {
+        let v = detect_installs("pip install --prefix /opt/venv foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_root() {
+        let v = detect_installs("pip install --root /staging foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_upgrade_strategy() {
+        let v = detect_installs("pip install --upgrade-strategy eager foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_attached_equals_form() {
+        let v = detect_installs("pip install --platform=linux_x86_64 foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_boolean_flag_unchanged() {
+        let v = detect_installs("pip install --upgrade --user foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    // ─── #149: perf — O(n) dedup + O(log n) claimed-span check ────────────
+
+    #[test]
+    fn perf_dedup_collapses_many_duplicates_quickly() {
+        let mut items: Vec<ParsedInstall> = (0..5_000)
+            .map(|_| ParsedInstall {
+                ecosystem: Ecosystem::Pypi,
+                packages: vec![("requests".to_string(), Some("2.31.0".to_string()))],
+                has_editable: false,
+                unvettable: None,
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        dedup_installs(&mut items);
+        let elapsed = start.elapsed();
+        assert_eq!(items.len(), 1, "all 5000 duplicates must collapse to 1");
+        assert!(
+            elapsed.as_millis() < 100,
+            "dedup of 5000 duplicates must be sub-100ms (got {}ms) — see #149",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_dedup_preserves_first_occurrence_order() {
+        let mk = |pkg: &str| ParsedInstall {
+            ecosystem: Ecosystem::Pypi,
+            packages: vec![(pkg.to_string(), None)],
+            has_editable: false,
+            unvettable: None,
+        };
+        let mut items = vec![mk("a"), mk("b"), mk("a"), mk("c"), mk("b"), mk("a")];
+        dedup_installs(&mut items);
+        let names: Vec<&str> = items
+            .iter()
+            .map(|i| i.packages[0].0.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"], "first-occurrence order broken");
+    }
+
+    #[test]
+    fn perf_dedup_preserves_order_independent_package_sets() {
+        let mk = |pkgs: Vec<&str>| ParsedInstall {
+            ecosystem: Ecosystem::Pypi,
+            packages: pkgs.into_iter().map(|s| (s.to_string(), None)).collect(),
+            has_editable: false,
+            unvettable: None,
+        };
+        let mut items = vec![mk(vec!["a", "b"]), mk(vec!["b", "a"])];
+        dedup_installs(&mut items);
+        assert_eq!(items.len(), 1, "order-independent set must collapse");
+    }
+
+    #[test]
+    fn perf_claimed_spans_handle_many_matches() {
+        // Stress: many install-shaped segments in one command. Old code
+        // was O(m * k) linear scan per match; new code is O(m log k) via
+        // BTreeMap range-lookup. Acceptance per #149: sub-millisecond on
+        // 1000+ spans. We use 200 chained segments to stay within the
+        // recursion-depth + budget caps; the per-span overhead is what
+        // the test guards against.
+        let cmd: String = (0..200)
+            .map(|i| format!("pip install pkg{}", i))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let start = std::time::Instant::now();
+        let v = detect_installs(&cmd);
+        let elapsed = start.elapsed();
+        assert!(!v.is_empty(), "stress payload must surface installs");
+        assert!(
+            elapsed.as_millis() < 250,
+            "200-segment install detect must be sub-250ms (got {}ms) — see #149",
+            elapsed.as_millis()
+        );
+    }
+
     #[test]
     fn mixed_editable_and_named_keeps_named_packages() {
         // `pip install -e . requests` must still surface `requests` as a
@@ -3351,7 +3750,21 @@ mod tests {
             !v.is_empty(),
             "depth-cap must surface at least one ParsedInstall (Unvettable), not silently Skip"
         );
-        // At least one item must be the Unvettable depth-cap marker.
+        // At least one item must be the Unvettable depth-cap marker AND
+        // it must be labelled `Ecosystem::Unknown`, not the historical
+        // hardcoded `Npm` (see #147 — a deep-nested PyPI / mixed payload
+        // was being mislabelled `[npm]` in the surfaced finding).
+        let cap_marker = v.iter().find(|i| {
+            i.unvettable
+                .as_deref()
+                .is_some_and(|s| s.contains("recursion depth limit"))
+        });
+        assert!(cap_marker.is_some(), "depth-cap marker missing: {v:?}");
+        assert_eq!(
+            cap_marker.unwrap().ecosystem,
+            Ecosystem::Unknown,
+            "depth-cap marker must be Ecosystem::Unknown (#147), not Npm"
+        );
         assert!(
             v.iter().any(|i| i.unvettable.as_deref().is_some_and(|s| s.contains("recursion depth limit"))),
             "depth-cap Unvettable marker missing: {v:?}"
@@ -3758,5 +4171,160 @@ mod tests {
         // the allowlist (otherwise `cd && npm install` semantics get
         // muddied if cd ever gains install-shaped argv).
         assert!(!command_head_is_data_utility("cd foo"));
+    }
+
+    #[test]
+    fn inline_bypass_simple() {
+        // The exact form the gate's own error message tells users to run.
+        assert!(cmd_has_leading_assignment(
+            "CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install starlette==0.49.1",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_value_variants() {
+        for v in &["off", "0", "false", "no"] {
+            let cmd = format!("CONTEXTCRAWLER_SUPPLY_CHAIN={} pip install x", v);
+            assert!(
+                cmd_has_leading_assignment(
+                    &cmd,
+                    "CONTEXTCRAWLER_SUPPLY_CHAIN",
+                    &["off", "0", "false", "no"],
+                ),
+                "should recognise value {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn inline_bypass_with_sibling_assignments() {
+        // Real-world: `FOO=bar CONTEXTCRAWLER_SUPPLY_CHAIN=off cmd`.
+        assert!(cmd_has_leading_assignment(
+            "FOO=bar CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+        // Whitespace tolerance.
+        assert!(cmd_has_leading_assignment(
+            "  FOO=bar   CONTEXTCRAWLER_SUPPLY_CHAIN=off   pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_mid_cmd_does_not_count() {
+        // Bypass must be PREFIX, not mid-cmd. `&&` is not a sibling
+        // assignment, so once we hit `pip` the leading run ends.
+        assert!(!cmd_has_leading_assignment(
+            "pip install x && CONTEXTCRAWLER_SUPPLY_CHAIN=off other",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_wrong_value_does_not_count() {
+        // Defensive: user typed `=on` thinking it enables — must NOT bypass.
+        assert!(!cmd_has_leading_assignment(
+            "CONTEXTCRAWLER_SUPPLY_CHAIN=on pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off", "0", "false", "no"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_value_must_match_exactly() {
+        // `=offsuffix` is not `=off`.
+        assert!(!cmd_has_leading_assignment(
+            "CONTEXTCRAWLER_SUPPLY_CHAIN=offsuffix pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_invalid_identifier_breaks_run() {
+        // `1NAME=` is not a valid identifier — should stop the leading run.
+        assert!(!cmd_has_leading_assignment(
+            "1NAME=x CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_empty_cmd() {
+        assert!(!cmd_has_leading_assignment(
+            "",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn http_err_5xx_is_retryable() {
+        for code in [500u16, 502, 503, 504, 599] {
+            assert!(
+                is_retryable_http_err_tag(HttpErrTag::Status(code)),
+                "5xx must be retryable: {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn http_err_4xx_is_not_retryable() {
+        // 404 = package doesn't exist; 401/403 = auth; 429 = rate-limit
+        // (we don't retry that here — would just add load against the same
+        // limiter; a separate cooldown could be future work).
+        for code in [400u16, 401, 403, 404, 422, 429] {
+            assert!(
+                !is_retryable_http_err_tag(HttpErrTag::Status(code)),
+                "4xx must NOT be retryable: {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn http_err_2xx_and_3xx_are_not_retryable() {
+        // Defensive: a 2xx/3xx shouldn't ever reach the classifier
+        // (ureq returns Ok for those), but if it did, treat as terminal —
+        // we don't want a bug to spin retries on a successful response.
+        for code in [200u16, 201, 204, 301, 302, 304] {
+            assert!(!is_retryable_http_err_tag(HttpErrTag::Status(code)));
+        }
+    }
+
+    #[test]
+    fn http_err_transport_is_retryable() {
+        // DNS hiccups, TCP resets, read timeouts — the cases the user's
+        // 5-unavailables-in-a-day issue traced back to.
+        assert!(is_retryable_http_err_tag(HttpErrTag::Transport));
+    }
+
+    #[test]
+    fn http_retry_constants_within_budget() {
+        // Per-attempt timeout × (1 + max_retries) + backoff × max_retries
+        // must comfortably fit inside CHECK_WALL_BUDGET so a single slow
+        // call cannot push the whole install past the deadline.
+        let worst_call = HTTP_ATTEMPT_TIMEOUT
+            .saturating_mul(1 + HTTP_MAX_RETRIES)
+            .saturating_add(HTTP_RETRY_BACKOFF.saturating_mul(HTTP_MAX_RETRIES));
+        assert!(
+            worst_call < CHECK_WALL_BUDGET,
+            "worst-case per-call ({:?}) must be less than CHECK_WALL_BUDGET ({:?})",
+            worst_call,
+            CHECK_WALL_BUDGET
+        );
+        // And the budget can still service at least two slow packages.
+        assert!(
+            worst_call * 2 < CHECK_WALL_BUDGET.saturating_add(StdDuration::from_secs(5)),
+            "budget must still cover ≥2 retried calls in one check"
+        );
     }
 }
