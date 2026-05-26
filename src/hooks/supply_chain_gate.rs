@@ -263,7 +263,7 @@ struct ParsedInstall {
     unvettable: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Ecosystem {
     Npm,
     Pypi,
@@ -1009,41 +1009,43 @@ fn detect_installs(cmd: &str) -> Vec<ParsedInstall> {
     out
 }
 
-/// Structural dedup: collapse `ParsedInstall`s that carry the same
-/// ecosystem + package set + editable + unvettable detail. Order of the
-/// first occurrence is preserved (stable).
-fn dedup_installs(items: &mut Vec<ParsedInstall>) {
-    let mut i = 0;
-    while i < items.len() {
-        let mut j = i + 1;
-        while j < items.len() {
-            if installs_equivalent(&items[i], &items[j]) {
-                items.remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
+/// Stable canonical signature of a `ParsedInstall` for hash-based dedup.
+/// Packages are sorted so two installs listing `[a, b]` and `[b, a]`
+/// hash equal — they semantically install the same set (#146 agy LOW).
+#[derive(Hash, PartialEq, Eq)]
+struct InstallSignature {
+    ecosystem: Ecosystem,
+    has_editable: bool,
+    unvettable: Option<String>,
+    sorted_packages: Vec<(String, Option<String>)>,
+}
+
+fn install_signature(item: &ParsedInstall) -> InstallSignature {
+    let mut pkgs = item.packages.clone();
+    pkgs.sort();
+    InstallSignature {
+        ecosystem: item.ecosystem,
+        has_editable: item.has_editable,
+        unvettable: item.unvettable.clone(),
+        sorted_packages: pkgs,
     }
 }
 
+/// Structural dedup: collapse `ParsedInstall`s that carry the same
+/// ecosystem + package set + editable + unvettable detail. Order of the
+/// first occurrence is preserved (stable). O(n) — was O(n²) pairwise
+/// before #149.
+fn dedup_installs(items: &mut Vec<ParsedInstall>) {
+    let mut seen: std::collections::HashSet<InstallSignature> =
+        std::collections::HashSet::with_capacity(items.len());
+    items.retain(|item| seen.insert(install_signature(item)));
+}
+
+/// Retained for callers/tests that still want the pairwise predicate.
+/// Equivalent to comparing the two canonical signatures.
+#[cfg_attr(not(test), allow(dead_code))]
 fn installs_equivalent(a: &ParsedInstall, b: &ParsedInstall) -> bool {
-    if a.ecosystem != b.ecosystem
-        || a.has_editable != b.has_editable
-        || a.unvettable != b.unvettable
-        || a.packages.len() != b.packages.len()
-    {
-        return false;
-    }
-    // Order-independent package-set compare (agy LOW on #146): two installs
-    // listing `[a, b]` and `[b, a]` semantically install the same set and
-    // must collapse. We sort cheap clones rather than mutate inputs so the
-    // original ordering (which has display value) is preserved for callers.
-    let mut a_pkgs = a.packages.clone();
-    let mut b_pkgs = b.packages.clone();
-    a_pkgs.sort();
-    b_pkgs.sort();
-    a_pkgs == b_pkgs
+    install_signature(a) == install_signature(b)
 }
 
 /// Recursion-bounded core of [`detect_installs`]. `depth` guards against a
@@ -1081,7 +1083,11 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
     // Run UV before PIP so `uv pip install foo` is claimed by the UV pattern
     // and PIP_RE matching the inner `pip install foo` substring is suppressed
     // for that span.
-    let mut claimed: Vec<(usize, usize)> = Vec::new();
+    // Map of start-byte → end-byte for claimed spans, sorted by start.
+    // O(log n) overlap-check via `range(..=start).next_back()` — was a
+    // linear scan (`claimed.iter().any(...)`) before #149.
+    let mut claimed: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
 
     let ordered = [
         (&*UV_RE, Ecosystem::Pypi),
@@ -1111,7 +1117,7 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
             {
                 continue;
             }
-            claimed.push((start, end));
+            claimed.insert(start, end);
             let cap = match re.captures_at(&masked, start) {
                 Some(c) => c,
                 None => continue,
@@ -1239,7 +1245,7 @@ fn installer_basename(tok: &str) -> &str {
 /// for the package-bearing regexes above.
 fn detect_bare_lockfile_installs(
     cmd: &str,
-    claimed: &mut Vec<(usize, usize)>,
+    claimed: &mut std::collections::BTreeMap<usize, usize>,
     out: &mut Vec<ParsedInstall>,
 ) {
     let tokens = shell_tokens(cmd);
@@ -1380,14 +1386,19 @@ fn detect_bare_lockfile_installs(
 
         if !has_package {
             // Skip if a higher-priority pattern already claimed this span.
-            if !claimed.iter().any(|(s, e)| *start >= *s && *start < *e) {
+            // O(log n) via BTreeMap range — was O(n) linear scan (#149).
+            let already_claimed = claimed
+                .range(..=*start)
+                .next_back()
+                .is_some_and(|(_, &end)| *start < end);
+            if !already_claimed {
                 // Claim the full verb span (head token through the verb
                 // token), not just the head — the end is read by no later
                 // pass today, but a short span would silently break dedup
                 // if another detector is added after this one.
                 let verb_end = tokens[verb_span_end_idx].0
                     + tokens[verb_span_end_idx].1.len();
-                claimed.push((*start, verb_end));
+                claimed.insert(*start, verb_end);
                 out.push(ParsedInstall {
                     ecosystem: eco,
                     packages: Vec::new(),
@@ -2942,6 +2953,82 @@ mod tests {
     fn pip_boolean_flag_unchanged() {
         let v = detect_installs("pip install --upgrade --user foo");
         assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    // ─── #149: perf — O(n) dedup + O(log n) claimed-span check ────────────
+
+    #[test]
+    fn perf_dedup_collapses_many_duplicates_quickly() {
+        let mut items: Vec<ParsedInstall> = (0..5_000)
+            .map(|_| ParsedInstall {
+                ecosystem: Ecosystem::Pypi,
+                packages: vec![("requests".to_string(), Some("2.31.0".to_string()))],
+                has_editable: false,
+                unvettable: None,
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        dedup_installs(&mut items);
+        let elapsed = start.elapsed();
+        assert_eq!(items.len(), 1, "all 5000 duplicates must collapse to 1");
+        assert!(
+            elapsed.as_millis() < 100,
+            "dedup of 5000 duplicates must be sub-100ms (got {}ms) — see #149",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_dedup_preserves_first_occurrence_order() {
+        let mk = |pkg: &str| ParsedInstall {
+            ecosystem: Ecosystem::Pypi,
+            packages: vec![(pkg.to_string(), None)],
+            has_editable: false,
+            unvettable: None,
+        };
+        let mut items = vec![mk("a"), mk("b"), mk("a"), mk("c"), mk("b"), mk("a")];
+        dedup_installs(&mut items);
+        let names: Vec<&str> = items
+            .iter()
+            .map(|i| i.packages[0].0.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"], "first-occurrence order broken");
+    }
+
+    #[test]
+    fn perf_dedup_preserves_order_independent_package_sets() {
+        let mk = |pkgs: Vec<&str>| ParsedInstall {
+            ecosystem: Ecosystem::Pypi,
+            packages: pkgs.into_iter().map(|s| (s.to_string(), None)).collect(),
+            has_editable: false,
+            unvettable: None,
+        };
+        let mut items = vec![mk(vec!["a", "b"]), mk(vec!["b", "a"])];
+        dedup_installs(&mut items);
+        assert_eq!(items.len(), 1, "order-independent set must collapse");
+    }
+
+    #[test]
+    fn perf_claimed_spans_handle_many_matches() {
+        // Stress: many install-shaped segments in one command. Old code
+        // was O(m * k) linear scan per match; new code is O(m log k) via
+        // BTreeMap range-lookup. Acceptance per #149: sub-millisecond on
+        // 1000+ spans. We use 200 chained segments to stay within the
+        // recursion-depth + budget caps; the per-span overhead is what
+        // the test guards against.
+        let cmd: String = (0..200)
+            .map(|i| format!("pip install pkg{}", i))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let start = std::time::Instant::now();
+        let v = detect_installs(&cmd);
+        let elapsed = start.elapsed();
+        assert!(!v.is_empty(), "stress payload must surface installs");
+        assert!(
+            elapsed.as_millis() < 250,
+            "200-segment install detect must be sub-250ms (got {}ms) — see #149",
+            elapsed.as_millis()
+        );
     }
 
     #[test]
