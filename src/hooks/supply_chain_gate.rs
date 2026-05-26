@@ -267,6 +267,14 @@ struct ParsedInstall {
 enum Ecosystem {
     Npm,
     Pypi,
+    /// Ecosystem-agnostic finding. Used for synthetic `ParsedInstall`s
+    /// emitted in fail-closed paths where the gate detected something
+    /// install-shaped but cannot resolve the actual ecosystem (e.g. the
+    /// recursion-depth cap surfacing a nested payload it refuses to
+    /// inspect). Always paired with `unvettable: Some(...)` so the caller
+    /// short-circuits to `Verdict::Ask` before any registry routing or
+    /// config lookup is attempted. See #147.
+    Unknown,
 }
 
 impl Ecosystem {
@@ -274,6 +282,7 @@ impl Ecosystem {
         match self {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "PyPI",
+            Ecosystem::Unknown => "unknown",
         }
     }
 }
@@ -1168,7 +1177,7 @@ fn detect_installs_into(cmd: &str, depth: u8, out: &mut Vec<ParsedInstall>) {
         }
     } else if !extract_recursion_segments(cmd_raw).is_empty() {
         out.push(ParsedInstall {
-            ecosystem: Ecosystem::Npm, // ecosystem-agnostic; pick one
+            ecosystem: Ecosystem::Unknown, // #147 — was hardcoded Npm; relabel
             packages: Vec::new(),
             has_editable: false,
             unvettable: Some(format!(
@@ -1391,6 +1400,9 @@ fn detect_bare_lockfile_installs(
                         Ecosystem::Pypi => "bare lockfile install — pulls the dependency tree \
                                             from poetry.lock/uv.lock/pyproject.toml the gate \
                                             cannot vet"
+                            .to_string(),
+                        Ecosystem::Unknown => "bare lockfile install — ecosystem could not be \
+                                               resolved; the gate cannot vet"
                             .to_string(),
                     }),
                 });
@@ -1971,6 +1983,12 @@ pub fn check(cmd: &str) -> Verdict {
         let eco_cfg = match install.ecosystem {
             Ecosystem::Npm => &config.npm,
             Ecosystem::Pypi => &config.pypi,
+            // Unknown is always paired with `unvettable: Some(...)` which
+            // short-circuits to Ask above this point — so this arm is
+            // unreachable in practice. Fall back to npm config for the
+            // benefit of any future code path that surfaces Unknown
+            // without the unvettable shortcut.
+            Ecosystem::Unknown => &config.npm,
         };
         let block_threshold = Severity::parse(&eco_cfg.block_severity).unwrap_or(Severity::High);
 
@@ -2041,6 +2059,14 @@ pub fn check(cmd: &str) -> Verdict {
             let registry_result = match install.ecosystem {
                 Ecosystem::Npm => npm_metadata(&pkg, pinned.as_deref()),
                 Ecosystem::Pypi => pypi_metadata(&pkg, pinned.as_deref()),
+                // Defensive: Unknown installs always have `unvettable:
+                // Some(...)` + empty packages, so this loop body never
+                // runs for them. If a future code path constructs an
+                // Unknown with packages, surface as transient so the
+                // caller fails to Ask/Unavailable instead of misrouting.
+                Ecosystem::Unknown => Err(
+                    "ecosystem-agnostic install — no registry to query".to_string(),
+                ),
             };
             let (version, publish) = match registry_result {
                 Ok(v) => v,
@@ -3512,7 +3538,21 @@ mod tests {
             !v.is_empty(),
             "depth-cap must surface at least one ParsedInstall (Unvettable), not silently Skip"
         );
-        // At least one item must be the Unvettable depth-cap marker.
+        // At least one item must be the Unvettable depth-cap marker AND
+        // it must be labelled `Ecosystem::Unknown`, not the historical
+        // hardcoded `Npm` (see #147 — a deep-nested PyPI / mixed payload
+        // was being mislabelled `[npm]` in the surfaced finding).
+        let cap_marker = v.iter().find(|i| {
+            i.unvettable
+                .as_deref()
+                .is_some_and(|s| s.contains("recursion depth limit"))
+        });
+        assert!(cap_marker.is_some(), "depth-cap marker missing: {v:?}");
+        assert_eq!(
+            cap_marker.unwrap().ecosystem,
+            Ecosystem::Unknown,
+            "depth-cap marker must be Ecosystem::Unknown (#147), not Npm"
+        );
         assert!(
             v.iter().any(|i| i.unvettable.as_deref().is_some_and(|s| s.contains("recursion depth limit"))),
             "depth-cap Unvettable marker missing: {v:?}"
