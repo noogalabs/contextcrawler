@@ -96,7 +96,7 @@ pub fn run(
 
     if summary.total_commands == 0 {
         println!("No tracking data yet.");
-        println!("Run some contextcrawler commands to start tracking savings.");
+        println!("Run some ContextCrawler commands to start tracking savings.");
         return Ok(());
     }
 
