@@ -1633,32 +1633,102 @@ fn read_body(resp: ureq::Response) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-fn http_get_json(url: &str) -> Result<Value, String> {
-    let mut req = ureq::get(url)
-        .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
-        .timeout(StdDuration::from_secs(8));
-    // Request npm's abbreviated metadata where applicable — ~100x smaller.
-    // PyPI ignores the header, so it is safe to send unconditionally for npm
-    // hosts only.
-    if url.starts_with("https://registry.npmjs.org/") {
-        req = req.set("Accept", NPM_ABBREVIATED_ACCEPT);
+/// Per-attempt HTTP timeout. With one retry on transient errors, total
+/// wall-clock per call is bounded by `2 * HTTP_ATTEMPT_TIMEOUT +
+/// HTTP_RETRY_BACKOFF`. Kept well under `CHECK_WALL_BUDGET` so a single
+/// slow package can't blow the whole install's budget.
+const HTTP_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const HTTP_MAX_RETRIES: u32 = 1;
+const HTTP_RETRY_BACKOFF: StdDuration = StdDuration::from_millis(250);
+
+/// Lightweight tag for classifying an HTTP failure. Separated from
+/// `ureq::Error` so the policy can be unit-tested without constructing a
+/// real `ureq::Response`/`ureq::Transport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpErrTag {
+    Status(u16),
+    Transport,
+}
+
+/// Should we retry after a failure of shape `tag`? Yes for transport-level
+/// failures (DNS hiccup, connection reset, read timeout) and 5xx responses
+/// (registry unhealthy, transient overload). No for 4xx — those signal a
+/// terminal problem with the request (package missing, auth, rate-limit)
+/// where an immediate retry just adds load and won't change the outcome.
+fn is_retryable_http_err_tag(tag: HttpErrTag) -> bool {
+    match tag {
+        HttpErrTag::Status(code) => (500..600).contains(&code),
+        HttpErrTag::Transport => true,
     }
-    let resp = req
-        .call()
-        .map_err(|e| format!("HTTP {}: {}", url, e))?;
-    let buf = read_body(resp)?;
-    serde_json::from_slice(&buf).map_err(|e| e.to_string())
+}
+
+fn is_retryable_http_err(e: &ureq::Error) -> bool {
+    let tag = match e {
+        ureq::Error::Status(code, _) => HttpErrTag::Status(*code),
+        ureq::Error::Transport(_) => HttpErrTag::Transport,
+    };
+    is_retryable_http_err_tag(tag)
+}
+
+fn http_get_json(url: &str) -> Result<Value, String> {
+    let mut last_err: Option<String> = None;
+    for attempt in 0..=HTTP_MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(HTTP_RETRY_BACKOFF);
+        }
+        let mut req = ureq::get(url)
+            .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
+            .timeout(HTTP_ATTEMPT_TIMEOUT);
+        // Request npm's abbreviated metadata where applicable — ~100x smaller.
+        // PyPI ignores the header, so it is safe to send unconditionally for npm
+        // hosts only.
+        if url.starts_with("https://registry.npmjs.org/") {
+            req = req.set("Accept", NPM_ABBREVIATED_ACCEPT);
+        }
+        match req.call() {
+            Ok(resp) => {
+                let buf = read_body(resp)?;
+                return serde_json::from_slice(&buf).map_err(|e| e.to_string());
+            }
+            Err(e) => {
+                let retryable = is_retryable_http_err(&e);
+                last_err = Some(format!("HTTP {}: {}", url, e));
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("HTTP {}: no attempts", url)))
 }
 
 fn http_post_json(url: &str, body: &Value) -> Result<Value, String> {
-    let resp = ureq::post(url)
-        .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
-        .set("Content-Type", "application/json")
-        .timeout(StdDuration::from_secs(8))
-        .send_string(&body.to_string())
-        .map_err(|e| format!("HTTP {}: {}", url, e))?;
-    let buf = read_body(resp)?;
-    serde_json::from_slice(&buf).map_err(|e| e.to_string())
+    let payload = body.to_string();
+    let mut last_err: Option<String> = None;
+    for attempt in 0..=HTTP_MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(HTTP_RETRY_BACKOFF);
+        }
+        let resp = ureq::post(url)
+            .set("User-Agent", "contextcrawler-supply-chain-gate/0.1")
+            .set("Content-Type", "application/json")
+            .timeout(HTTP_ATTEMPT_TIMEOUT)
+            .send_string(&payload);
+        match resp {
+            Ok(r) => {
+                let buf = read_body(r)?;
+                return serde_json::from_slice(&buf).map_err(|e| e.to_string());
+            }
+            Err(e) => {
+                let retryable = is_retryable_http_err(&e);
+                last_err = Some(format!("HTTP {}: {}", url, e));
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("HTTP {}: no attempts", url)))
 }
 
 /// Resolve (version, publish_time) for the package. If `pinned` is Some, use
@@ -1932,6 +2002,47 @@ fn cache_put(eco: Ecosystem, pkg: &str, version: &str, publish: &DateTime<Utc>) 
     }
 }
 
+/// Does `cmd` open with a leading `NAME=VALUE` assignment (possibly preceded
+/// by sibling assignments and whitespace), and is that assignment for `name`
+/// with a value in `allowed`?
+///
+/// Used so `CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install x` bypasses the
+/// gate the same way the user reads the hint suggests. Only the *leading*
+/// run of assignments counts — once we see a non-assignment token, the
+/// rest of the cmd is ignored. (Mid-cmd `&& FOO=bar baz` does not bypass.)
+///
+/// Conservative on value parsing: unquoted values are anything up to the
+/// next whitespace; quoted values are not supported in v1 (the bypass
+/// values we care about are short bareword tokens like `off`/`0`/`false`).
+fn cmd_has_leading_assignment(cmd: &str, name: &str, allowed: &[&str]) -> bool {
+    let mut rest = cmd.trim_start();
+    while !rest.is_empty() {
+        // Pull off the next whitespace-delimited token.
+        let tok_end = rest
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len());
+        let token = &rest[..tok_end];
+        // POSIX-shape assignment: NAME=VALUE where NAME is identifier-safe.
+        let Some(eq_idx) = token.find('=') else {
+            // First non-assignment token ends the leading run.
+            return false;
+        };
+        let (n, rhs) = (&token[..eq_idx], &token[eq_idx + 1..]);
+        if n.is_empty()
+            || !n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        if n == name && allowed.iter().any(|v| *v == rhs) {
+            return true;
+        }
+        // Advance past this assignment + any whitespace before the next token.
+        rest = rest[tok_end..].trim_start();
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -1943,6 +2054,18 @@ pub fn check(cmd: &str) -> Verdict {
         return Verdict::Skip;
     }
     if std::env::var("CONTEXTCRAWLER_SUPPLY_CHAIN").as_deref() == Ok("off") {
+        return Verdict::Skip;
+    }
+    // Also honour an inline leading-prefix bypass, which is what the gate's
+    // own error messages suggest (`Overrides: rerun with
+    // CONTEXTCRAWLER_SUPPLY_CHAIN=off …`). Without this branch the user
+    // sees the hint, runs the suggested form, and is still blocked — the
+    // inline assignment scopes to the subprocess, not to this hook. See #181.
+    if cmd_has_leading_assignment(
+        cmd,
+        "CONTEXTCRAWLER_SUPPLY_CHAIN",
+        &["off", "0", "false", "no"],
+    ) {
         return Verdict::Skip;
     }
 
@@ -2208,11 +2331,13 @@ pub fn log_event(cmd: &str, verdict: &Verdict) {
         Verdict::Block(f) | Verdict::Ask(f) => serde_json::to_string(f).unwrap_or_default(),
         _ => "[]".to_string(),
     };
+    // Scrub credentials before the cmd lands on disk. See issue #180.
+    let safe_cmd = crate::core::secret_redact::redact(cmd);
     let record = format!(
         r#"{{"ts":"{}","verdict":"{}","cmd":{},"findings":{}}}"#,
         Utc::now().to_rfc3339(),
         kind,
-        serde_json::to_string(cmd).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(safe_cmd.as_ref()).unwrap_or_else(|_| "\"\"".into()),
         findings
     );
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -4046,5 +4171,160 @@ mod tests {
         // the allowlist (otherwise `cd && npm install` semantics get
         // muddied if cd ever gains install-shaped argv).
         assert!(!command_head_is_data_utility("cd foo"));
+    }
+
+    #[test]
+    fn inline_bypass_simple() {
+        // The exact form the gate's own error message tells users to run.
+        assert!(cmd_has_leading_assignment(
+            "CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install starlette==0.49.1",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_value_variants() {
+        for v in &["off", "0", "false", "no"] {
+            let cmd = format!("CONTEXTCRAWLER_SUPPLY_CHAIN={} pip install x", v);
+            assert!(
+                cmd_has_leading_assignment(
+                    &cmd,
+                    "CONTEXTCRAWLER_SUPPLY_CHAIN",
+                    &["off", "0", "false", "no"],
+                ),
+                "should recognise value {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn inline_bypass_with_sibling_assignments() {
+        // Real-world: `FOO=bar CONTEXTCRAWLER_SUPPLY_CHAIN=off cmd`.
+        assert!(cmd_has_leading_assignment(
+            "FOO=bar CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+        // Whitespace tolerance.
+        assert!(cmd_has_leading_assignment(
+            "  FOO=bar   CONTEXTCRAWLER_SUPPLY_CHAIN=off   pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_mid_cmd_does_not_count() {
+        // Bypass must be PREFIX, not mid-cmd. `&&` is not a sibling
+        // assignment, so once we hit `pip` the leading run ends.
+        assert!(!cmd_has_leading_assignment(
+            "pip install x && CONTEXTCRAWLER_SUPPLY_CHAIN=off other",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_wrong_value_does_not_count() {
+        // Defensive: user typed `=on` thinking it enables — must NOT bypass.
+        assert!(!cmd_has_leading_assignment(
+            "CONTEXTCRAWLER_SUPPLY_CHAIN=on pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off", "0", "false", "no"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_value_must_match_exactly() {
+        // `=offsuffix` is not `=off`.
+        assert!(!cmd_has_leading_assignment(
+            "CONTEXTCRAWLER_SUPPLY_CHAIN=offsuffix pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_invalid_identifier_breaks_run() {
+        // `1NAME=` is not a valid identifier — should stop the leading run.
+        assert!(!cmd_has_leading_assignment(
+            "1NAME=x CONTEXTCRAWLER_SUPPLY_CHAIN=off pip install x",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn inline_bypass_empty_cmd() {
+        assert!(!cmd_has_leading_assignment(
+            "",
+            "CONTEXTCRAWLER_SUPPLY_CHAIN",
+            &["off"],
+        ));
+    }
+
+    #[test]
+    fn http_err_5xx_is_retryable() {
+        for code in [500u16, 502, 503, 504, 599] {
+            assert!(
+                is_retryable_http_err_tag(HttpErrTag::Status(code)),
+                "5xx must be retryable: {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn http_err_4xx_is_not_retryable() {
+        // 404 = package doesn't exist; 401/403 = auth; 429 = rate-limit
+        // (we don't retry that here — would just add load against the same
+        // limiter; a separate cooldown could be future work).
+        for code in [400u16, 401, 403, 404, 422, 429] {
+            assert!(
+                !is_retryable_http_err_tag(HttpErrTag::Status(code)),
+                "4xx must NOT be retryable: {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn http_err_2xx_and_3xx_are_not_retryable() {
+        // Defensive: a 2xx/3xx shouldn't ever reach the classifier
+        // (ureq returns Ok for those), but if it did, treat as terminal —
+        // we don't want a bug to spin retries on a successful response.
+        for code in [200u16, 201, 204, 301, 302, 304] {
+            assert!(!is_retryable_http_err_tag(HttpErrTag::Status(code)));
+        }
+    }
+
+    #[test]
+    fn http_err_transport_is_retryable() {
+        // DNS hiccups, TCP resets, read timeouts — the cases the user's
+        // 5-unavailables-in-a-day issue traced back to.
+        assert!(is_retryable_http_err_tag(HttpErrTag::Transport));
+    }
+
+    #[test]
+    fn http_retry_constants_within_budget() {
+        // Per-attempt timeout × (1 + max_retries) + backoff × max_retries
+        // must comfortably fit inside CHECK_WALL_BUDGET so a single slow
+        // call cannot push the whole install past the deadline.
+        let worst_call = HTTP_ATTEMPT_TIMEOUT
+            .saturating_mul(1 + HTTP_MAX_RETRIES)
+            .saturating_add(HTTP_RETRY_BACKOFF.saturating_mul(HTTP_MAX_RETRIES));
+        assert!(
+            worst_call < CHECK_WALL_BUDGET,
+            "worst-case per-call ({:?}) must be less than CHECK_WALL_BUDGET ({:?})",
+            worst_call,
+            CHECK_WALL_BUDGET
+        );
+        // And the budget can still service at least two slow packages.
+        assert!(
+            worst_call * 2 < CHECK_WALL_BUDGET.saturating_add(StdDuration::from_secs(5)),
+            "budget must still cover ≥2 retried calls in one check"
+        );
     }
 }
