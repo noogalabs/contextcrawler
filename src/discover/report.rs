@@ -120,7 +120,7 @@ impl DiscoverReport {
 pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> String {
     let mut out = String::with_capacity(2048);
 
-    out.push_str("contextcrawler Discover -- Savings Opportunities\n");
+    out.push_str("ContextCrawler Discover -- Savings Opportunities\n");
     out.push_str(&"=".repeat(52));
     out.push('\n');
     out.push_str(&format!(
@@ -134,12 +134,12 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     };
     if report.rtk_via_runtime > 0 {
         out.push_str(&format!(
-            "Already using contextcrawler: {} commands ({:.1}%)  -- {} via hook rewrite (runtime tracked)\n",
+            "Already using ContextCrawler: {} commands ({:.1}%)  -- {} via hook rewrite (runtime tracked)\n",
             report.already_rtk, already_pct, report.rtk_via_runtime
         ));
     } else {
         out.push_str(&format!(
-            "Already using contextcrawler: {} commands ({:.1}%)\n",
+            "Already using ContextCrawler: {} commands ({:.1}%)\n",
             report.already_rtk, already_pct
         ));
     }
@@ -149,14 +149,14 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     }
 
     if report.supported.is_empty() && report.unsupported.is_empty() {
-        out.push_str("\nNo missed savings found. contextcrawler usage looks good!\n");
+        out.push_str("\nNo missed savings found. ContextCrawler usage looks good!\n");
         append_agent_notes(&mut out, report.agent_status);
         return out;
     }
 
     // Missed savings
     if !report.supported.is_empty() {
-        out.push_str("\nMISSED SAVINGS -- Commands contextcrawler already handles\n");
+        out.push_str("\nMISSED SAVINGS -- Commands ContextCrawler already handles\n");
         out.push_str(&"-".repeat(72));
         out.push('\n');
         out.push_str(&format!(

@@ -155,7 +155,7 @@ pub fn run(_verbose: u8) -> Result<()> {
     }
 
     // Display table
-    let header = "Contextcrawler Session Overview (last 10)";
+    let header = "ContextCrawler Session Overview (last 10)";
     println!("{}", header);
     println!("{}", "-".repeat(70));
     println!(
@@ -193,7 +193,7 @@ pub fn run(_verbose: u8) -> Result<()> {
         0.0
     };
     println!("Average adoption: {:.0}%", avg_adoption);
-    println!("Tip: Run `contextcrawler discover` to find missed contextcrawler opportunities");
+    println!("Tip: Run `contextcrawler discover` to find missed ContextCrawler opportunities");
 
     Ok(())
 }
