@@ -1421,6 +1421,27 @@ fn split_attached_flag(tok: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+/// pip/uv flags that take a value in the next token. These must consume
+/// their value so the value isn't misclassified as a package name. The list
+/// is intentionally pip-focused — see #145 case 3. npm equivalents are out
+/// of scope (very rare to see value-consuming flags in npm installs).
+const PIP_VALUE_CONSUMING_FLAGS: &[&str] = &[
+    // package destination
+    "-t", "--target", "--prefix", "--root",
+    // index discovery
+    "--index-url", "-i", "--extra-index-url", "--find-links", "-f",
+    // platform / interpreter targeting
+    "--platform", "--python-version", "--implementation", "--abi",
+    // network / trust
+    "--trusted-host", "--proxy", "--cert", "--client-cert",
+    // wheel / binary policy
+    "--no-binary", "--only-binary",
+    // upgrade strategy
+    "--upgrade-strategy",
+    // build / cache directories
+    "--build", "--cache-dir", "--src", "--log",
+];
+
 /// Returns (registry-package-names with optional pinned version,
 /// saw_editable_arg, lockfile_source). `lockfile_source` is `Some(detail)`
 /// when a `-r`/`--requirement`/`-c`/`--constraint` indirection flag was seen
@@ -1432,6 +1453,13 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
     let mut tokens = s.split_whitespace().peekable();
 
     while let Some(tok) = tokens.next() {
+        // Inline shell comment — the rest of the line is annotation, not
+        // packages. `pip install flask # production` previously slurped
+        // `#` and `production` as packages, both 404'd, cascaded to Ask.
+        // #145 case 2.
+        if tok.starts_with('#') {
+            break;
+        }
         if tok == "-e" || tok == "--editable" {
             editable = true;
             tokens.next();
@@ -1458,9 +1486,9 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
                 });
                 continue;
             }
-            if matches!(flag, "-t" | "--target" | "--index-url") {
+            if PIP_VALUE_CONSUMING_FLAGS.contains(&flag) {
                 // Value-bearing flag: consume the value token only when it
-                // was NOT attached with `=`.
+                // was NOT attached with `=`. #145 case 3.
                 if attached.is_none() {
                     tokens.next();
                 }
@@ -1493,6 +1521,17 @@ fn parse_package_args(s: &str) -> (Vec<(String, Option<String>)>, bool, Option<S
     (pkgs, editable, lockfile_source)
 }
 
+/// Strip a PEP 508 extras suffix (`name[extra]`, `name[a,b,c]`) from a
+/// package spec. Returns the bare name portion; if no extras, returns the
+/// input unchanged. The registry lookup endpoints reject the extras form,
+/// so we must strip it before issuing the metadata call. #145 case 1.
+fn strip_pep508_extras(s: &str) -> &str {
+    match s.find('[') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
 /// Split a token like `requests==2.20.0`, `@types/node@22.10.0`, or `lodash`
 /// into (name, optional pinned version). Only exact pins (`==X`, `name@X`)
 /// are returned; ranges like `>=2.0` yield None for the version (we don't
@@ -1517,14 +1556,14 @@ fn split_name_version(s: &str) -> (String, Option<String>) {
     // pip exact pin
     if let Some(idx) = stripped.find("==") {
         return (
-            stripped[..idx].to_string(),
+            strip_pep508_extras(&stripped[..idx]).to_string(),
             Some(stripped[idx + 2..].to_string()),
         );
     }
     // pip range specifiers — drop the spec, leave version None
     for sep in [">=", "<=", "~=", "!=", ">", "<"] {
         if let Some(idx) = stripped.find(sep) {
-            return (stripped[..idx].to_string(), None);
+            return (strip_pep508_extras(&stripped[..idx]).to_string(), None);
         }
     }
     // npm: name@version
@@ -1534,7 +1573,7 @@ fn split_name_version(s: &str) -> (String, Option<String>) {
             Some(stripped[idx + 1..].to_string()),
         );
     }
-    (stripped.to_string(), None)
+    (strip_pep508_extras(stripped).to_string(), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -2755,6 +2794,128 @@ mod tests {
         let v = detect_installs("pip install https://example.com/pkg.tar.gz");
         assert!(v[0].has_editable);
         assert!(v[0].packages.is_empty());
+    }
+
+    // ─── #145: parse_package_args robustness ───────────────────────────────
+
+    #[test]
+    fn pep_508_extras_suffix_stripped() {
+        let v = detect_installs("pip install celery[redis]");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].packages.len(), 1);
+        assert_eq!(v[0].packages[0].0, "celery", "extras must be stripped");
+        assert_eq!(v[0].packages[0].1, None);
+    }
+
+    #[test]
+    fn pep_508_extras_with_exact_pin_preserved() {
+        let v = detect_installs("pip install celery[redis]==5.3.0");
+        assert_eq!(v[0].packages[0].0, "celery");
+        assert_eq!(v[0].packages[0].1.as_deref(), Some("5.3.0"));
+    }
+
+    #[test]
+    fn pep_508_multi_extras_stripped() {
+        let v = detect_installs("pip install requests[socks,security]");
+        assert_eq!(v[0].packages[0].0, "requests");
+    }
+
+    #[test]
+    fn pep_508_extras_direct_unit() {
+        assert_eq!(split_name_version("celery[redis]").0, "celery");
+        assert_eq!(
+            split_name_version("celery[redis]==5.3.0"),
+            ("celery".to_string(), Some("5.3.0".to_string()))
+        );
+        assert_eq!(split_name_version("requests[socks,security]>=2.0").0, "requests");
+    }
+
+    #[test]
+    fn inline_hash_comment_terminates_args() {
+        let v = detect_installs("pip install flask # this comment");
+        assert_eq!(v.len(), 1);
+        assert_eq!(names(&v[0]), vec!["flask"], "comment tokens leaked through");
+    }
+
+    #[test]
+    fn inline_hash_only_terminates_when_standalone_token() {
+        let v = detect_installs("pip install pkg#fragment");
+        assert_eq!(v.len(), 1);
+        assert!(!v[0].packages.is_empty());
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_platform() {
+        let v = detect_installs("pip install --platform linux_x86_64 foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_python_version() {
+        let v = detect_installs("pip install --python-version 3.11 foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_trusted_host() {
+        let v = detect_installs("pip install --trusted-host pypi.org foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_extra_index_url() {
+        let v = detect_installs("pip install --extra-index-url https://pkg.example.org/simple foo");
+        let ns = names(&v[0]);
+        assert!(ns.contains(&"foo"));
+        assert!(!ns.iter().any(|n| n.starts_with("http")));
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_find_links() {
+        let v = detect_installs("pip install --find-links /tmp/wheels foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_only_binary() {
+        let v = detect_installs("pip install --only-binary :all: foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_no_binary() {
+        let v = detect_installs("pip install --no-binary :none: foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_prefix() {
+        let v = detect_installs("pip install --prefix /opt/venv foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_root() {
+        let v = detect_installs("pip install --root /staging foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_upgrade_strategy() {
+        let v = detect_installs("pip install --upgrade-strategy eager foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_value_consuming_flag_attached_equals_form() {
+        let v = detect_installs("pip install --platform=linux_x86_64 foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
+    }
+
+    #[test]
+    fn pip_boolean_flag_unchanged() {
+        let v = detect_installs("pip install --upgrade --user foo");
+        assert_eq!(names(&v[0]), vec!["foo"]);
     }
 
     #[test]
