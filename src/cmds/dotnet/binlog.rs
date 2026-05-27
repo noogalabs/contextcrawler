@@ -1244,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_scrub_sensitive_env_vars_masks_values() {
-        let input = "PATH=/usr/local/bin HOME: /Users/daniel GITHUB_TOKEN=ghp_123";
+        let input = "PATH=/usr/local/bin HOME: /Users/alice GITHUB_TOKEN=ghp_123";
         let scrubbed = scrub_sensitive_env_vars(input);
 
         assert!(scrubbed.contains("PATH=[REDACTED]"));
